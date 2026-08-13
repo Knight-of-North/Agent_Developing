@@ -56,7 +56,7 @@ def generate_script_node(state: dict) -> dict:
 {{
   "background": "案件背景故事，约100字",
   "suspects": [
-    {{"name": "嫌疑人名字", "secret": "这个人隐藏的秘密"}}
+    {{"name": "嫌疑人名字", "secret": "这个人隐藏的秘密", "forbidden": ["这个人绝对不能公开说出的关键词，2~4个"]}}
   ],
   "clues": ["线索1", "线索2", "线索3", "线索4", "线索5"],
   "truth": "案件真相：凶手是谁、动机、作案手法"
@@ -102,7 +102,7 @@ def dm_intro_node(state: dict) -> dict:
 
 
 def ai_player_turn_node(state: dict) -> dict:
-    """节点 3：AI 玩家发言（think/speak 双通道）"""
+    """节点 3：AI 玩家发言（think/speak 双通道 + 防泄露重试）"""
     script = state.get("script", {})
     suspects = script.get("suspects", [])
     if not suspects:
@@ -112,6 +112,7 @@ def ai_player_turn_node(state: dict) -> dict:
     speaker = suspects[round_num % len(suspects)]
     name = speaker.get("name", "嫌疑人")
     secret = speaker.get("secret", "无")
+    forbidden = speaker.get("forbidden", [])   # 禁忌词：绝对不能公开说
 
     history = "\n".join(
         f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])[-6:]
@@ -130,10 +131,22 @@ def ai_player_turn_node(state: dict) -> dict:
   "speak": "你公开说的话（1~3 句，符合人设）"
 }}"""
 
-    resp = llm.invoke(prompt)
-    out = _parse_json(resp.content)
-    think = out.get("think", "")
-    speak = out.get("speak", out.get("raw", "……"))
+    # 防跑飞（确定性校验 + 重试）：
+    # LLM 负责"生成发言"，确定性逻辑负责"检查发言有没有泄露秘密"。
+    # 如果发言里出现了禁忌词（泄露），就在 prompt 里加强约束、让模型重说。
+    think, speak = "", "……"
+    for attempt in range(3):   # 最多重试 3 次，避免死循环
+        resp = llm.invoke(prompt)
+        out = _parse_json(resp.content)
+        think = out.get("think", "")
+        speak = out.get("speak", out.get("raw", "……"))
+
+        # 确定性校验：发言里是否出现了禁忌词（纯 Python 的字符串匹配，不调 LLM）
+        leaked = [w for w in forbidden if w and w in speak]
+        if not leaked:
+            break   # 没泄露，接受这次发言
+        # 泄露了：把"你刚才说漏嘴了"这件事告诉模型，让它重说
+        prompt += f"\n\n⚠️ 你刚才的发言泄露了秘密（提到了：{'、'.join(leaked)}），请重新组织语言，绝不能再提这些词。"
 
     return {
         "messages": [{"speaker": name, "content": speak}],
