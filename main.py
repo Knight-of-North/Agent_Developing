@@ -1,5 +1,5 @@
 """
-AI 剧本杀主持人 · 入口（Phase 2：自动多轮讨论）
+AI 剧本杀主持人 · 入口（Phase 3：加入投票环节）
 
 运行方式：python main.py
 """
@@ -12,7 +12,7 @@ if __name__ == "__main__":
 
     print(f"\n正在生成剧本，主题：{theme} ...\n")
 
-    # invoke：把初始状态喂给图，它会自己跑完"开场 -> 循环讨论 -> 揭晓"整条流程
+    # invoke：跑完"开场 -> 循环讨论 -> 投票 -> 统计 -> 揭晓"整条流程
     result = graph.invoke({"theme": theme, "messages": [], "thoughts": []})
 
     # ---- 打印剧本 ----
@@ -30,8 +30,16 @@ if __name__ == "__main__":
     for m in result.get("messages", []):
         print(f"\n{m['speaker']}: {m['content']}")
 
-    # ---- 打印 AI 内心戏（think 通道，正式版不公开，这里仅供你调试）----
+    # ---- 打印投票结果（这是确定性节点 tally 算出来的，不是 LLM 编的）----
     print("\n" + "=" * 46)
-    print("【AI 玩家内心戏】（调试用，正式版不公开）")
+    print("【投票结果】")
+    for voter, target in result.get("votes", {}).items():
+        print(f"  · {voter} → {target}")
+    print(f"\n得票最多：{result.get('vote_winner', '无人')}")
+    print(f"票数分布：{result.get('vote_counts', {})}")
+    print("=" * 46)
+
+    # ---- 打印 AI 内心戏（调试用，正式版不公开）----
+    print("\n【AI 玩家内心戏】（调试用，正式版不公开）")
     for t in result.get("thoughts", []):
         print(f"  · {t}")

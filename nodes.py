@@ -1,16 +1,19 @@
 """
 节点函数 —— LangGraph 里的"演员"
 
-Phase 2 节点清单：
-1. generate_script_node ：生成剧本（不变）
-2. dm_intro_node       ：DM 开场介绍（新）
-3. ai_player_turn_node ：AI 玩家发言，think/speak 双通道（新，核心）
-4. dm_reveal_node      ：DM 揭晓真相（新）
-5. should_continue     ：条件边的路由函数（新，判断循环是否继续）
+Phase 3 节点清单：
+1. generate_script_node ：生成剧本（LLM）
+2. dm_intro_node       ：DM 开场介绍（LLM）
+3. ai_player_turn_node ：AI 玩家发言，think/speak 双通道（LLM）
+4. ai_vote_node        ：AI 玩家投票指认凶手（LLM，新增）
+5. tally_node          ：统计票数（确定性节点，不调 LLM，新增）
+6. dm_reveal_node      ：DM 揭晓真相 + 对比投票（LLM）
+7. should_continue     ：条件边的路由函数
 """
 import os
 import json
 import re
+from collections import Counter
 from dotenv import load_dotenv
 from langchain_deepseek import ChatDeepSeek
 
@@ -25,7 +28,7 @@ llm = ChatDeepSeek(
     reasoning_effort="none",   # 关键：关闭 v4 默认的 thinking 模式，让答案直接进 content
 )
 
-# 讨论最多进行几轮（3 个嫌疑人各说 2 轮 = 6 轮）
+# 讨论最多进行几轮
 MAX_ROUNDS = 6
 
 
@@ -133,16 +136,74 @@ def ai_player_turn_node(state: dict) -> dict:
     }
 
 
+def ai_vote_node(state: dict) -> dict:
+    """节点 4：AI 玩家投票指认凶手（LLM 节点，新增）"""
+    script = state.get("script", {})
+    suspects = script.get("suspects", [])
+    suspect_names = [s.get("name", "?") for s in suspects]
+
+    history = "\n".join(
+        f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])[-10:]
+    )
+
+    prompt = f"""讨论已经结束，现在进入【投票】环节。
+
+嫌疑人名单：{suspect_names}
+
+讨论记录：
+{history}
+
+请每位嫌疑人根据讨论内容，投票指认自己认为的凶手。严格输出 JSON：
+{{
+  "votes": {{"林晚": "王教授", "周野": "王教授", "苏晴": "林晚"}}
+}}
+
+要求：
+1. votes 的键是每位嫌疑人的名字，值是他/她投的人
+2. 不能投自己，被投者必须是嫌疑人名单里的人"""
+
+    resp = llm.invoke(prompt)
+    out = _parse_json(resp.content)
+    votes = out.get("votes", {})
+    if not isinstance(votes, dict):
+        votes = {}
+
+    # 兜底：过滤掉"投自己"或"投名单外的人"的无效票
+    valid = {k: v for k, v in votes.items() if v in suspect_names and k != v}
+    return {"votes": valid, "current_phase": "vote"}
+
+
+def tally_node(state: dict) -> dict:
+    """节点 5：统计票数（确定性节点，纯 Python 逻辑，不调 LLM，新增）
+
+    为什么用确定性节点而不是让 LLM 统计？
+    因为"数票数"是精确计算，LLM 会数错、会编造；而 Counter 又快又准又零成本。
+    """
+    votes = state.get("votes", {})
+    counter = Counter(votes.values())
+    vote_counts = dict(counter)
+    # 得票最多的人；平票时取第一个（后续可优化为"平票重投"）
+    vote_winner = counter.most_common(1)[0][0] if counter else "无人投票"
+    return {"vote_counts": vote_counts, "vote_winner": vote_winner}
+
+
 def dm_reveal_node(state: dict) -> dict:
-    """节点 4：DM 揭晓真相，收尾"""
+    """节点 6：DM 揭晓真相 + 对比投票结果"""
     script = state.get("script", {})
     truth = script.get("truth", "")
+    vote_counts = state.get("vote_counts", {})
+    vote_winner = state.get("vote_winner", "无人")
 
-    prompt = f"""你是一位剧本杀主持人（DM）。讨论已经结束，现在进入【揭晓真相】阶段。
+    prompt = f"""你是一位剧本杀主持人（DM）。讨论和投票都结束了，现在进入【揭晓真相】阶段。
 
 案件真相：{truth}
+投票结果：{vote_counts}（得票最多的是：{vote_winner}）
 
-请用主持人的口吻，庄严地揭晓真相（凶手、动机、手法），并为整场游戏收尾。"""
+请用主持人的口吻，依次：
+1. 公布投票结果（谁投了谁、谁得票最多）
+2. 揭晓真相（凶手、动机、手法）
+3. 对比投票和真相：多数人投对了吗？点出投对和投错的玩家
+4. 为整场游戏收尾"""
 
     resp = llm.invoke(prompt)
     return {
@@ -152,12 +213,9 @@ def dm_reveal_node(state: dict) -> dict:
 
 
 def should_continue(state: dict) -> str:
-    """条件边的路由函数：根据轮次决定讨论循环继续还是收尾。
-
-    返回值必须对应 graph.py 里 add_conditional_edges 的映射键。
-    """
+    """条件边的路由函数：根据轮次决定讨论循环继续还是收尾。"""
     if state.get("phase_round", 0) >= MAX_ROUNDS:
-        return "reveal"      # 轮次已满 -> 进入揭晓
+        return "vote"        # 轮次已满 -> 进入投票
     return "continue"        # 还没聊够 -> 继续循环
 
 

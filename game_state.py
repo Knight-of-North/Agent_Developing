@@ -1,10 +1,7 @@
 """
 游戏状态定义 —— LangGraph 里的"共享舞台"
 
-Phase 2 变化：
-1. messages 的元素从"纯字符串"升级为 dict：{"speaker": 谁, "content": 说了什么}
-   这样打印时能区分是谁说的，也为 Phase 3 的私聊/信息差打基础。
-2. 新增 thoughts 字段：AI 玩家的"内心戏"（think 通道），不对外公开，仅供调试。
+Phase 3 变化：新增投票相关的三个字段。
 """
 from typing import TypedDict, Annotated
 import operator
@@ -19,17 +16,16 @@ class GameState(TypedDict, total=False):
     # 剧本：generate_script_node 生成的结构化数据
     script: dict
 
-    # 当前阶段：generate -> intro -> discuss -> reveal
+    # 当前阶段：generate -> intro -> discuss -> vote -> reveal
     current_phase: str
 
-    # 讨论轮次（Phase 2 用它做循环计数，配合条件边判断是否继续）
+    # 讨论轮次（配合条件边判断是否继续循环）
     phase_round: int
 
     # 公开对话历史（元素是 dict）：{"speaker": "角色名", "content": "台词"}
-    # operator.add 保证新消息"追加"而不是"覆盖"旧的
     messages: Annotated[list, operator.add]
 
-    # AI 玩家的内心戏（think 通道，元素是字符串），不展示给"其他玩家"
+    # AI 玩家的内心戏（think 通道），不展示给"其他玩家"
     thoughts: Annotated[list, operator.add]
 
     # 玩家信息 {玩家名: 角色名}
@@ -46,3 +42,9 @@ class GameState(TypedDict, total=False):
 
     # 投票结果 {投票者: 被投者}
     votes: dict
+
+    # 得票最多的嫌疑人（tally_node 统计得出）
+    vote_winner: str
+
+    # 各嫌疑人得票数 {嫌疑人: 票数}（tally_node 统计得出）
+    vote_counts: dict
