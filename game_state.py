@@ -1,46 +1,41 @@
 """
 游戏状态定义 —— LangGraph 里的"共享舞台"
 
-想象一场话剧：所有演员（节点）在同一个舞台（状态）上演戏。
-每个演员上台，先看一眼舞台上的道具（读状态），
-演完后再往舞台上添几样东西（返回"部分更新"）。
-
-这个文件就是定义"舞台上到底能放哪些道具"。
+Phase 2 变化：
+1. messages 的元素从"纯字符串"升级为 dict：{"speaker": 谁, "content": 说了什么}
+   这样打印时能区分是谁说的，也为 Phase 3 的私聊/信息差打基础。
+2. 新增 thoughts 字段：AI 玩家的"内心戏"（think 通道），不对外公开，仅供调试。
 """
 from typing import TypedDict, Annotated
 import operator
 
 
 class GameState(TypedDict, total=False):
-    """
-    total=False 表示：这些字段不要求一开始就全部填满，
-    节点可以逐步往状态里添加字段（LangGraph 节点返回"部分更新"）。
-    """
+    """total=False：字段不必一开始就填满，节点逐步往状态里添加。"""
 
-    # 剧本主题（由用户在 main.py 输入）
+    # 剧本主题（用户在 main.py 输入）
     theme: str
 
     # 剧本：generate_script_node 生成的结构化数据
-    # 形如 {"background": "...", "suspects": [...], "clues": [...], "truth": "..."}
     script: dict
 
-    # 当前阶段：控制游戏走到哪一步
-    # "generate" -> "intro" -> "clues" -> "vote" -> "reveal"
+    # 当前阶段：generate -> intro -> discuss -> reveal
     current_phase: str
 
-    # 当前阶段轮次（Phase 2 多轮对话时才用，Phase 1 先定义好占位）
+    # 讨论轮次（Phase 2 用它做循环计数，配合条件边判断是否继续）
     phase_round: int
 
-    # 对话历史
-    # Annotated[list, operator.add] 是关键：它给 messages 指定了一个"合并规则"（reducer）。
-    # 当节点返回 {"messages": [新消息]} 时，LangGraph 会把新列表"追加"到旧列表后面，
-    # 而不是直接"覆盖"旧的。这就是为什么多轮对话不会把之前的发言冲掉。
+    # 公开对话历史（元素是 dict）：{"speaker": "角色名", "content": "台词"}
+    # operator.add 保证新消息"追加"而不是"覆盖"旧的
     messages: Annotated[list, operator.add]
+
+    # AI 玩家的内心戏（think 通道，元素是字符串），不展示给"其他玩家"
+    thoughts: Annotated[list, operator.add]
 
     # 玩家信息 {玩家名: 角色名}
     players: dict
 
-    # AI 玩家列表（Phase 2 起用）
+    # AI 玩家列表
     ai_players: list
 
     # 线索池（所有线索）

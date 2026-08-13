@@ -1,34 +1,59 @@
 """
-流程编排 —— LangGraph 里的"导演"
+流程编排 —— Phase 2：加入循环和条件边
 
-用 StateGraph 把各个节点（演员）按顺序串起来，形成游戏流程。
+图结构：
+    START -> generate_script -> dm_intro -> ai_player_turn -+
+                                          ^                 |
+                                          |   （条件边）     |
+                                          +----- continue --+
+                                          （轮次满则 reveal 往下）
 
-Phase 1 是最简单的线性流程（一条直线走到底）：
-    START -> generate_script_node -> dungeon_master_node -> END
+    ai_player_turn --reveal--> dm_reveal -> END
 """
 from langgraph.graph import StateGraph, START, END
 from game_state import GameState
-from nodes import generate_script_node, dungeon_master_node
+from nodes import (
+    generate_script_node,
+    dm_intro_node,
+    ai_player_turn_node,
+    dm_reveal_node,
+    should_continue,
+)
 
 
 def build_graph():
-    # 1. 创建图，指定它共享的状态类型
+    # 1. 创建图
     builder = StateGraph(GameState)
 
-    # 2. 注册节点：把函数挂到图上，并起一个名字（名字用于连线）
+    # 2. 注册节点
     builder.add_node("generate_script", generate_script_node)
-    builder.add_node("dungeon_master", dungeon_master_node)
+    builder.add_node("dm_intro", dm_intro_node)
+    builder.add_node("ai_player_turn", ai_player_turn_node)
+    builder.add_node("dm_reveal", dm_reveal_node)
 
-    # 3. 连线（add_edge 是"无条件边"：A 走完一定去 B）
-    builder.add_edge(START, "generate_script")               # 程序开始 -> 生成剧本
-    builder.add_edge("generate_script", "dungeon_master")    # 剧本 -> DM 主持
-    builder.add_edge("dungeon_master", END)                  # DM 主持 -> 结束
+    # 3. 连线：前半段是无条件边（一条直线）
+    builder.add_edge(START, "generate_script")
+    builder.add_edge("generate_script", "dm_intro")
+    builder.add_edge("dm_intro", "ai_player_turn")
 
-    # 4. 编译成可运行的图对象
+    # 4. 关键：条件边。从 ai_player_turn 出发，由 should_continue 决定下一步去哪。
+    #    这是 Phase 2 的核心 —— 用"状态"来决定流程走向，而不是写死顺序。
+    builder.add_conditional_edges(
+        "ai_player_turn",          # 从哪个节点出发
+        should_continue,           # 路由函数：读 state，返回 "continue" 或 "reveal"
+        {
+            "continue": "ai_player_turn",   # 继续 -> 回到自己（形成循环！）
+            "reveal": "dm_reveal",          # 揭晓 -> 往下走
+        },
+    )
+
+    # 5. 收尾
+    builder.add_edge("dm_reveal", END)
+
     return builder.compile()
 
 
 if __name__ == "__main__":
-    # 自测：打印图的 ASCII 结构，方便看清节点怎么连的
+    # 自测：打印 ASCII 图，会看到 ai_player_turn 有个"回到自己"的环
     graph = build_graph()
     graph.get_graph().print_ascii()

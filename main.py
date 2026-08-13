@@ -1,22 +1,19 @@
 """
-AI 剧本杀主持人 · 入口
+AI 剧本杀主持人 · 入口（Phase 2：自动多轮讨论）
 
 运行方式：python main.py
 """
 from graph import build_graph
 
 if __name__ == "__main__":
-    # 编译出可运行的图
     graph = build_graph()
 
-    # 让用户输入主题（回车则用默认主题）
     theme = input("请输入剧本杀主题（回车使用默认「民国豪门恩怨」）：").strip() or "民国豪门恩怨"
 
     print(f"\n正在生成剧本，主题：{theme} ...\n")
 
-    # invoke：把初始状态喂给图，让它从头跑到尾
-    # 初始状态：主题 + 空的对话记录（messages 一定要给空列表，reducer 才能正常追加）
-    result = graph.invoke({"theme": theme, "messages": []})
+    # invoke：把初始状态喂给图，它会自己跑完"开场 -> 循环讨论 -> 揭晓"整条流程
+    result = graph.invoke({"theme": theme, "messages": [], "thoughts": []})
 
     # ---- 打印剧本 ----
     script = result.get("script", {})
@@ -26,12 +23,15 @@ if __name__ == "__main__":
     print("\n【嫌疑人】")
     for s in script.get("suspects", []):
         print(f"  · {s.get('name', '?')} —— {s.get('secret', '')}")
-    print("\n【线索】")
-    for c in script.get("clues", []):
-        print(f"  · {c}")
     print("=" * 46)
 
-    # ---- 打印 DM 台词 ----
-    print("\n【主持人 DM】")
+    # ---- 打印完整公开对话 ----
+    print("\n【游戏过程】")
     for m in result.get("messages", []):
-        print(m)
+        print(f"\n{m['speaker']}: {m['content']}")
+
+    # ---- 打印 AI 内心戏（think 通道，正式版不公开，这里仅供你调试）----
+    print("\n" + "=" * 46)
+    print("【AI 玩家内心戏】（调试用，正式版不公开）")
+    for t in result.get("thoughts", []):
+        print(f"  · {t}")
