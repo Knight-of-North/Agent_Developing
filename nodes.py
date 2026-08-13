@@ -1,14 +1,16 @@
 """
 节点函数 —— LangGraph 里的"演员"
 
-Phase 3 节点清单：
-1. generate_script_node ：生成剧本（LLM）
+Phase 3.5 节点清单（用户参与）：
+1. generate_script_node ：生成剧本 + 指定用户角色（LLM）
 2. dm_intro_node       ：DM 开场介绍（LLM）
 3. ai_player_turn_node ：AI 玩家发言，think/speak 双通道（LLM）
-4. ai_vote_node        ：AI 玩家投票指认凶手（LLM，新增）
-5. tally_node          ：统计票数（确定性节点，不调 LLM，新增）
-6. dm_reveal_node      ：DM 揭晓真相 + 对比投票（LLM）
-7. should_continue     ：条件边的路由函数
+4. human_turn_node     ：轮到用户发言（interrupt 暂停等输入，新增）
+5. ai_vote_node        ：AI 玩家投票（LLM）
+6. human_vote_node     ：用户投票（interrupt 暂停等输入，新增）
+7. tally_node          ：统计票数（确定性节点，不调 LLM）
+8. dm_reveal_node      ：DM 揭晓真相 + 对比投票（LLM）
+9. route_speaker       ：条件边路由（判断下一个发言者是谁）
 """
 import os
 import json
@@ -16,6 +18,7 @@ import re
 from collections import Counter
 from dotenv import load_dotenv
 from langchain_deepseek import ChatDeepSeek
+from langgraph.types import interrupt
 
 load_dotenv()
 
@@ -44,7 +47,7 @@ def _parse_json(text: str) -> dict:
 
 
 def generate_script_node(state: dict) -> dict:
-    """节点 1：根据主题生成结构化剧本"""
+    """节点 1：生成结构化剧本，并把第一个嫌疑人指定为用户角色"""
     theme = state.get("theme", "民国豪门恩怨")
 
     prompt = f"""你是一名资深剧本杀编剧。请围绕主题「{theme}」创作一个完整的剧本杀剧本。
@@ -61,7 +64,10 @@ def generate_script_node(state: dict) -> dict:
 
     resp = llm.invoke(prompt)
     script = _parse_json(resp.content)
-    return {"script": script, "current_phase": "intro"}
+    # 用户扮演第一个嫌疑人
+    suspects = script.get("suspects", [])
+    user_role = suspects[0].get("name", "玩家") if suspects else "玩家"
+    return {"script": script, "current_phase": "intro", "user_role": user_role}
 
 
 def dm_intro_node(state: dict) -> dict:
@@ -70,6 +76,7 @@ def dm_intro_node(state: dict) -> dict:
     background = script.get("background", script.get("raw", ""))
     suspects = script.get("suspects", [])
     clues = script.get("clues", [])
+    user_role = state.get("user_role", "")
 
     prompt = f"""你是一位剧本杀主持人（DM）。现在进入【开场】阶段。
 
@@ -81,6 +88,8 @@ def dm_intro_node(state: dict) -> dict:
 1. 宣布案件发生，介绍背景和嫌疑人
 2. 公布可公开的线索
 3. 宣布进入自由讨论，规则是嫌疑人轮流发言
+
+注意：{user_role} 是真人玩家扮演的，介绍时正常介绍即可。
 
 只输出主持台词本身，不要额外解释。"""
 
@@ -97,16 +106,13 @@ def ai_player_turn_node(state: dict) -> dict:
     script = state.get("script", {})
     suspects = script.get("suspects", [])
     if not suspects:
-        # 剧本没生成出嫌疑人时兜底：直接推进轮次，避免死循环
         return {"phase_round": state.get("phase_round", 0) + 1}
 
     round_num = state.get("phase_round", 0)
-    # 轮流发言：第 round_num 轮由第 (round_num % 人数) 个嫌疑人发言
     speaker = suspects[round_num % len(suspects)]
     name = speaker.get("name", "嫌疑人")
     secret = speaker.get("secret", "无")
 
-    # 把最近几条公开对话拼进 prompt，让 AI 能接上上下文
     history = "\n".join(
         f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])[-6:]
     )
@@ -130,17 +136,36 @@ def ai_player_turn_node(state: dict) -> dict:
     speak = out.get("speak", out.get("raw", "……"))
 
     return {
-        "messages": [{"speaker": name, "content": speak}],   # 公开台词，进对话历史
-        "thoughts": [f"{name}（内心）: {think}"],             # 内心戏，不公开
-        "phase_round": round_num + 1,                        # 轮次 +1
+        "messages": [{"speaker": name, "content": speak}],
+        "thoughts": [f"{name}（内心）: {think}"],
+        "phase_round": round_num + 1,
+    }
+
+
+def human_turn_node(state: dict) -> dict:
+    """节点 4：轮到用户发言（interrupt 暂停，等用户在终端输入）
+
+    interrupt() 会在这里"冻结"图，把控制权交还给 main.py，
+    等 main.py 用 Command(resume=用户输入) 恢复时，interrupt() 返回用户输入的内容。
+    """
+    user_role = state.get("user_role", "你")
+    round_num = state.get("phase_round", 0)
+    # 暂停，把提示信息传给 main.py
+    user_input = interrupt({"type": "human_turn", "speaker": user_role})
+    return {
+        "messages": [{"speaker": user_role, "content": user_input}],
+        "phase_round": round_num + 1,
     }
 
 
 def ai_vote_node(state: dict) -> dict:
-    """节点 4：AI 玩家投票指认凶手（LLM 节点，新增）"""
+    """节点 5：AI 玩家投票（排除用户角色，用户单独在 human_vote 里投）"""
     script = state.get("script", {})
     suspects = script.get("suspects", [])
+    user_role = state.get("user_role", "")
     suspect_names = [s.get("name", "?") for s in suspects]
+    # AI 玩家 = 排除用户扮演的角色
+    ai_names = [n for n in suspect_names if n != user_role]
 
     history = "\n".join(
         f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])[-10:]
@@ -149,17 +174,18 @@ def ai_vote_node(state: dict) -> dict:
     prompt = f"""讨论已经结束，现在进入【投票】环节。
 
 嫌疑人名单：{suspect_names}
+需要投票的 AI 玩家：{ai_names}
 
 讨论记录：
 {history}
 
-请每位嫌疑人根据讨论内容，投票指认自己认为的凶手。严格输出 JSON：
+请每位 AI 玩家根据讨论内容，投票指认自己认为的凶手。严格输出 JSON：
 {{
-  "votes": {{"林晚": "王教授", "周野": "王教授", "苏晴": "林晚"}}
+  "votes": {{"周野": "王教授", "苏晴": "林晚"}}
 }}
 
 要求：
-1. votes 的键是每位嫌疑人的名字，值是他/她投的人
+1. votes 的键是 AI 玩家名单里的人，值是他/她投的人
 2. 不能投自己，被投者必须是嫌疑人名单里的人"""
 
     resp = llm.invoke(prompt)
@@ -169,38 +195,56 @@ def ai_vote_node(state: dict) -> dict:
         votes = {}
 
     # 兜底：过滤掉"投自己"或"投名单外的人"的无效票
-    valid = {k: v for k, v in votes.items() if v in suspect_names and k != v}
+    valid = {k: v for k, v in votes.items() if k in ai_names and v in suspect_names and k != v}
     return {"votes": valid, "current_phase": "vote"}
 
 
-def tally_node(state: dict) -> dict:
-    """节点 5：统计票数（确定性节点，纯 Python 逻辑，不调 LLM，新增）
+def human_vote_node(state: dict) -> dict:
+    """节点 6：用户投票（interrupt 暂停，等用户输入）
 
-    为什么用确定性节点而不是让 LLM 统计？
-    因为"数票数"是精确计算，LLM 会数错、会编造；而 Counter 又快又准又零成本。
+    注意：votes 是普通 dict（没有 reducer），所以这里要把用户的票
+    "合并"进已有的 AI 投票里，而不是直接覆盖。
     """
+    user_role = state.get("user_role", "你")
+    script = state.get("script", {})
+    suspect_names = [s.get("name", "?") for s in script.get("suspects", [])]
+
+    user_vote = interrupt({"type": "human_vote", "suspects": suspect_names})
+
+    # 拷贝现有投票（AI 玩家投的），再加上用户这一票
+    votes = dict(state.get("votes", {}))
+    votes[user_role] = user_vote
+    return {"votes": votes}
+
+
+def tally_node(state: dict) -> dict:
+    """节点 7：统计票数（确定性节点，纯 Python 逻辑，不调 LLM）"""
     votes = state.get("votes", {})
     counter = Counter(votes.values())
     vote_counts = dict(counter)
-    # 得票最多的人；平票时取第一个（后续可优化为"平票重投"）
     vote_winner = counter.most_common(1)[0][0] if counter else "无人投票"
     return {"vote_counts": vote_counts, "vote_winner": vote_winner}
 
 
 def dm_reveal_node(state: dict) -> dict:
-    """节点 6：DM 揭晓真相 + 对比投票结果"""
+    """节点 8：DM 揭晓真相 + 对比投票结果"""
     script = state.get("script", {})
     truth = script.get("truth", "")
+    votes = state.get("votes", {})
     vote_counts = state.get("vote_counts", {})
     vote_winner = state.get("vote_winner", "无人")
+
+    # 完整投票明细（谁投了谁），让 DM 照实公布，而不是自己编
+    votes_text = "、".join(f"{k}投{v}" for k, v in votes.items()) or "无人投票"
 
     prompt = f"""你是一位剧本杀主持人（DM）。讨论和投票都结束了，现在进入【揭晓真相】阶段。
 
 案件真相：{truth}
-投票结果：{vote_counts}（得票最多的是：{vote_winner}）
+投票明细（谁投了谁，务必照实公布，禁止编造）：{votes_text}
+票数统计：{vote_counts}（得票最多的是：{vote_winner}）
 
 请用主持人的口吻，依次：
-1. 公布投票结果（谁投了谁、谁得票最多）
+1. 照实公布投票明细（谁投了谁、谁得票最多）
 2. 揭晓真相（凶手、动机、手法）
 3. 对比投票和真相：多数人投对了吗？点出投对和投错的玩家
 4. 为整场游戏收尾"""
@@ -212,13 +256,25 @@ def dm_reveal_node(state: dict) -> dict:
     }
 
 
-def should_continue(state: dict) -> str:
-    """条件边的路由函数：根据轮次决定讨论循环继续还是收尾。"""
-    if state.get("phase_round", 0) >= MAX_ROUNDS:
-        return "vote"        # 轮次已满 -> 进入投票
-    return "continue"        # 还没聊够 -> 继续循环
+def route_speaker(state: dict) -> str:
+    """条件边的路由函数：根据当前轮次决定"下一个谁发言"。
+
+    返回 "human"（轮到用户）/ "ai"（轮到 AI）/ "vote"（进入投票）。
+    """
+    round_num = state.get("phase_round", 0)
+    if round_num >= MAX_ROUNDS:
+        return "vote"
+
+    script = state.get("script", {})
+    suspects = script.get("suspects", [])
+    if not suspects:
+        return "vote"
+
+    speaker = suspects[round_num % len(suspects)]
+    if speaker.get("name") == state.get("user_role", ""):
+        return "human"   # 轮到用户发言
+    return "ai"          # 轮到 AI 发言
 
 
 if __name__ == "__main__":
-    # 单文件自测：先看剧本生成
     print(generate_script_node({"theme": "校园密室"}))

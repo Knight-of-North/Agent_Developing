@@ -1,7 +1,7 @@
 """
 游戏状态定义 —— LangGraph 里的"共享舞台"
 
-Phase 3 变化：新增投票相关的三个字段。
+Phase 3.5 变化：新增 user_role 字段（用户扮演的角色）。
 """
 from typing import TypedDict, Annotated
 import operator
@@ -21,6 +21,9 @@ class GameState(TypedDict, total=False):
 
     # 讨论轮次（配合条件边判断是否继续循环）
     phase_round: int
+
+    # 用户扮演的角色名（generate_script_node 自动设为第一个嫌疑人）
+    user_role: str
 
     # 公开对话历史（元素是 dict）：{"speaker": "角色名", "content": "台词"}
     messages: Annotated[list, operator.add]
