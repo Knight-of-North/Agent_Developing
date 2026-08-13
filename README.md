@@ -1,86 +1,74 @@
-# Agent 项目模板
+# AI 剧本杀主持人（Murder Mystery Host）
 
-三人协作开发一个智能体（Agent）的标准骨架：自然语言提问 → 基于知识库精准回答并给出处。
+一个基于 **LangGraph** 的多智能体协作系统：自动生成剧本、主持游戏流程、模拟 AI 玩家发言，并管理线索与投票。**你（真人）扮演一个角色**，与多个 AI 嫌疑人一起讨论、推理、投票，体验完整的剧本杀流程。
 
 ## 技术栈
 
-- **编排**：LangGraph（StateGraph 图编排）
-- **检索**：LangChain Retrieval 全家桶（加载 → 切块 → Embedding → 向量库 → 生成）
-- **模型**：DeepSeek（langchain-deepseek，API key 配在 `.env`，见 `.env.example`）
-- **界面**：Gradio / Streamlit（后续）
+- **编排**：LangGraph（StateGraph 图编排、条件边、循环、checkpointer）
+- **模型**：DeepSeek V4-Flash（`langchain-deepseek`）
+- **人机交互**：LangGraph `interrupt`（人在回路 / HITL）
 
-## 目录结构
+## 功能特性
 
-```
-├── main.py          # 入口：python main.py
-├── INTERFACE.md     # ⚠️ 接口契约（开发前必读）
-├── agent/           # A：核心 Agent（LangGraph 编排、记忆）
-├── rag/             # B：RAG 管道（retrieve + 建库脚本）
-└── tools/           # C：工具注册、MCP、界面
-```
+- 🎭 **多智能体协作**：剧本生成、DM 主持、AI 玩家（多个嫌疑人）、确定性工具节点各司其职
+- 🧠 **Think / Speak 双通道**：AI 玩家先内心推理（think），再公开发言（speak），只把 speak 展示给玩家
+- 🗳️ **投票环节**：讨论结束后投票指认凶手，确定性节点统计票数，DM 对比投票与真相
+- 🛡️ **防跑飞校验**：AI 玩家发言若泄露秘密（禁忌词），自动打回重说
+- 👤 **人在回路**：用户扮演一个角色，通过 interrupt 实时参与讨论和投票
 
-## 环境初始化（每人本地执行一次）
+## 运行说明
 
 ```bash
+# 1. 创建并激活环境
 conda create -n py10 python=3.10 -y
 conda activate py10
+
+# 2. 安装依赖（建议先配清华镜像源）
 pip install -r requirements.txt
-```
 
-## 运行
+# 3. 配置密钥：复制 .env.example 为 .env，填入你的 DeepSeek key
+#    注意：DEEPSEEK_MODEL 用 deepseek-v4-flash（deepseek-chat 已于 2026-07 退役）
 
-```bash
+# 4. 运行
 python main.py
 ```
 
-## 团队协作约定（必读）
-
-### 分支模型
+## 项目结构
 
 ```
-main（稳定版，答辩交付）← dev（集成分支，联调地）← feature/xxx（每人一条）
+Agent_Developing/
+├── main.py          # 入口：交互式游戏（含 interrupt 恢复循环）
+├── graph.py         # LangGraph 图编排（节点注册、条件边、checkpointer）
+├── nodes.py         # 节点函数：多智能体 + 确定性节点
+├── game_state.py    # 共享状态定义（TypedDict + reducer）
+├── diagnose.py      # 调试脚本（查看模型原始返回）
+├── requirements.txt # 依赖清单
+└── .env.example     # 密钥配置模板
 ```
 
-### 初始化命令（已建好仓库时）
+## 图结构
 
-```bash
-git clone <仓库地址>
-git switch dev                      # 切到开发分支（本地自动创建）
-git switch -c feature/你的模块名     # 从 dev 拉自己的分支
-git push -u origin feature/你的模块名
+```
+START → generate_script → dm_intro → [讨论循环：用户/AI 轮流发言]
+                                      （条件边 route_speaker 路由）
+     → ai_vote → human_vote → tally → dm_reveal → END
 ```
 
-### 日常节奏
+## 核心概念（LangGraph 学习要点）
 
-| 时间 | 动作 |
-|---|---|
-| 开工 | `git switch dev && git pull`，再切回自己的分支 |
-| 开发中 | 在自己的 feature 分支上 add + commit |
-| 收工 | push 到自己的 feature 分支 |
-| 每 2 天 | 把自己的分支合并进 dev（切到 dev → merge） |
+| 概念 | 作用 | 对应代码 |
+|---|---|---|
+| **StateGraph** | 用图定义游戏流程 | `graph.py` |
+| **共享状态 State** | 所有节点共享的"舞台" | `game_state.py` 的 `GameState` |
+| **reducer** | `messages` 用 `operator.add` 追加而非覆盖 | `Annotated[list, operator.add]` |
+| **条件边** | 根据状态路由（轮到谁发言） | `add_conditional_edges` + `route_speaker` |
+| **循环** | 讨论环节的多轮发言 | 条件边返回自己形成环 |
+| **确定性节点** | 统计票数、防泄露校验（不调 LLM） | `tally_node`、防跑飞校验 |
+| **interrupt** | 人在回路，暂停等用户输入 | `human_turn_node` + `Command(resume)` |
+| **checkpointer** | 图暂停时保存进度 | `MemorySaver` + `thread_id` |
 
-### 合并操作（VSCode 图形化）
+## 关键设计思想
 
-1. 左下角切到**目标分支**（要合进 dev 就切 dev）
-2. 点源代码管理面板 `···` → Branch → **Merge Branch...**
-3. 选**来源分支**（你的 feature/xxx）→ 解决冲突（如遇）→ 提交 → 同步 push
-
-> 原则：**要合进谁，先站到谁。** 别在 main 上直接开发、别直接往 main push（交付前由 A 统一合并）。
-
-### git 应急命令（GUI 报错时用）
-
-```bash
-git status            # 看状态（任何操作前先敲）
-git log --oneline     # 看历史
-git pull              # 拉取（同步按钮报错时手动拉）
-git merge 分支名       # GUI 合并失败时兜底
-git reset --hard HEAD~1  # 撤销最后一次提交（慎用）
-```
-
-## 开发顺序建议
-
-1. **第 1 周**：各人先跑通自己的模块桩函数（能 import、能返回空结果）
-2. **第 2 周**：A 接 LangGraph 编排 + 模型；B 建知识库 + 真实检索；C 写工具 + 界面
-3. **第 3 周**：联调 + 打磨 + 答辩准备
-
-> 接口签名见 `INTERFACE.md`，改接口必须同步更新文档并通知全组。
+1. **流程控制 vs 内容生成分离**：LLM 负责"说什么"（生成剧本、台词），确定性逻辑负责"算什么、合不合规"（统计票数、防泄露校验）。这是从 [loverGraph](https://github.com/Baillei/loverGraph) 借鉴的核心思想。
+2. **Think/Speak 双通道**：AI 玩家的"内心戏"和"公开台词"分离，凶手在心里盘算、在嘴上掩饰。
+3. **拥抱不确定性**：模型输出可能不合规（泄露秘密、格式错误），通过"确定性校验 + 重试"来兜底。

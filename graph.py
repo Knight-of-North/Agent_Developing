@@ -1,34 +1,77 @@
 """
-流程编排 —— LangGraph 里的"导演"
+流程编排 —— Phase 3.5：用户参与（interrupt 人在回路）
 
-用 StateGraph 把各个节点（演员）按顺序串起来，形成游戏流程。
+图结构：
+    START -> generate_script -> dm_intro -+
+                                          |   （条件边 route_speaker）
+              +---------------------------+
+              v
+    human_turn（interrupt 等用户） <----+
+    ai_player_turn（AI 发言）      <----+---- 循环
+              |                        |
+              +---- 轮满 -> ai_vote -> human_vote -> tally -> dm_reveal -> END
 
-Phase 1 是最简单的线性流程（一条直线走到底）：
-    START -> generate_script_node -> dungeon_master_node -> END
+关键：本图带 checkpointer（MemorySaver），才能在 interrupt 处"暂停并记住进度"。
 """
 from langgraph.graph import StateGraph, START, END
+
+try:
+    from langgraph.checkpoint.memory import MemorySaver
+except ImportError:
+    from langgraph.checkpoint.memory import InMemorySaver as MemorySaver
+
 from game_state import GameState
-from nodes import generate_script_node, dungeon_master_node
+from nodes import (
+    generate_script_node,
+    dm_intro_node,
+    ai_player_turn_node,
+    human_turn_node,
+    ai_vote_node,
+    human_vote_node,
+    tally_node,
+    dm_reveal_node,
+    route_speaker,
+)
 
 
 def build_graph():
-    # 1. 创建图，指定它共享的状态类型
     builder = StateGraph(GameState)
 
-    # 2. 注册节点：把函数挂到图上，并起一个名字（名字用于连线）
+    # 注册节点
     builder.add_node("generate_script", generate_script_node)
-    builder.add_node("dungeon_master", dungeon_master_node)
+    builder.add_node("dm_intro", dm_intro_node)
+    builder.add_node("ai_player_turn", ai_player_turn_node)
+    builder.add_node("human_turn", human_turn_node)   # interrupt 节点
+    builder.add_node("ai_vote", ai_vote_node)
+    builder.add_node("human_vote", human_vote_node)   # interrupt 节点
+    builder.add_node("tally", tally_node)
+    builder.add_node("dm_reveal", dm_reveal_node)
 
-    # 3. 连线（add_edge 是"无条件边"：A 走完一定去 B）
-    builder.add_edge(START, "generate_script")               # 程序开始 -> 生成剧本
-    builder.add_edge("generate_script", "dungeon_master")    # 剧本 -> DM 主持
-    builder.add_edge("dungeon_master", END)                  # DM 主持 -> 结束
+    # 前半段
+    builder.add_edge(START, "generate_script")
+    builder.add_edge("generate_script", "dm_intro")
 
-    # 4. 编译成可运行的图对象
-    return builder.compile()
+    # 条件边：讨论循环的路由（挂在三个"发言入口"之后）
+    # route_speaker 根据 phase_round 决定下一个发言者是用户还是 AI，或进入投票
+    route_map = {
+        "human": "human_turn",
+        "ai": "ai_player_turn",
+        "vote": "ai_vote",
+    }
+    builder.add_conditional_edges("dm_intro", route_speaker, route_map)
+    builder.add_conditional_edges("ai_player_turn", route_speaker, route_map)
+    builder.add_conditional_edges("human_turn", route_speaker, route_map)
+
+    # 投票链：AI 投票 -> 用户投票 -> 统计 -> 揭晓
+    builder.add_edge("ai_vote", "human_vote")
+    builder.add_edge("human_vote", "tally")
+    builder.add_edge("tally", "dm_reveal")
+    builder.add_edge("dm_reveal", END)
+
+    # 关键：带上 checkpointer，图才能在 interrupt 处暂停并记住进度
+    return builder.compile(checkpointer=MemorySaver())
 
 
 if __name__ == "__main__":
-    # 自测：打印图的 ASCII 结构，方便看清节点怎么连的
     graph = build_graph()
     graph.get_graph().print_ascii()
