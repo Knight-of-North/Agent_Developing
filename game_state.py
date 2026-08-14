@@ -13,6 +13,9 @@ class GameState(TypedDict, total=False):
     # 剧本主题（用户在 main.py 输入）
     theme: str
 
+    # 背景风格（用户选择：民国豪门 / 校园怪谈 / 古风仙侠 / 现代都市 / 科幻末世 / 自由发挥）
+    background_style: str
+
     # 剧本：generate_script_node 生成的结构化数据
     script: dict
 

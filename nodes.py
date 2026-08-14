@@ -19,8 +19,14 @@ from collections import Counter
 from dotenv import load_dotenv
 from langchain_deepseek import ChatDeepSeek
 from langgraph.types import interrupt
+import httpx
 
 load_dotenv()
+
+# 显式创建"不走代理"的 HTTP 客户端。
+# streamlit 进程可能读到了代理环境变量（与普通终端不同），导致 SDK 走坏代理报 Connection error。
+# trust_env=False 强制直连，不读 HTTP_PROXY / HTTPS_PROXY 等环境变量。
+http_client = httpx.Client(trust_env=False, timeout=120)
 
 llm = ChatDeepSeek(
     model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
@@ -29,6 +35,9 @@ llm = ChatDeepSeek(
     temperature=0.8,
     max_tokens=4096,
     reasoning_effort="none",   # 关键：关闭 v4 默认的 thinking 模式，让答案直接进 content
+    timeout=120,               # 请求超时 120 秒（网络慢时别急着放弃）
+    max_retries=5,             # 失败自动重试 5 次（SSL 握手偶发失败，多试几次提高成功率）
+    http_client=http_client,   # 用不走代理的客户端，规避 streamlit 环境的代理问题
 )
 
 # 讨论最多进行几轮
@@ -49,8 +58,14 @@ def _parse_json(text: str) -> dict:
 def generate_script_node(state: dict) -> dict:
     """节点 1：生成结构化剧本，并把第一个嫌疑人指定为用户角色"""
     theme = state.get("theme", "民国豪门恩怨")
+    background = state.get("background_style", "自由发挥")
 
-    prompt = f"""你是一名资深剧本杀编剧。请围绕主题「{theme}」创作一个完整的剧本杀剧本。
+    prompt = f"""你是一名资深剧本杀编剧。
+
+创作主题：{theme}
+背景风格：{background}
+
+请围绕这个主题、在这个背景风格下，创作一个完整的剧本杀剧本。
 
 严格输出 JSON 格式，不要输出任何 JSON 以外的文字。字段如下：
 {{
