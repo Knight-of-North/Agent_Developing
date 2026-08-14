@@ -11,11 +11,15 @@ if __name__ == "__main__":
     # thread_id 标识"这一局游戏"，每次调用都带上，图才知道接着上次跑
     config = {"configurable": {"thread_id": "murder_1"}}
 
-    theme = input("请输入剧本杀主题（回车使用默认「民国豪门恩怨」）：").strip() or "民国豪门恩怨"
-    print(f"\n正在生成剧本，主题：{theme} ...\n")
+    theme = input("请输入剧本杀主题（回车自由发挥）：").strip() or "自由发挥"
+    background = input("背景风格（回车自由发挥，可选：民国豪门/校园怪谈/古风仙侠/现代都市/科幻末世）：").strip() or "自由发挥"
+    print(f"\n正在生成剧本，主题：{theme}，背景：{background} ...\n")
 
     # 第一次调用：跑到第一个 interrupt（轮到你发言）时暂停
-    result = graph.invoke({"theme": theme, "messages": [], "thoughts": []}, config)
+    result = graph.invoke(
+        {"theme": theme, "background_style": background, "messages": [], "thoughts": []},
+        config,
+    )
 
     # ---- 打印你的角色卡（让你知道自己的秘密，才能带入角色）----
     script = result.get("script", {})

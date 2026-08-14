@@ -2,3 +2,5 @@ langgraph>=1.0,<2
 langchain-core>=1.2,<2
 langchain-deepseek>=0.1
 python-dotenv>=1.0
+streamlit>=1.32
+
