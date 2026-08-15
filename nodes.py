@@ -56,7 +56,12 @@ def _parse_json(text: str) -> dict:
 
 
 def generate_script_node(state: dict) -> dict:
-    """节点 1：生成结构化剧本，并把第一个嫌疑人指定为用户角色"""
+    """节点 1：生成结构化剧本，并把第一个嫌疑人指定为用户角色
+
+    线索分成两类（信息差的来源）：
+    - public_clues ：所有人都知道的公共线索，DM 开场当众公布
+    - private_clues：私密线索，每条带 holder（持有者），只有该角色知道
+    """
     theme = state.get("theme", "民国豪门恩怨")
     background = state.get("background_style", "自由发挥")
 
@@ -73,36 +78,135 @@ def generate_script_node(state: dict) -> dict:
   "suspects": [
     {{"name": "嫌疑人名字", "secret": "这个人隐藏的秘密", "forbidden": ["这个人绝对不能公开说出的关键词，2~4个"]}}
   ],
-  "clues": ["线索1", "线索2", "线索3", "线索4", "线索5"],
+  "public_clues": ["所有人都知道的公共线索，2~3条"],
+  "private_clues": [
+    {{"holder": "持有这条线索的嫌疑人名字（必须与 suspects 里的 name 完全一致）", "content": "这条线索的具体内容，只有 holder 一个人知道"}}
+  ],
   "truth": "案件真相：凶手是谁、动机、作案手法"
-}}"""
+}}
+
+【私密线索设计铁律（信息差是剧本杀的灵魂，务必遵守）】：
+1. 每个嫌疑人都必须至少持有 1 条私密线索，凶手可以持有 2 条。
+2. 凶手的私密线索必须对他/她有利（不在场证明、伪造证词、转移视线的伪证），帮他洗清嫌疑。
+3. 其余角色（尤其接近真相的人）的私密线索要能指向真凶，但单看任何一条都不足以锁定，必须互相拼凑。
+4. 不同角色的私密线索要能组合出完整真相：每个人手里只有一块拼图。
+5. private_clues 里每个元素的 holder 必须精确等于 suspects 里的某个 name，不能写"某人""凶手"等模糊指代。"""
 
     resp = llm.invoke(prompt)
     script = _parse_json(resp.content)
+    script = _fallback_clues(script)   # 兜底：LLM 没按新格式给线索时，从旧格式抢救
     # 用户扮演第一个嫌疑人
-    suspects = script.get("suspects", [])
+    suspects = script.get("suspects") or []
     user_role = suspects[0].get("name", "玩家") if suspects else "玩家"
     return {"script": script, "current_phase": "intro", "user_role": user_role}
 
 
+def _fallback_clues(script: dict) -> dict:
+    """兜底：LLM 没按新格式（public_clues/private_clues）输出时，从旧 clues 字段抢救。
+
+    这是"确定性兜底"思想：不指望 LLM 100% 听话，而是准备好它不听话时的退路。
+    旧格式的 clues 是没标注持有者的纯字符串列表，这里把它切分：
+    前 2 条当公共线索，剩下的轮转分配给各嫌疑人，保证信息差仍然成立。
+    """
+    if script.get("public_clues") or script.get("private_clues"):
+        return script   # 已经是新格式，不用动
+
+    suspects = script.get("suspects") or []
+    names = [s.get("name") for s in suspects if s.get("name")]
+    old_clues = script.get("clues") or []
+    if not old_clues:
+        return script   # 连旧线索都没有，放弃兜底
+
+    # 前 2 条公开，剩余轮转分配（第 i 条分给第 i % len(names) 个嫌疑人）
+    public = old_clues[:2]
+    private = []
+    if names:
+        for i, c in enumerate(old_clues[2:]):
+            private.append({"holder": names[i % len(names)], "content": c})
+    else:
+        public = old_clues   # 没有嫌疑人名单，全部当公共线索
+
+    script["public_clues"] = public
+    script["private_clues"] = private
+    return script
+
+
+def distribute_clues_node(state: dict) -> dict:
+    """节点 1.5：线索分发（信息差的核心，确定性节点，不调 LLM）
+
+    把剧本里的私密线索按 holder 归位到每个角色手里，形成信息差：
+    - 每个角色只"看得见"自己持有的线索
+    - 凶手手握护身符，侦探手握指向真凶的拼图
+    - 真相散落在不同人手里，必须靠讨论互相盘问才能拼出全貌
+
+    为什么这里用纯 Python 而不是 LLM？
+    因为"分发"本质是机械的归位动作（把 holder 字符串匹配到角色名），
+    LLM 反而可能分错、丢线索。信息差由"编剧在设计线索时定好归属"决定，
+    "执行分发"用确定性逻辑最可靠——这和 tally_node 数票是同一个道理。
+    """
+    script = state.get("script", {})
+    suspect_names = [s.get("name", "") for s in (script.get("suspects") or []) if s.get("name")]
+
+    public = list(script.get("public_clues") or [])
+    private = script.get("private_clues") or []
+
+    # 初始：每个嫌疑人一条线索都没有
+    distributed = {name: [] for name in suspect_names}
+
+    # 第一遍：holder 合法的私密线索，归位到对应角色
+    unassigned = []
+    for clue in private:
+        if not isinstance(clue, dict):
+            continue
+        content = clue.get("content", "")
+        holder = clue.get("holder", "")
+        if content and holder in distributed:
+            distributed[holder].append(content)
+        elif content:
+            unassigned.append(content)   # holder 写错 / 缺失，先收集起来
+
+    # 兜底：holder 对不上嫌疑人名单的线索，负载均衡分配——
+    # 每条都分给"当前持有线索最少"的角色，保证不丢线索、也不偏爱任何人。
+    if unassigned and suspect_names:
+        for content in unassigned:
+            target = min(suspect_names, key=lambda n: len(distributed[n]))
+            distributed[target].append(content)
+
+    # clues_pool：所有线索的完整清单（公开 + 私密），供 DM 揭晓时复盘"哪些线索从未被公开"
+    clues_pool = public + [
+        (c.get("content", "") if isinstance(c, dict) else c) for c in private
+    ]
+
+    return {
+        "clues_pool": clues_pool,
+        "distributed_clues": distributed,
+    }
+
+
 def dm_intro_node(state: dict) -> dict:
-    """节点 2：DM 开场介绍，然后把阶段推进到讨论"""
+    """节点 2：DM 开场介绍（只公布公共线索，私密线索各角色私下掌握）"""
     script = state.get("script", {})
     background = script.get("background", script.get("raw", ""))
     suspects = script.get("suspects", [])
-    clues = script.get("clues", [])
+    public_clues = script.get("public_clues", [])
     user_role = state.get("user_role", "")
 
     prompt = f"""你是一位剧本杀主持人（DM）。现在进入【开场】阶段。
 
 案件背景：{background}
 登场嫌疑人：{suspects}
-可公开线索：{clues}
+可公开线索（这些可以当众公布）：{public_clues}
+
+【重要规则】这是一局"信息不对称"的剧本杀：
+- 每个嫌疑人私下都握有只属于自己的私密线索（已悄悄发到各自手里，不在这里列出，你也不知道具体内容）。
+- 你在开场时只能公布上面的"可公开线索"，绝不能编造或公布私密线索。
+- 你要引导玩家：真相散落在不同人手里，需要大家讨论、互相盘问才能拼出全貌。
 
 请用主持人的口吻：
 1. 宣布案件发生，介绍背景和嫌疑人
-2. 公布可公开的线索
-3. 宣布进入自由讨论，规则是嫌疑人轮流发言
+2. 公布可公开线索
+3. 说明"每人手中握有私密线索"，鼓励玩家互相套话
+4. 宣布进入自由讨论，规则是嫌疑人轮流发言
 
 注意：{user_role} 是真人玩家扮演的，介绍时正常介绍即可。
 
@@ -129,6 +233,10 @@ def ai_player_turn_node(state: dict) -> dict:
     secret = speaker.get("secret", "无")
     forbidden = speaker.get("forbidden", [])   # 禁忌词：绝对不能公开说
 
+    # 信息差：只把"这个角色自己持有的私密线索"告诉它，别的角色有什么它不知道
+    own_clues = state.get("distributed_clues", {}).get(name, [])
+    clues_text = "\n".join(f"- {c}" for c in own_clues) if own_clues else "（你没有额外的私密线索）"
+
     history = "\n".join(
         f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])[-6:]
     )
@@ -137,13 +245,16 @@ def ai_player_turn_node(state: dict) -> dict:
 
 你的秘密（只能你自己知道，绝不能在发言中直接承认）：{secret}
 
+你手里握有的私密线索（只有你知道；是否公开、公开多少、如何曲解，都由你决定）：
+{clues_text}
+
 最近对话：
 {history if history else "（还没有人发言）"}
 
 请以「{name}」的口吻，输出 JSON：
 {{
-  "think": "你的内心推理（不公开）：你在隐瞒什么、怀疑谁、想引导什么",
-  "speak": "你公开说的话（1~3 句，符合人设）"
+  "think": "你的内心推理（不公开）：你在隐瞒什么、怀疑谁、想引导什么、手里的线索指向谁",
+  "speak": "你公开说的话（1~3 句，符合人设。可选择性抛出部分线索引导他人，也可隐瞒）
 }}"""
 
     # 防跑飞（确定性校验 + 重试）：

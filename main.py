@@ -21,15 +21,23 @@ if __name__ == "__main__":
         config,
     )
 
-    # ---- 打印你的角色卡（让你知道自己的秘密，才能带入角色）----
+    # ---- 打印你的角色卡（让你知道自己的秘密 + 私密线索，才能带入角色）----
     script = result.get("script", {})
     user_role = result.get("user_role", "你")
     suspects = script.get("suspects", [])
     user_secret = next((s.get("secret", "") for s in suspects if s.get("name") == user_role), "")
+    # 信息差：只显示你自己持有的私密线索，别人的线索你看不到
+    user_clues = result.get("distributed_clues", {}).get(user_role, [])
     print("=" * 46)
     print(f"【你的角色卡】你扮演：{user_role}")
     print(f"  你的秘密（只能自己知道，别主动暴露）：{user_secret}")
-    print(f"  目标：隐瞒秘密，同时找出真凶")
+    print("  你掌握的私密线索（只有你知道，是否公开由你决定）：")
+    if user_clues:
+        for c in user_clues:
+            print(f"    · {c}")
+    else:
+        print("    · （你没有任何私密线索，只能靠盘问别人）")
+    print(f"  目标：隐瞒秘密，同时从别人嘴里套线索、找出真凶")
     print("=" * 46)
 
     # ---- 边玩边打印：只打印"新增"的消息 ----

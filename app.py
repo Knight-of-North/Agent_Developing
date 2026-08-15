@@ -61,12 +61,21 @@ else:
     user_role = result.get("user_role", "你")
     suspects = script.get("suspects", [])
     user_secret = next((s.get("secret", "") for s in suspects if s.get("name") == user_role), "")
+    # 信息差：只显示你自己持有的私密线索
+    user_clues = result.get("distributed_clues", {}).get(user_role, [])
 
     with st.sidebar:
         st.header("🪪 你的角色卡")
         st.subheader(user_role)
         st.caption("你的秘密（别主动暴露）")
         st.info(user_secret)
+        st.divider()
+        st.caption("🔍 你掌握的私密线索（只有你知道）")
+        if user_clues:
+            for c in user_clues:
+                st.markdown(f"· {c}")
+        else:
+            st.markdown("· （你没有任何私密线索，只能靠盘问别人）")
         st.divider()
         st.caption("嫌疑人名单")
         for s in suspects:
