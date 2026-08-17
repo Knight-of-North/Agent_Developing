@@ -8,6 +8,7 @@ import streamlit as st
 from langgraph.types import Command
 from graph import build_graph
 from nodes import generate_script_stream, _parse_names
+from interrupt_handler import get_interrupt, get_interrupt_type, validate_vote
 
 
 # 缓存图对象：这样 MemorySaver 的状态在 Streamlit 会话内不会丢
@@ -30,37 +31,49 @@ def _run_stream(graph, cmd, config):
     跑完时是完整 state。这样下游逻辑不用改。
     """
     placeholder = st.empty()
-    segments = []   # 已完成的片段（DM 台词 + AI 发言，按顺序）
-    current = ""    # 当前正在生成的 DM 台词 token
+    segments = []        # 已完成的片段（DM 台词 + AI 发言，按顺序）
+    current_parts = []   # 当前正在生成的 DM 台词 token（list 累积，O(n)，避免 += 的 O(n²)）
+    pending = 0          # 距上次渲染累计的字符数，用于节流
 
     def render():
         parts = list(segments)
-        if current:
-            parts.append(current)
+        if current_parts:
+            parts.append("".join(current_parts))
         placeholder.markdown("\n\n".join(parts))
 
-    for chunk in graph.stream(cmd, config, stream_mode=["messages", "updates"], version="v2"):
-        t = chunk.get("type")
-        d = chunk.get("data")
-        if t == "messages":
-            token, meta = d
-            node = meta.get("langgraph_node")
-            # 只显示 DM 台词的 token；AI 发言的 token（含 think）不显示
-            if node in ("dm_intro", "dm_reveal") and token.content:
-                current += token.content
+    try:
+        for chunk in graph.stream(cmd, config, stream_mode=["messages", "updates"], version="v2"):
+            t = chunk.get("type")
+            d = chunk.get("data")
+            if t == "messages":
+                token, meta = d
+                node = meta.get("langgraph_node")
+                # 只显示 DM 台词的 token；AI 发言的 token（含 think）不显示
+                if node in ("dm_intro", "dm_reveal") and token.content:
+                    current_parts.append(token.content)
+                    pending += len(token.content)
+                    if pending >= 24:      # 节流：攒够 24 字符才渲染，避免每个 token 全量重写 DOM
+                        render()
+                        pending = 0
+            elif t == "updates":
+                if "__interrupt__" in d:
+                    # 图暂停在 interrupt：从 checkpoint 拿完整 state，附上 interrupt 信息返回
+                    state = graph.get_state(config).values
+                    return {**state, "__interrupt__": d["__interrupt__"]}
+                # 节点完成：把新产生的公开消息（speak，不含 think）逐条封存显示
+                for node, update in d.items():
+                    if isinstance(update, dict):
+                        for m in update.get("messages", []):
+                            segments.append(f"**{m['speaker']}**：{m['content']}")
+                current_parts = []   # 节点结束，清空当前 token 累积
+                pending = 0
                 render()
-        elif t == "updates":
-            if "__interrupt__" in d:
-                # 图暂停在 interrupt：从 checkpoint 拿完整 state，附上 interrupt 信息返回
-                state = graph.get_state(config).values
-                return {**state, "__interrupt__": d["__interrupt__"]}
-            # 节点完成：把新产生的公开消息（speak，不含 think）逐条封存显示
-            for node, update in d.items():
-                if isinstance(update, dict):
-                    for m in update.get("messages", []):
-                        segments.append(f"**{m['speaker']}**：{m['content']}")
-            current = ""   # 节点结束，清空当前 token 累积
-            render()
+    except Exception as e:
+        # 游戏进行中 LLM 断连/超时会在这里抛出，不能让页面显示 traceback 红屏
+        st.error(f"游戏运行出错：{type(e).__name__}：{e}")
+        st.info("可能是网络波动或 DeepSeek 临时限流，请重新输入重试当前步骤。")
+        st.stop()   # 保留旧的 st.session_state.result（停在当前 interrupt），页面回到输入框允许重试
+    render()   # 收尾：把最后不足 24 字符的 token 也渲染出来
     # 图正常跑完（没有 interrupt）
     return graph.get_state(config).values
 
@@ -126,15 +139,26 @@ if not st.session_state.started:
         st.markdown("### 🎬 正在生成剧本...")
         gen = generate_script_stream(theme_val, background, story_val, custom_names, time_val, location_val)
         placeholder = st.empty()
-        full_text = ""
+        parts = []   # 用 list 累积 token（O(n)），避免 full_text += token 的 O(n²)
+        pending = 0  # 距上次刷新累计的字符数，用于节流显示
         script = None
         try:
             while True:
                 token = next(gen)
-                full_text += token
-                placeholder.code(full_text, language=None)   # 实时显示生成中的原始 JSON
+                parts.append(token)
+                pending += len(token)
+                if pending >= 48:   # 攒够 48 字符才刷新，避免每个 token 全量重写 DOM
+                    placeholder.code("".join(parts), language=None)
+                    pending = 0
         except StopIteration as e:
             script = e.value   # 生成器 return 的最终 script
+        except Exception as e:
+            # LLM 网络异常 / 限流 / 超时会在这里抛出，不能让页面直接崩溃
+            st.error(f"剧本生成失败：{type(e).__name__}：{e}")
+            st.info("可能是网络波动或 DeepSeek 临时限流，请稍后点击「开始游戏」重试。")
+            st.session_state.started = False   # 回到输入页，允许重试
+            st.stop()
+        placeholder.code("".join(parts), language=None)   # 收尾：显示完整原始 JSON
         st.success("剧本生成完成！")
 
         # 把预生成好的 script 传给图（generate_script_node 检测到已有 script 会跳过）
@@ -159,8 +183,8 @@ else:
     result = st.session_state.result
 
     # ---- 阶段 1：开局选角色（图停在 choose_role interrupt，此时 user_role 还没定）----
-    if "__interrupt__" in result and result["__interrupt__"][0].value["type"] == "choose_role":
-        info = result["__interrupt__"][0].value
+    if get_interrupt_type(result) == "choose_role":
+        info = get_interrupt(result)
         st.markdown("### 🎭 选择你想扮演的角色")
         st.markdown("剧本已生成，请选一个嫌疑人扮演：")
         cols = st.columns(len(info["suspects"]))
@@ -209,8 +233,8 @@ else:
             st.markdown(f"**{m['speaker']}**：{m['content']}")
 
     # 处理 interrupt（human_turn / human_vote）
-    if "__interrupt__" in result:
-        info = result["__interrupt__"][0].value
+    info = get_interrupt(result)
+    if info:
         if info["type"] == "human_turn":
             # 显式 key：让"发言输入框"和"投票输入框"完全独立，
             # 避免 st.chat_input 值残留把发言文本带进投票环节
@@ -222,7 +246,7 @@ else:
             user_input = st.chat_input(f"投票：{', '.join(info['suspects'])}，输入你投谁的名字", key="vote_input")
             if user_input:
                 # 校验：必须是合法嫌疑人名字，防止残留的发言文本被当成投票
-                if user_input in info["suspects"]:
+                if validate_vote(user_input, info["suspects"]):
                     st.session_state.result = _run_stream(graph, Command(resume=user_input), config)
                     st.rerun()
                 else:
@@ -237,6 +261,14 @@ else:
             st.write(f"**得票最多：{result.get('vote_winner', '无人')}**")
             st.write(f"票数分布：{result.get('vote_counts', {})}")
         if st.button("再来一局", type="primary"):
+            # 清理当前 thread 的所有 checkpoint，释放 MemorySaver 内存。
+            # @st.cache_resource 让图单例常驻，MemorySaver 会累积每局的每一步快照，
+            # 不清理的话长时间运行内存持续增长（checkpointer.delete 是 langgraph>=1.0 的接口）
+            old_config = {"configurable": {"thread_id": st.session_state.thread_id}}
+            try:
+                graph.checkpointer.delete(old_config)
+            except Exception:
+                pass
             for key in ["started", "result", "thread_id"]:
                 st.session_state.pop(key, None)
             st.rerun()

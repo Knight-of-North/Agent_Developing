@@ -1,5 +1,5 @@
 """DeepSeek API 连通性测试
-用法：cd campus-agent && python test_api.py
+用法：cd Agent_Developing && python test_api.py
 读取 .env 中的 DEEPSEEK_API_KEY / DEEPSEEK_MODEL / DEEPSEEK_BASE_URL
 """
 import os

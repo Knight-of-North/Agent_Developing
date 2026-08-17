@@ -39,8 +39,12 @@ python main.py
 Agent_Developing/
 ├── main.py          # 入口：交互式游戏（含 interrupt 恢复循环）
 ├── graph.py         # LangGraph 图编排（节点注册、条件边、checkpointer）
-├── nodes.py         # 节点函数：多智能体 + 确定性节点
+├── nodes.py         # 节点函数：多智能体 + 确定性节点（纯编排，已拆薄）
+├── names.py         # 嫌疑人名字池 + 抽样（_parse_names / _pick_suspect_names）
+├── prompts.py       # prompt 构建（_build_script_prompt）
+├── validators.py    # 解析/规范化/兜底（_parse_json / _enforce_names / _extract_speak 等）
 ├── game_state.py    # 共享状态定义（TypedDict + reducer）
+├── tests/           # 纯函数单元测试（pytest，不烧 token）
 ├── diagnose.py      # 调试脚本（查看模型原始返回）
 ├── requirements.txt # 依赖清单
 └── .env.example     # 密钥配置模板

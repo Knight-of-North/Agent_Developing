@@ -1,0 +1,157 @@
+"""
+确定性校验 / 规范化 / 兜底工具（从 nodes.py 拆出）。
+
+这些都是"不调 LLM 的纯逻辑"，负责把 LLM 的输出校验、纠正、抢救。
+分层思想：LLM 负责生成，这些函数负责"兜底"——
+不指望 LLM 100% 听话，而是准备好它不听话时的退路。
+"""
+import json
+import re
+
+
+def _parse_json(text: str) -> dict:
+    """从模型输出里安全提取 JSON。
+
+    LLM 输出不规整是常态，逐级放宽尝试：
+    1. 直接 json.loads（最理想）
+    2. 提取 ```json ... ``` 或 ``` ``` 代码块里的内容
+    3. 从第一个 { 截取到最后一个 }（LLM 常在 JSON 前后加"好的，这是剧本："等引导文字）
+    都失败才返回 {"raw": 原文}，交给下游兜底。
+    """
+    text = text.strip()
+
+    # 先去掉首尾的 ``` 围栏（无论有没有 json 语言标记）
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 兜底 1：从文本里提取 ```json ... ``` 代码块
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # 兜底 2：从第一个 { 截取到最后一个 }（忽略 JSON 前后的引导文字）
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    return {"raw": text}
+
+
+def _enforce_names(script: dict, names: list[str]) -> dict:
+    """兜底：强制剧本里的嫌疑人名字 = 我们抽的名字。
+
+    名字是后续 choose_role / route_speaker / distribute_clues 的"主键"，
+    LLM 可能不听话改了名字，必须改回来，否则选角色、轮流发言全乱。
+    策略：尽量保留 LLM 给每个位置编的 secret / forbidden，只替换 name。
+    """
+    suspects = script.get("suspects") or []
+    fixed = []
+    for i, name in enumerate(names):
+        if i < len(suspects) and isinstance(suspects[i], dict):
+            s = dict(suspects[i])
+            s["name"] = name           # 只改名字，保留它编的 secret / forbidden
+        else:
+            # LLM 少给了嫌疑人，补一个空壳
+            s = {"name": name, "secret": "待补充", "forbidden": []}
+        fixed.append(s)
+    script["suspects"] = fixed
+    return script
+
+
+def _normalize_secret_first_person(secret: str) -> str:
+    """兜底：把 secret 开头的第三人称代词替换为第一人称。
+
+    LLM 偶尔偷懒用「他/她」写自己的秘密（应该是第一人称「我」），破坏代入感。
+    只替换 secret 开头的代词（其余地方的代词可能指别人，不动）。
+    """
+    if not secret:
+        return secret
+    # 按长度从长到短匹配，避免「她的」被先匹配成「她」+「的」
+    for old, new in [("她的", "我的"), ("他的", "我的"), ("她", "我"), ("他", "我")]:
+        if secret.startswith(old):
+            return new + secret[len(old):]
+    return secret
+
+
+def _normalize_secrets(script: dict) -> dict:
+    """把所有 suspect 的 secret 规范化为第一人称开头。"""
+    for s in script.get("suspects") or []:
+        if isinstance(s, dict) and "secret" in s:
+            s["secret"] = _normalize_secret_first_person(s["secret"])
+    return script
+
+
+def _fallback_clues(script: dict) -> dict:
+    """兜底：LLM 没按新格式（public_clues/private_clues）输出时，从旧 clues 字段抢救。
+
+    这是"确定性兜底"思想：不指望 LLM 100% 听话，而是准备好它不听话时的退路。
+    旧格式的 clues 是没标注持有者的纯字符串列表，这里把它切分：
+    前 2 条当公共线索，剩下的轮转分配给各嫌疑人，保证信息差仍然成立。
+    """
+    if script.get("public_clues") or script.get("private_clues"):
+        return script   # 已经是新格式，不用动
+
+    suspects = script.get("suspects") or []
+    names = [s.get("name") for s in suspects if s.get("name")]
+    old_clues = script.get("clues") or []
+    if not old_clues:
+        return script   # 连旧线索都没有，放弃兜底
+
+    # 前 2 条公开，剩余轮转分配（第 i 条分给第 i % len(names) 个嫌疑人）
+    public = old_clues[:2]
+    private = []
+    if names:
+        for i, c in enumerate(old_clues[2:]):
+            private.append({"holder": names[i % len(names)], "content": c})
+    else:
+        public = old_clues   # 没有嫌疑人名单，全部当公共线索
+
+    script["public_clues"] = public
+    script["private_clues"] = private
+    return script
+
+
+def _extract_speak(out: dict) -> str:
+    """从 LLM 解析结果里安全提取"公开发言"。
+
+    JSON 解析成功时直接取 speak；解析失败时 _parse_json 返回 {"raw": 全文}，
+    此时绝不能用 raw（raw 里混着 think 内心戏，公开出去 = 凶手剧透）。
+
+    用 json.JSONDecoder().raw_decode() 从 raw 中扫描第一个合法 JSON 对象——
+    它天然处理转义引号（\\"）、Unicode 转义（\\uXXXX）等情况，比正则健壮。
+    扫描不到再退回正则兜底。
+    """
+    if "speak" in out:
+        return out["speak"]
+    raw = out.get("raw", "")
+
+    # 用 JSONDecoder 从 raw 中扫描第一个合法 JSON 对象（天然处理转义）
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(raw):
+        start = raw.find("{", idx)
+        if start == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(raw, start)
+            if isinstance(obj, dict) and "speak" in obj:
+                return str(obj["speak"])
+            idx = end
+        except json.JSONDecodeError:
+            idx = start + 1   # 这个 { 不是合法 JSON 起点，往后找
+
+    # 兜底：正则（处理 speak 值不含转义引号的极端格式）
+    m = re.search(r'"speak"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+    return m.group(1) if m else "……（这个角色欲言又止）"

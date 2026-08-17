@@ -6,6 +6,7 @@ AI 剧本杀主持人 · 入口（Phase 5：用户选择角色，interrupt 人�
 from langgraph.types import Command
 from graph import build_graph
 from nodes import _parse_names
+from interrupt_handler import get_interrupt, validate_vote
 
 
 def print_role_card(result):
@@ -58,8 +59,8 @@ if __name__ == "__main__":
         return len(messages)
 
     # ---- 循环处理 interrupt：图暂停时，读提示 -> 用户输入 -> 恢复 ----
-    while "__interrupt__" in result:
-        info = result["__interrupt__"][0].value
+    while get_interrupt(result):
+        info = get_interrupt(result)
 
         if info["type"] == "choose_role":
             # 开局选角色：打印名单让用户挑
@@ -90,7 +91,7 @@ if __name__ == "__main__":
             suspects_list = info["suspects"]
             print(f"\n【投票】嫌疑人名单：{', '.join(suspects_list)}")
             user_input = input("你投谁（输入名字）：").strip()
-            while user_input not in suspects_list:
+            while not validate_vote(user_input, suspects_list):
                 print(f"  ⚠️ 无效投票，请从名单里选：{', '.join(suspects_list)}")
                 user_input = input("你投谁（输入名字）：").strip()
             result = graph.invoke(Command(resume=user_input), config)

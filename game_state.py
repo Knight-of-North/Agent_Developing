@@ -7,6 +7,17 @@ from typing import TypedDict, Annotated
 import operator
 
 
+def _merge_dict(a: dict, b: dict) -> dict:
+    """字典合并 reducer：两个节点返回的 dict 合并，后写入的覆盖同名键。
+
+    为什么 votes 需要它？votes 是普通 dict，LangGraph 默认"后写覆盖前写"，
+    会导致 ai_vote_node 返回的票被 human_vote_node 覆盖。用合并 reducer 后，
+    两个节点各自 `return {"votes": {...}}`，框架自动合并成一张完整投票表，
+    节点里就不用再手动 `dict(state.get("votes", {}))` 拷贝了。
+    """
+    return {**a, **b}
+
+
 class GameState(TypedDict, total=False):
     """total=False：字段不必一开始就填满，节点逐步往状态里添加。"""
 
@@ -29,7 +40,7 @@ class GameState(TypedDict, total=False):
     story_location: str
 
     # 用户自定义的嫌疑人名字（可选，列表。提供时优先于随机抽名，更有代入感）
-    custom_names: list
+    custom_names: list[str]
 
     # 剧本：generate_script_node 生成的结构化数据
     script: dict
@@ -49,20 +60,12 @@ class GameState(TypedDict, total=False):
     # AI 玩家的内心戏（think 通道），不展示给"其他玩家"
     thoughts: Annotated[list, operator.add]
 
-    # 玩家信息 {玩家名: 角色名}
-    players: dict
-
-    # AI 玩家列表
-    ai_players: list
-
-    # 线索池（所有线索）
-    clues_pool: list
-
     # 已分配的线索 {玩家名: [线索...]}
-    distributed_clues: dict
+    distributed_clues: dict[str, list[str]]
 
     # 投票结果 {投票者: 被投者}
-    votes: dict
+    # 用合并 reducer：ai_vote_node 和 human_vote_node 各自返回自己的票，框架自动合并
+    votes: Annotated[dict, _merge_dict]
 
     # 得票最多的嫌疑人（tally_node 统计得出）
     vote_winner: str
