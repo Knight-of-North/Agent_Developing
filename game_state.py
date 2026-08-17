@@ -51,8 +51,26 @@ class GameState(TypedDict, total=False):
     # 讨论轮次（配合条件边判断是否继续循环）
     phase_round: int
 
+    # 讨论节奏（每人发言轮数，默认 3；app 开局可选快/标准/深入 → 2/3/4）
+    rounds_per_player: int
+
+    # 中场引导是否已做过（dm_midpoint_node 触发一次后置 True，避免重复）
+    midpoint_done: bool
+
+    # 被玩家点名、待回应的角色名（空 = 无）。定向通信：玩家发言点名某 AI 后，
+    # 该 AI 优先回应一次，回应后清空（报告⑤⑮的"点名优先发言"）
+    pending_reply_to: str
+
+    # 玩家连续追问的剩余次数（>0 时 route_speaker 再次轮到玩家）。
+    # 玩家点名 AI 后置 1，AI 回应后玩家可追问一次，追问后归零——形成小交锋（报告④的轻量版）
+    follow_up: int
+
     # 用户扮演的角色名（generate_script_node 自动设为第一个嫌疑人）
     user_role: str
+
+    # 用户扮演的角色是否为凶手（choose_role_node 里对比 user_role 与 murderer 得出）。
+    # 用于差异化提示（"你是真凶，目标脱罪"）和结局演绎（完美犯罪）
+    user_is_murderer: bool
 
     # 公开对话历史（元素是 dict）：{"speaker": "角色名", "content": "台词"}
     messages: Annotated[list, operator.add]
@@ -62,6 +80,14 @@ class GameState(TypedDict, total=False):
 
     # 已分配的线索 {玩家名: [线索...]}
     distributed_clues: dict[str, list[str]]
+
+    # 线索公开状态 {线索内容: 首次提及的发言人}，讨论中逐条追踪哪些线索已被公开。
+    # 供 DM 中场引导、AI 发言提示"未公开线索"、复盘数据化使用（报告⑨）。
+    revealed_clues: Annotated[dict, _merge_dict]
+
+    # AI 自我记忆 {角色名: [该角色说过的关键陈述，最多保留最近 3 条]}。
+    # 防 AI 自相矛盾（第 2 轮说"在书房"第 8 轮说"在厨房"），凶手忘词会意外露馅
+    agent_memory: Annotated[dict, _merge_dict]
 
     # 投票结果 {投票者: 被投者}
     # 用合并 reducer：ai_vote_node 和 human_vote_node 各自返回自己的票，框架自动合并

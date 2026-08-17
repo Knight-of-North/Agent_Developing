@@ -9,6 +9,7 @@ from langgraph.types import Command
 from graph import build_graph
 from nodes import generate_script_stream, _parse_names
 from interrupt_handler import get_interrupt, get_interrupt_type, validate_vote
+from visualization import build_relations_html
 
 
 # 缓存图对象：这样 MemorySaver 的状态在 Streamlit 会话内不会丢
@@ -31,9 +32,11 @@ def _run_stream(graph, cmd, config):
     跑完时是完整 state。这样下游逻辑不用改。
     """
     placeholder = st.empty()
+    thinking_ph = st.empty()   # AI 发言期间的"思考中"占位（独立于 segments，节点完成后清掉）
     segments = []        # 已完成的片段（DM 台词 + AI 发言，按顺序）
     current_parts = []   # 当前正在生成的 DM 台词 token（list 累积，O(n)，避免 += 的 O(n²)）
     pending = 0          # 距上次渲染累计的字符数，用于节流
+    thinking = False     # 是否有 AI 玩家正在"思考"（发言 token 已到但发言未完成）
 
     def render():
         parts = list(segments)
@@ -48,8 +51,13 @@ def _run_stream(graph, cmd, config):
             if t == "messages":
                 token, meta = d
                 node = meta.get("langgraph_node")
-                # 只显示 DM 台词的 token；AI 发言的 token（含 think）不显示
-                if node in ("dm_intro", "dm_reveal") and token.content:
+                if node == "ai_player_turn":
+                    # AI 发言节点：token 含 think（内心戏=剧透）不显示，
+                    # 但用首个 token 触发"思考中"占位，消除等待期的冷场感
+                    if not thinking:
+                        thinking = True
+                        thinking_ph.markdown("💭 有嫌疑人正在思考……")
+                elif node in ("dm_intro", "dm_reveal") and token.content:
                     current_parts.append(token.content)
                     pending += len(token.content)
                     if pending >= 24:      # 节流：攒够 24 字符才渲染，避免每个 token 全量重写 DOM
@@ -60,7 +68,9 @@ def _run_stream(graph, cmd, config):
                     # 图暂停在 interrupt：从 checkpoint 拿完整 state，附上 interrupt 信息返回
                     state = graph.get_state(config).values
                     return {**state, "__interrupt__": d["__interrupt__"]}
-                # 节点完成：把新产生的公开消息（speak，不含 think）逐条封存显示
+                # 节点完成：先清掉"思考中"占位，再把新产生的公开消息逐条封存显示
+                thinking_ph.empty()
+                thinking = False
                 for node, update in d.items():
                     if isinstance(update, dict):
                         for m in update.get("messages", []):
@@ -69,10 +79,15 @@ def _run_stream(graph, cmd, config):
                 pending = 0
                 render()
     except Exception as e:
-        # 游戏进行中 LLM 断连/超时会在这里抛出，不能让页面显示 traceback 红屏
-        st.error(f"游戏运行出错：{type(e).__name__}：{e}")
-        st.info("可能是网络波动或 DeepSeek 临时限流，请重新输入重试当前步骤。")
-        st.stop()   # 保留旧的 st.session_state.result（停在当前 interrupt），页面回到输入框允许重试
+        # 游戏进行中 LLM 断连/超时会在这里抛出。
+        # 把错误存到 st.session_state 而不是只调 st.error()——
+        # 因为下面 st.stop() 会抛 StopException，新脚本不再渲染旧 st.error，
+        # 错误就一闪而过看不到了。session_state 跨 rerun 保留，
+        # 顶层（st.set_page_config 之后）会渲染并提供"清除错误"按钮。
+        st.session_state.last_error = f"游戏运行出错：{type(e).__name__}：{e}"
+        st.error(st.session_state.last_error)   # 旧脚本里也渲染一次（让用户立即看到）
+        st.info("可能是网络波动或 DeepSeek 临时限流，请稍后重试。")
+        st.stop()   # 停止当前脚本，st.session_state.result 保持旧值，页面回到当前 interrupt 的输入框
     render()   # 收尾：把最后不足 24 字符的 token 也渲染出来
     # 图正常跑完（没有 interrupt）
     return graph.get_state(config).values
@@ -80,6 +95,15 @@ def _run_stream(graph, cmd, config):
 
 st.set_page_config(page_title="AI 剧本杀主持人", page_icon="🎭")
 graph = get_graph()
+
+# ---- 跨 rerun 持久化的错误提示 ----
+# _run_stream 内部抛异常时把错误存到 st.session_state.last_error，
+# 这里在每轮脚本顶部渲染（避免"一闪而过"看不到），用户点按钮清除。
+if "last_error" in st.session_state:
+    st.error(st.session_state.last_error)
+    if st.button("清除错误，继续游戏"):
+        del st.session_state.last_error
+        st.rerun()
 
 # ---- 初始化会话状态（跨 rerun 保存）----
 if "thread_id" not in st.session_state:
@@ -126,6 +150,9 @@ if not st.session_state.started:
         custom_names = _parse_names(custom_names_text)
         if custom_names and len(custom_names) < 3:
             st.caption("⚠️ 至少 3 个名字，否则会自动退回随机生成")
+    # 讨论节奏：快/标准/深入 → 每人发言 2/3/4 轮（报告⑫：轮数可调，避免垃圾时间/意犹未尽）
+    pace = st.radio("讨论节奏", ["快（每人2轮）", "标准（每人3轮）", "深入（每人4轮）"], horizontal=True)
+    rounds_per_player = {"快（每人2轮）": 2, "标准（每人3轮）": 3, "深入（每人4轮）": 4}[pace]
     if st.button("开始游戏", type="primary"):
         st.session_state.started = True
         theme_val = theme.strip() or "自由发挥"
@@ -171,6 +198,7 @@ if not st.session_state.started:
                 "story_time": time_val,
                 "story_location": location_val,
                 "custom_names": custom_names,
+                "rounds_per_player": rounds_per_player,
                 "messages": [],
                 "thoughts": [],
             },
@@ -209,6 +237,9 @@ else:
     with st.sidebar:
         st.header("🪪 你的角色卡")
         st.subheader(user_role)
+        # 玩家是凶手时给特殊提示（否则会陷入"知道自己是凶手却无事可做"的断裂）
+        if result.get("user_is_murderer"):
+            st.warning("🩸 你是真凶！你的目标：误导其他人、隐藏证据、别被投出去。")
         st.caption("你的秘密（别主动暴露）")
         st.info(user_secret)
         st.divider()
@@ -223,6 +254,14 @@ else:
         for s in suspects:
             mark = "（你）" if s.get("name") == user_role else ""
             st.write(f"· {s.get('name')}{mark}")
+        st.divider()
+        # 人物关系图（仅公开关系，私密关系属信息差不显示）
+        st.caption("🕸️ 人物关系图（仅公开关系）")
+        relations_html = build_relations_html(script.get("relations", []), [s.get("name", "?") for s in suspects])
+        if relations_html:
+            st.components.v1.html(relations_html, height=380)
+        else:
+            st.caption("（剧本未生成公开关系）")
 
     # 对话历史（主区域）：直接渲染。
     # 真流式已经在"等待时"实时显示过了，这里无需再打字机回放。

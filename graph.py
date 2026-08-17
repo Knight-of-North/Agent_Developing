@@ -26,11 +26,13 @@ from nodes import (
     distribute_clues_node,
     choose_role_node,
     dm_intro_node,
+    dm_midpoint_node,
     ai_player_turn_node,
     human_turn_node,
     ai_vote_node,
     human_vote_node,
     tally_node,
+    final_statement_node,
     dm_reveal_node,
     route_speaker,
 )
@@ -44,11 +46,13 @@ def build_graph():
     builder.add_node("distribute_clues", distribute_clues_node)   # 信息差：线索分发
     builder.add_node("choose_role", choose_role_node)             # interrupt：用户选角色
     builder.add_node("dm_intro", dm_intro_node)
+    builder.add_node("dm_midpoint", dm_midpoint_node)             # DM 中场引导（讨论过半触发）
     builder.add_node("ai_player_turn", ai_player_turn_node)
     builder.add_node("human_turn", human_turn_node)   # interrupt 节点
     builder.add_node("ai_vote", ai_vote_node)
     builder.add_node("human_vote", human_vote_node)   # interrupt 节点
     builder.add_node("tally", tally_node)
+    builder.add_node("final_statement", final_statement_node)   # 被投最高者的最终陈词
     builder.add_node("dm_reveal", dm_reveal_node)
 
     # 前半段：生成剧本 -> 分发线索 -> 选角色 -> DM 开场
@@ -57,21 +61,24 @@ def build_graph():
     builder.add_edge("distribute_clues", "choose_role")
     builder.add_edge("choose_role", "dm_intro")
 
-    # 条件边：讨论循环的路由（挂在三个"发言入口"之后）
-    # route_speaker 根据 phase_round 决定下一个发言者是用户还是 AI，或进入投票
+    # 条件边：讨论循环的路由（挂在三个"发言入口"之后 + 中场引导之后）
+    # route_speaker 根据 phase_round 决定下一个发言者是用户还是 AI、中场引导、或进入投票
     route_map = {
         "human": "human_turn",
         "ai": "ai_player_turn",
+        "midpoint": "dm_midpoint",
         "vote": "ai_vote",
     }
     builder.add_conditional_edges("dm_intro", route_speaker, route_map)
     builder.add_conditional_edges("ai_player_turn", route_speaker, route_map)
     builder.add_conditional_edges("human_turn", route_speaker, route_map)
+    builder.add_conditional_edges("dm_midpoint", route_speaker, route_map)
 
-    # 投票链：AI 投票 -> 用户投票 -> 统计 -> 揭晓
+    # 投票链：AI 投票 -> 用户投票 -> 统计 -> 最终陈词 -> 揭晓
     builder.add_edge("ai_vote", "human_vote")
     builder.add_edge("human_vote", "tally")
-    builder.add_edge("tally", "dm_reveal")
+    builder.add_edge("tally", "final_statement")
+    builder.add_edge("final_statement", "dm_reveal")
     builder.add_edge("dm_reveal", END)
 
     # 关键：带上 checkpointer，图才能在 interrupt 处暂停并记住进度

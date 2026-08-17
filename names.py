@@ -39,6 +39,11 @@ _NAME_POOLS = {
 # dict.fromkeys 保序去重：O(k)，替代之前 `if x not in list` 的 O(k²) 线性扫描。
 _MIXED_POOL = list(dict.fromkeys(n for pool in _NAME_POOLS.values() for n in pool))
 
+# 本会话已用过的名字集合：避免重玩撞脸。
+# 名字池每风格仅 16 个、混合池约 80 个，同一风格玩 4~5 局后重复概率显著上升，
+# 撞名会瞬间唤起上一局的记忆、破坏"新故事"的感觉。抽样时优先排除已用名字。
+_used_names: set[str] = set()
+
 
 def _parse_names(text: str) -> list[str]:
     """解析用户输入的自定义名字列表（支持逗号/顿号/分号/冒号/竖线/斜杠/空格/换行分隔，去重保序）。
@@ -75,6 +80,14 @@ def _pick_suspect_names(background: str, custom_names: list[str] | None = None) 
             return cleaned[:6]   # 最多 6 个嫌疑人
 
     pool = _NAME_POOLS.get(background, _MIXED_POOL)
+    # 优先从未用过的名字里抽，避免和之前几局撞脸
+    fresh = [n for n in pool if n not in _used_names]
+    if len(fresh) < 4:
+        # 新鲜名字不够抽一整局了，重置（允许从头复用）
+        _used_names.clear()
+        fresh = list(pool)
     n = random.randint(4, 6)          # 嫌疑人数量也随机，增强可玩性
-    n = min(n, len(pool))             # 名字池不够抽时退而求其次
-    return random.sample(pool, n)
+    n = min(n, len(fresh))            # 名字池不够抽时退而求其次
+    picked = random.sample(fresh, n)
+    _used_names.update(picked)        # 标记本会话已用
+    return picked

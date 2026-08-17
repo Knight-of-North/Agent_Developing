@@ -25,6 +25,7 @@ Phase 5 节点清单（用户选择角色）：
 """
 import os
 import logging
+import re
 from collections import Counter
 from dotenv import load_dotenv
 from langchain_deepseek import ChatDeepSeek
@@ -100,12 +101,62 @@ def _stream_full_text(prompt: str, *, allow_partial: bool = True) -> str:
     return "".join(parts)
 
 
+def _check_script_consistency(script: dict) -> list[str]:
+    """剧本自洽性确定性检查，返回问题列表（空列表 = 通过）。
+
+    对应"赢不了的局"风险：线索与真相不自洽时，玩家认真推理却必然失败，
+    且事后看不出是系统问题。这里做三条低成本检查：
+    1. truth 里必须提到某个嫌疑人名字（凶手在名单内）
+    2. 每个嫌疑人的 forbidden 词至少有 1 个出现在自己的 secret 里（防泄露机制才有效）
+    3. 至少要有私密线索（信息差的基础，全空则玩不下去）
+    """
+    problems = []
+    suspects = script.get("suspects") or []
+    names = [s.get("name", "") for s in suspects if isinstance(s, dict) and s.get("name")]
+    truth = script.get("truth", "")
+
+    if truth and names and not any(n and n in truth for n in names):
+        problems.append("truth 未提到任何嫌疑人名字")
+
+    for s in suspects:
+        if not isinstance(s, dict):
+            continue
+        secret = s.get("secret", "")
+        forbidden = s.get("forbidden", []) or []
+        if secret and forbidden and not any(w and w in secret for w in forbidden):
+            problems.append(f"{s.get('name', '?')} 的 forbidden 词未出现在 secret 里")
+
+    if not (script.get("private_clues") or script.get("public_clues")):
+        problems.append("没有任何线索")
+
+    return problems
+
+
+def _get_murderer(script: dict, suspect_names: list[str]) -> str:
+    """提取凶手名字：优先读 murderer 字段（结构化），否则从 truth 里子串匹配嫌疑人名字兜底。
+
+    murderer 是结构化字段（"玩家是凶手""AI 目标注入"都靠它精确判断谁是凶手）；
+    旧格式剧本没有这个字段时，从 truth 文本里找第一个出现的嫌疑人名字。
+    """
+    murderer = script.get("murderer", "")
+    if murderer and murderer in suspect_names:
+        return murderer
+    # 兜底：从 truth 里找第一个出现的嫌疑人名字
+    truth = script.get("truth", "")
+    for n in suspect_names:
+        if n and n in truth:
+            return n
+    return ""
+
+
 def generate_script_node(state: GameState) -> dict:
     """节点 1：生成结构化剧本（不再指定用户角色，改由 choose_role_node 让用户选）
 
     两个入口：
     - 如果 state 里已经有 script（前端用流式预生成好了），直接跳过，不重复生成。
     - 否则用 llm.invoke 兜底生成（终端版 main.py 走这条路）。
+
+    生成后做自洽校验，不过则重试（最多 2 次），仍不过放行但记日志。
     """
     if state.get("script"):
         return {"current_phase": "intro"}   # 剧本已预生成，跳过
@@ -121,11 +172,17 @@ def generate_script_node(state: GameState) -> dict:
     names = _pick_suspect_names(background, custom_names)
     prompt = _build_script_prompt(theme, background, names, background_story, story_time, story_location)
 
-    resp = get_llm().invoke(prompt)
-    script = _parse_json(resp.content)
-    script = _fallback_clues(script)        # 兜底：LLM 没按新格式给线索时，从旧格式抢救
-    script = _enforce_names(script, names)  # 兜底：强制剧本名字 = 我们抽的名字
-    script = _normalize_secrets(script)     # 兜底：secret 强制第一人称开头
+    script = None
+    for attempt in range(2):   # 最多生成 2 次（自洽校验不过则重试）
+        resp = get_llm().invoke(prompt)
+        script = _parse_json(resp.content)
+        script = _fallback_clues(script)        # 兜底：LLM 没按新格式给线索时，从旧格式抢救
+        script = _enforce_names(script, names)  # 兜底：强制剧本名字 = 我们抽的名字
+        script = _normalize_secrets(script)     # 兜底：secret 强制第一人称开头
+        problems = _check_script_consistency(script)
+        if not problems:
+            break
+        logger.warning("剧本自洽校验未通过（第 %d 次）：%s", attempt + 1, problems)
     return {"script": script, "current_phase": "intro"}
 
 
@@ -146,19 +203,26 @@ def generate_script_stream(theme: str, background: str, background_story: str = 
     names = _pick_suspect_names(background, custom_names)
     prompt = _build_script_prompt(theme, background, names, background_story, story_time, story_location)
 
-    # 用 list 累积 token，最后 join（O(n)），避免 `full += token` 的 O(n²) 复制
-    parts = []
-    for chunk in get_llm().stream(prompt):
-        token = chunk.content or ""
-        if token:
-            parts.append(token)
-            yield token
+    # 生成 + 兜底 + 自洽校验（不过则重试，最多 2 次）
+    script = None
+    for attempt in range(2):
+        # 用 list 累积 token，最后 join（O(n)），避免 `full += token` 的 O(n²) 复制
+        parts = []
+        for chunk in get_llm().stream(prompt):
+            token = chunk.content or ""
+            if token:
+                parts.append(token)
+                yield token
 
-    # 流式结束后，用累积的完整文本做解析 + 兜底（和节点里的后处理完全一致）
-    script = _parse_json("".join(parts))
-    script = _fallback_clues(script)
-    script = _enforce_names(script, names)
-    script = _normalize_secrets(script)   # 兜底：secret 强制第一人称开头
+        # 流式结束后，用累积的完整文本做解析 + 兜底（和节点里的后处理完全一致）
+        script = _parse_json("".join(parts))
+        script = _fallback_clues(script)
+        script = _enforce_names(script, names)
+        script = _normalize_secrets(script)   # 兜底：secret 强制第一人称开头
+        problems = _check_script_consistency(script)
+        if not problems:
+            break
+        logger.warning("剧本自洽校验未通过（第 %d 次）：%s", attempt + 1, problems)
     return script
 
 
@@ -202,9 +266,59 @@ def distribute_clues_node(state: GameState) -> dict:
             target = min(suspect_names, key=lambda n: len(distributed[n]))
             distributed[target].append(content)
 
+    # 均衡兜底：尽量消除"白板角色"（整局无存在感、开局即劝退）。
+    # 只从"线索数 > 1"的角色匀一条给零线索角色，且保证 donor 匀完还剩至少 1 条——
+    # 避免拆东墙补西墙（把一个人匀光、制造新的白板）。
+    for n in [x for x in suspect_names if not distributed[x]]:
+        donors = [x for x in suspect_names if len(distributed[x]) > 1]
+        if not donors:
+            break   # 没有多线索角色可匀了，剩余白板只能留白（线索总量不够，数学上无解）
+        donor = max(donors, key=lambda x: len(distributed[x]))
+        distributed[n].append(distributed[donor].pop())
+
     return {
         "distributed_clues": distributed,
     }
+
+
+def _extract_clue_keywords(clue: str) -> list[str]:
+    """从线索内容里抽关键词（用于判断线索是否在发言中被公开提及）。
+
+    简单启发式：按标点/空白切分，取长度 >= 2 的片段当关键词。
+    足够用来做"这条线索有没有被人说出来"的粗略判断，不必精确。
+    """
+    words = re.split(r"[，。、；：？！\s]+", clue)
+    return [w for w in words if len(w) >= 2]
+
+
+def _update_revealed_clues(speak: str, distributed_clues: dict, revealed_clues: dict) -> dict:
+    """发言后更新线索公开状态：发言里出现某条线索的关键词，就标记为公开。
+
+    返回本次新公开的线索映射 {线索内容: 首次提及者}（只返回新增，已公开的跳过）。
+    纯确定性逻辑，不调 LLM。
+    """
+    newly = {}
+    for holder, clues in distributed_clues.items():
+        for clue in clues:
+            if clue in revealed_clues:
+                continue   # 已公开，跳过
+            keywords = _extract_clue_keywords(clue)
+            if any(kw and kw in speak for kw in keywords):
+                newly[clue] = holder
+    return newly
+
+
+def _detect_addressed(speak: str, names: list[str]) -> str:
+    """检测发言里点名了哪个嫌疑人（简单子串匹配，返回第一个被点到的名字，无则空串）。
+
+    用于"点名优先发言"：玩家问"陆明轩案发当晚你在哪"时，检测到"陆明轩"，
+    让陆明轩下一个优先回应。子串匹配可能误伤（名字是另一个名字的子串），
+    但作为启发式足够——真正的回应质量由 prompt 的"必须回应"规则兜底。
+    """
+    for n in names:
+        if n and n in speak:
+            return n
+    return ""
 
 
 def choose_role_node(state: GameState) -> dict:
@@ -229,11 +343,13 @@ def choose_role_node(state: GameState) -> dict:
     # 不让非法输入污染后续的 route_speaker / human_turn 逻辑。
     if chosen not in names:
         chosen = names[0]
-    return {"user_role": chosen}
+    # 判断玩家是否选到了凶手（用于差异化提示 + 完美犯罪结局）
+    murderer = _get_murderer(script, names)
+    return {"user_role": chosen, "user_is_murderer": chosen == murderer}
 
 
 def dm_intro_node(state: GameState) -> dict:
-    """节点 2：DM 开场介绍（只公布公共线索，私密线索各角色私下掌握）"""
+    """节点 2：DM 开场介绍（只公布公共线索和公开关系，私密线索/私密关系各角色私下掌握）"""
     script = state.get("script", {})
     background = script.get("background", script.get("raw", ""))
     suspects = script.get("suspects", [])
@@ -241,24 +357,34 @@ def dm_intro_node(state: GameState) -> dict:
     # 否则 prompt 里"你也不知道私密线索"就和传入内容自相矛盾，DM 会在开场白剧透。
     names = [s.get("name", "?") for s in suspects]
     public_clues = script.get("public_clues", [])
+    # 公开的人物关系（public=true 的才能当众介绍；私密关系仍属信息差，玩家要自己盘）
+    relations = script.get("relations", [])
+    public_relations = [
+        f"{r.get('from', '?')} 与 {r.get('to', '?')}：{r.get('rel', '')}"
+        for r in relations if isinstance(r, dict) and r.get("public", False)
+    ]
+    relations_text = "\n".join(f"- {t}" for t in public_relations) if public_relations else "（人物之间的恩怨情仇，等玩家自己盘问）"
     user_role = state.get("user_role", "")
 
     prompt = f"""你是一位剧本杀主持人（DM）。现在进入【开场】阶段。
 
 案件背景：{background}
 登场嫌疑人：{names}
+公开人物关系（这些可以当众介绍，帮助玩家建立人物印象）：
+{relations_text}
 可公开线索（这些可以当众公布）：{public_clues}
 
 【重要规则】这是一局"信息不对称"的剧本杀：
 - 每个嫌疑人私下都握有只属于自己的私密线索（已悄悄发到各自手里，不在这里列出，你也不知道具体内容）。
-- 你在开场时只能公布上面的"可公开线索"，绝不能编造或公布私密线索。
+- 你在开场时只能公布上面的"可公开线索"和"公开人物关系"，绝不能编造或公布私密线索、私密关系。
 - 你要引导玩家：真相散落在不同人手里，需要大家讨论、互相盘问才能拼出全貌。
 
 请用主持人的口吻，把案件背景像讲故事一样娓娓道来（自然融入，不要照念、不要机械罗列），依次：
 1. 用一段有画面感的开场，把案件背景和嫌疑人自然引出来
-2. 公布可公开线索
-3. 说明"每人手中握有私密线索"，鼓励玩家互相套话
-4. 自然过渡到自由讨论，规则是嫌疑人轮流发言
+2. 借公开人物关系，简要勾勒"谁和谁有什么纠葛"（点到为止，勾出嫌疑即可）
+3. 公布可公开线索
+4. 说明"每人手中握有私密线索"，鼓励玩家互相套话
+5. 自然过渡到自由讨论，规则是嫌疑人轮流发言
 
 注意：{user_role} 是真人玩家扮演的，介绍时正常介绍即可。
 
@@ -272,6 +398,39 @@ def dm_intro_node(state: GameState) -> dict:
     }
 
 
+def dm_midpoint_node(state: GameState) -> dict:
+    """节点 3.5：DM 中场引导（讨论过半时触发一次，基于线索公开情况给方向提示）。
+
+    真实 DM 的核心职能是中场控场——讨论后半程容易跑题冷场，这里在过半时插入
+    一次 2~3 句的中场引导：指出被忽略的线索方向、提醒盘问人物关系，但不剧透。
+    依赖 revealed_clues（线索公开追踪）提供"哪些线索还没浮出水面"的事实。
+    """
+    revealed = state.get("revealed_clues", {})
+    distributed = state.get("distributed_clues", {})
+
+    # 尚未被任何人公开提及的线索（还在某人手里藏着）
+    all_clues = [c for clues in distributed.values() for c in clues]
+    hidden = [c for c in all_clues if c not in revealed]
+
+    prompt = f"""你是剧本杀主持人（DM）。讨论已经过半，现在做一次中场引导。
+
+已经公开讨论的线索：{list(revealed.keys()) if revealed else "（还没有线索被公开讨论）"}
+尚未被提及的线索方向：{hidden if hidden else "（线索基本都浮出水面了）"}
+
+请用 2~3 句给出中场引导：
+- 指出大家似乎忽略了哪个方向（从"尚未被提及的线索"里挑，但**不要直接说出线索的具体内容**，只给模糊方向，比如"大家似乎都忽略了案发时间这个疑点"）
+- 提醒玩家关注还没被盘问清楚的人物关系
+- 绝不剧透真相、绝不编造线索
+
+只输出主持台词本身，不要额外解释。"""
+
+    resp = _stream_full_text(prompt)
+    return {
+        "messages": [{"speaker": "主持人", "content": resp}],
+        "midpoint_done": True,   # 标记中场引导已做，避免重复触发
+    }
+
+
 def ai_player_turn_node(state: GameState) -> dict:
     """节点 3：AI 玩家发言（think/speak 双通道 + 防泄露重试 + 确定性脱敏兜底）"""
     script = state.get("script", {})
@@ -280,10 +439,34 @@ def ai_player_turn_node(state: GameState) -> dict:
         return {"phase_round": state.get("phase_round", 0) + 1}
 
     round_num = state.get("phase_round", 0)
-    speaker = _current_speaker(state)
+    # 定向通信：玩家点名了某个 AI 时，优先让他回应（而非按轮换顺序），回应后清空 pending
+    pending = state.get("pending_reply_to", "")
+    suspect_names = [s.get("name", "") for s in suspects]
+    if pending and pending in suspect_names:
+        speaker = next(s for s in suspects if s.get("name") == pending)
+        clear_pending = {"pending_reply_to": ""}
+    else:
+        speaker = _current_speaker(state)
+        clear_pending = {}
     name = speaker.get("name", "嫌疑人")
     secret = speaker.get("secret", "无")
     forbidden = speaker.get("forbidden", [])   # 禁忌词：绝对不能公开说
+    personality = speaker.get("personality", "")
+    speech_style = speaker.get("speech_style", "")
+
+    # 判断当前发言者是否为凶手，注入不同目标（凶手脱罪 vs 无辜者找凶）——
+    # 没有目标的 agent 只是聊天机器人，有目标才有策略、欺骗、博弈
+    murderer = _get_murderer(script, suspect_names)
+    if name == murderer:
+        goal_text = """【你的目标】你是真凶，首要目标是不被投出去：
+- 不要主动提及任何能指向你的线索，尽量把嫌疑引向有动机的其他人
+- 被直接指控时，用你手里的有利线索为自己辩护
+- 可以撒谎、编造不在场证明，但要圆得回来，不能自相矛盾"""
+    else:
+        goal_text = """【你的目标】你是无辜者，首要目标是找出真凶：
+- 分享你手里的线索（但可保留最关键的一条作底牌）
+- 关注其他人发言中的矛盾，指出不合理之处
+- 被怀疑时为自己辩护，但不要慌乱"""
 
     # 信息差：只把"这个角色自己持有的私密线索"告诉它，别的角色有什么它不知道
     own_clues = state.get("distributed_clues", {}).get(name, [])
@@ -295,15 +478,30 @@ def ai_player_turn_node(state: GameState) -> dict:
         f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])[-max(6, len(suspects) * 2):]
     )
 
+    # 自我记忆：该角色之前说过的关键陈述（防自相矛盾）
+    memory = state.get("agent_memory", {}).get(name, [])
+    memory_text = "\n".join(f"- 你之前说过：{m}" for m in memory[-3:]) if memory else "（这是你第一次发言）"
+
     prompt = f"""你正在扮演剧本杀角色「{name}」。
 
+你的性格：{personality or "未指定"}
+你的说话风格：{speech_style or "未指定"}
 你的秘密（只能你自己知道，绝不能在发言中直接承认）：{secret}
+
+你之前说过的话（必须与之保持一致，不能自相矛盾；若之前说了谎，要圆回来而不是推翻）：
+{memory_text}
 
 你手里握有的私密线索（只有你知道；是否公开、公开多少、如何曲解，都由你决定）：
 {clues_text}
 
 最近对话：
 {history if history else "（还没有人发言）"}
+
+{goal_text}
+
+【发言要求】
+- 说话必须体现你的性格和说话风格，让玩家感受到你是一个"活人"，而不是复读机。
+- 若最近对话中有人直接向你提问、点名质疑你，你必须先正面回应（可以撒谎、可以回避、可以反将一军，但绝不能无视），再展开你自己的内容。
 
 请以「{name}」的口吻，输出 JSON：
 {{
@@ -334,10 +532,19 @@ def ai_player_turn_node(state: GameState) -> dict:
         if w and w in speak:
             speak = speak.replace(w, "□")
 
+    # 更新线索公开状态（发言里出现的线索关键词标记为公开）
+    revealed = _update_revealed_clues(speak, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
+
+    # 把本次发言存入自我记忆（保留最近 3 条），供下一轮"保持一致"使用
+    new_memory = (state.get("agent_memory", {}).get(name, []) + [speak])[-3:]
+
     return {
         "messages": [{"speaker": name, "content": speak}],
         "thoughts": [f"{name}（内心）: {think}"],
         "phase_round": round_num + 1,
+        "revealed_clues": revealed,
+        "agent_memory": {name: new_memory},
+        **clear_pending,
     }
 
 
@@ -351,9 +558,20 @@ def human_turn_node(state: GameState) -> dict:
     round_num = state.get("phase_round", 0)
     # 暂停，把提示信息传给 main.py
     user_input = interrupt({"type": "human_turn", "speaker": user_role})
+    # 更新线索公开状态
+    revealed = _update_revealed_clues(user_input, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
+    # 检测玩家点名了哪个 AI（排除自己），被点名者下一个优先回应
+    script = state.get("script", {})
+    suspect_names = [s.get("name", "") for s in script.get("suspects", [])]
+    addressed = _detect_addressed(user_input, [n for n in suspect_names if n != user_role])
+    # 点名了 AI → 给一次追问机会（follow_up=1）；没点名 → 归零（恢复轮换）
+    follow_up = 1 if addressed else 0
     return {
         "messages": [{"speaker": user_role, "content": user_input}],
         "phase_round": round_num + 1,
+        "revealed_clues": revealed,
+        "pending_reply_to": addressed,
+        "follow_up": follow_up,
     }
 
 
@@ -466,6 +684,42 @@ def tally_node(state: GameState) -> dict:
     return {"vote_counts": vote_counts, "vote_winner": vote_winner}
 
 
+def final_statement_node(state: GameState) -> dict:
+    """节点 7.5：被投最高者的最终陈词（tally 与 reveal 之间，补上剧本杀的情绪最高点）。
+
+    真实剧本杀里"被投者自辩/遗言"是情绪高点，这里让得票最高的 AI 角色做一次
+    最后挣扎（喊冤或认罪由 LLM 根据其真实身份自由发挥）。
+    平票 / 无人投票 / 得票最高者恰好是真人玩家时跳过（玩家已在投票时表达）。
+    """
+    vote_winner = state.get("vote_winner", "")
+    user_role = state.get("user_role", "")
+    script = state.get("script", {})
+
+    if not vote_winner or str(vote_winner).startswith("平票") or vote_winner == user_role:
+        return {}   # 无单一 AI 被投最多，跳过陈词
+
+    suspects = script.get("suspects", [])
+    winner = next((s for s in suspects if s.get("name") == vote_winner), None)
+    secret = winner.get("secret", "无") if winner else "无"
+    truth = script.get("truth", "")
+
+    prompt = f"""你是剧本杀角色「{vote_winner}」，你在投票中被最多人指认为凶手。
+
+你的秘密：{secret}
+案件真相（你此刻扮演这个角色，请根据自己是否真凶来决定喊冤还是认罪）：{truth}
+
+请输出一段 2 句的最终陈词（这是你最后的自辩机会）：
+- 若你是凶手：可以继续狡辩、嫁祸他人，也可以突然认罪，由你自由发挥
+- 若你不是凶手：真诚喊冤，语气符合被冤枉的处境
+
+只输出陈词本身，不要 JSON、不要解释、不要"最终陈词"这类前缀。"""
+
+    resp = _stream_full_text(prompt)
+    return {
+        "messages": [{"speaker": vote_winner, "content": f"（最终陈词）{resp}"}],
+    }
+
+
 def _format_private_clues(distributed_clues: dict) -> str:
     """把 {角色名: [私密线索...]} 格式化成"谁持有哪条线索"的文本清单。
 
@@ -494,6 +748,19 @@ def dm_reveal_node(state: GameState) -> dict:
     # 完整投票明细（谁投了谁），让 DM 照实公布，而不是自己编
     votes_text = "、".join(f"{k}投{v}" for k, v in votes.items()) or "无人投票"
 
+    # 真人玩家投给了谁，让 DM 据此判断玩家投对/投错，做投错结局演绎
+    user_role = state.get("user_role", "你")
+    user_vote = votes.get(user_role, "未投")
+
+    # 玩家是否为凶手（"完美犯罪"结局）
+    user_is_murderer = state.get("user_is_murderer", False)
+    perfect_crime_note = ""
+    if user_is_murderer:
+        if str(vote_winner) != user_role:
+            perfect_crime_note = f"（注意：真人玩家 {user_role} 是真凶却未被投出，这是一场「完美犯罪」！请点出他/她是如何瞒天过海的）"
+        else:
+            perfect_crime_note = f"（真人玩家 {user_role} 是真凶且被识破了，请演绎他/她的伏法）"
+
     # 信息差闭环：把"私密线索总账"+"公开讨论记录"交给 LLM，让它复盘哪些线索被埋没
     clues_text = _format_private_clues(state.get("distributed_clues", {}))
     history = "\n".join(
@@ -505,6 +772,7 @@ def dm_reveal_node(state: GameState) -> dict:
 案件真相：{truth}
 投票明细（谁投了谁，务必照实公布，禁止编造）：{votes_text}
 票数统计：{vote_counts}（得票最多的是：{vote_winner}）{winner_note}
+真人玩家（{user_role}）投给了：{user_vote}
 
 【私密线索总账】开局时每个玩家私下只握有这些线索（别人不知道）：
 {clues_text}
@@ -517,7 +785,8 @@ def dm_reveal_node(state: GameState) -> dict:
 2. 揭晓真相（凶手、动机、手法）
 3. 对比投票和真相：多数人投对了吗？点出投对和投错的玩家
 4. 【线索复盘】对照私密线索总账和公开讨论记录，指出哪些私密线索从头到尾没被任何人在讨论中提及（被埋没了），并简要说明这些线索若被挖出，对破案有什么帮助
-5. 为整场游戏收尾"""
+5. 【结局演绎】对照真相，判断真人玩家（{user_role}）投对了还是投错了：若投错，演绎一段"真凶逍遥法外"的遗憾尾声（真凶暗自庆幸、蒙混过关，玩家恍然大悟又懊恼）；若投对，正常庆祝破案{perfect_crime_note}
+6. 为整场游戏收尾"""
 
     resp = _stream_full_text(prompt)
     return {
@@ -544,7 +813,7 @@ def _current_speaker(state: GameState) -> dict:
 def route_speaker(state: GameState) -> str:
     """条件边的路由函数：根据当前轮次决定"下一个谁发言"。
 
-    返回 "human"（轮到用户）/ "ai"（轮到 AI）/ "vote"（进入投票）。
+    返回 "human"（轮到用户）/ "ai"（轮到 AI）/ "midpoint"（中场引导）/ "vote"（进入投票）。
     """
     round_num = state.get("phase_round", 0)
     script = state.get("script", {})
@@ -552,10 +821,23 @@ def route_speaker(state: GameState) -> str:
     if not suspects:
         return "vote"
 
-    # 讨论轮数动态：嫌疑人数量 × ROUNDS_PER_PLAYER，保证每个角色至少发言 2 次
-    max_rounds = len(suspects) * ROUNDS_PER_PLAYER
+    # 讨论轮数动态：嫌疑人数量 × 每人发言轮数（rounds_per_player 可配置，默认 ROUNDS_PER_PLAYER）
+    rounds_per_player = state.get("rounds_per_player", ROUNDS_PER_PLAYER)
+    max_rounds = len(suspects) * rounds_per_player
     if round_num >= max_rounds:
         return "vote"
+
+    # 中场引导：讨论过半时触发一次（midpoint_done 标记避免重复）
+    if not state.get("midpoint_done") and round_num >= max_rounds // 2:
+        return "midpoint"
+
+    # 定向通信：玩家点名了某个 AI，优先让他回应（human_turn_node 已把点名者存入 pending_reply_to）
+    if state.get("pending_reply_to", ""):
+        return "ai"
+
+    # 追问：玩家点名 AI 后有一次追问机会（follow_up>0），AI 回应后再次轮到玩家
+    if state.get("follow_up", 0) > 0:
+        return "human"
 
     speaker = _current_speaker(state)
     if speaker.get("name") == state.get("user_role", ""):
