@@ -20,6 +20,14 @@ class GameState(TypedDict, total=False):
     # 提供时作为 LLM 创作的核心依据，优先级高于 theme + background_style）
     background_story: str
 
+    # 用户自定义的故事时间（可选，如"1935 年深秋"、"宋代江南"、"未来废土纪元"）。
+    # 作为"素材种子"喂给 LLM，引导它理解时代氛围后自然融入，而非把时间字样硬贴进剧情。
+    story_time: str
+
+    # 用户自定义的故事地点（可选，如"上海滩租界"、"湖南师大图书馆"、"深山古宅"）。
+    # 同上：LLM 要理解地点的空间/人文特征后让场景自然生长，而非照抄地点名词。
+    story_location: str
+
     # 用户自定义的嫌疑人名字（可选，列表。提供时优先于随机抽名，更有代入感）
     custom_names: list
 

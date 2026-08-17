@@ -44,9 +44,9 @@ llm = ChatDeepSeek(
 )
 
 # 每个玩家至少发言几轮（讨论总轮数 = 嫌疑人数量 × 这个值）。
-# 之前 MAX_ROUNDS 写死 6，嫌疑人随机 4~6 人时，玩家可能只轮到 1 次就投票，
-# 体验像"刚发言就进投票"。改成动态后保证每个角色至少发言 2 次。
-ROUNDS_PER_PLAYER = 2
+# 之前 MAX_ROUNDS 写死 6，嫌疑人随机 4~6 人时，玩家可能只轮到 1 次就投票。
+# 现在每人至少发言 3 次，剧情流转更充分、更有可玩性（想更快就改小）。
+ROUNDS_PER_PLAYER = 3
 
 
 # ---- 嫌疑人名字池（按背景风格分组）----
@@ -187,7 +187,7 @@ def _stream_full_text(prompt: str) -> str:
     return full
 
 
-def _build_script_prompt(theme: str, background: str, names: list, background_story: str = "") -> str:
+def _build_script_prompt(theme: str, background: str, names: list, background_story: str = "", story_time: str = "", story_location: str = "") -> str:
     """构建"生成剧本"的 prompt（节点生成 和 流式生成 共用，避免重复）。
 
     名字由 _pick_suspect_names 随机抽好、作为参数传进来，
@@ -195,6 +195,11 @@ def _build_script_prompt(theme: str, background: str, names: list, background_st
 
     如果用户提供了自定义背景剧情（background_story），它就是创作的核心依据，
     优先级高于 theme + background；否则退回"主题 + 风格"自由发挥。
+
+    时间（story_time）/ 地点（story_location）是额外的可选"素材种子"：
+    不当作硬性事实让 LLM 照抄，而是引导它"理解设定背后的时代氛围 / 空间人文特征，
+    让动机、手法、场景自然生长出来"。这正是第 18 条踩坑经验的复用——
+    给 LLM 素材要引导"消化再创作"，而不是"原样搬运"。
     """
     names_text = "、".join(names)
 
@@ -210,6 +215,24 @@ def _build_script_prompt(theme: str, background: str, names: list, background_st
     else:
         context = f"""创作主题：{theme}
 背景风格：{background}"""
+
+    # 时间 / 地点：可选的自定义设定，作为"理解后融入"的素材，而不是照抄的标签。
+    # 关键措辞：让 LLM 去理解设定背后的"时代氛围 / 空间人文特征"，再让故事元素
+    # 从这些特征里自然生长——如果直接说"必须严格基于 X"，LLM 会把 X 原文贴进 background。
+    extra = []
+    if story_time and story_time.strip():
+        extra.append(f"""【自定义时间设定】{story_time.strip()}
+请先理解这个时间背后的时代氛围与现实条件（年代/季节/时段/科技水平/社会风俗/称谓习惯），
+再让案件的动机、作案手法、人物称谓、可用线索都贴合这个时代自然生长出来，
+而不是把"时间"当成一个标签生硬地贴进剧情里。""")
+    if story_location and story_location.strip():
+        extra.append(f"""【自定义地点设定】{story_location.strip()}
+请先理解这个地点背后的空间特征与人文环境（地理/建筑/气候/职业/风土人情），
+再让案发场景、人物关系、线索的来源都从这个地点自然生长出来，
+而不是把"地点"当成一个标签生硬地贴进剧情里。""")
+
+    if extra:
+        context += "\n\n" + "\n\n".join(extra)
 
     return f"""你是一名资深剧本杀编剧。
 
@@ -234,10 +257,10 @@ def _build_script_prompt(theme: str, background: str, names: list, background_st
 }}
 
 【私密线索设计铁律（信息差是剧本杀的灵魂，务必遵守）】：
-1. 每个嫌疑人都必须至少持有 1 条私密线索，凶手可以持有 2 条。
-2. 凶手的私密线索必须对他/她有利（不在场证明、伪造证词、转移视线的伪证），帮他洗清嫌疑。
-3. 其余角色（尤其接近真相的人）的私密线索要能指向真凶，但单看任何一条都不足以锁定，必须互相拼凑。
-4. 不同角色的私密线索要能组合出完整真相：每个人手里只有一块拼图。
+1. 每个嫌疑人都必须持有 2~3 条私密线索，凶手可以持有 3~4 条（线索要丰富，信息量要足）。
+2. 凶手的私密线索里至少有一部分对他/她有利（不在场证明、伪造证词、转移视线的伪证），帮他洗清嫌疑。
+3. 其余角色的私密线索要能指向真凶、或彼此矛盾，单看任何一条都不足以锁定，必须互相拼凑、交叉印证。
+4. 不同角色的私密线索要有层次和勾连（护身符、指向他人、隐藏动机），组合起来才能还原完整真相。
 5. private_clues 里每个元素的 holder 必须精确等于 suspects 里的某个 name，不能写"某人""凶手"等模糊指代。"""
 
 
@@ -254,11 +277,13 @@ def generate_script_node(state: dict) -> dict:
     theme = state.get("theme", "民国豪门恩怨")
     background = state.get("background_style", "自由发挥")
     background_story = state.get("background_story", "")
+    story_time = state.get("story_time", "")
+    story_location = state.get("story_location", "")
     custom_names = state.get("custom_names")
 
     # 先由确定性逻辑选好嫌疑人名字（自定义优先，否则随机），再让 LLM 编故事
     names = _pick_suspect_names(background, custom_names)
-    prompt = _build_script_prompt(theme, background, names, background_story)
+    prompt = _build_script_prompt(theme, background, names, background_story, story_time, story_location)
 
     resp = llm.invoke(prompt)
     script = _parse_json(resp.content)
@@ -268,7 +293,7 @@ def generate_script_node(state: dict) -> dict:
     return {"script": script, "current_phase": "intro"}
 
 
-def generate_script_stream(theme: str, background: str, background_story: str = "", custom_names=None):
+def generate_script_stream(theme: str, background: str, background_story: str = "", custom_names=None, story_time: str = "", story_location: str = ""):
     """真流式生成剧本（生成器函数）。
 
     - yield：每个 token 片段（前端用它实时显示"剧本正在生成"）
@@ -283,7 +308,7 @@ def generate_script_stream(theme: str, background: str, background_story: str = 
     又能携带最终结果"的惯用法。
     """
     names = _pick_suspect_names(background, custom_names)
-    prompt = _build_script_prompt(theme, background, names, background_story)
+    prompt = _build_script_prompt(theme, background, names, background_story, story_time, story_location)
 
     full = ""
     for chunk in llm.stream(prompt):

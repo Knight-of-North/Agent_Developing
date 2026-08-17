@@ -36,13 +36,15 @@ if __name__ == "__main__":
 
     theme = input("请输入剧本杀主题（回车自由发挥）：").strip() or "自由发挥"
     background = input("背景风格（回车自由发挥，可选：民国豪门/校园怪谈/古风仙侠/现代都市/科幻末世）：").strip() or "自由发挥"
-    background_story = input("自定义剧情背景（回车跳过，让 AI 自由发挥；填写则 AI 严格基于它创作）：").strip()
+    background_story = input("自定义剧情背景（回车跳过，让 AI 自由发挥；填写则 AI 理解后融入创作）：").strip()
+    story_time = input("故事发生时间（回车跳过，如：1935年深秋 / 宋代江南）：").strip()
+    story_location = input("故事发生地点（回车跳过，如：上海滩租界 / 湖南师大图书馆）：").strip()
     custom_names = _parse_names(input("自定义嫌疑人名字（回车跳过用随机；填写如：张三,李四,王五）："))
     print(f"\n正在生成剧本，主题：{theme}，背景：{background} ...\n")
 
     # 第一次调用：跑到第一个 interrupt（选角色）时暂停
     result = graph.invoke(
-        {"theme": theme, "background_style": background, "background_story": background_story, "custom_names": custom_names, "messages": [], "thoughts": []},
+        {"theme": theme, "background_style": background, "background_story": background_story, "story_time": story_time, "story_location": story_location, "custom_names": custom_names, "messages": [], "thoughts": []},
         config,
     )
 
@@ -103,7 +105,3 @@ if __name__ == "__main__":
     print(f"\n得票最多：{result.get('vote_winner', '无人')}")
     print(f"票数分布：{result.get('vote_counts', {})}")
     print("=" * 46)
-
-    print("\n【AI 玩家内心戏】（调试用，正式版不公开）")
-    for t in result.get("thoughts", []):
-        print(f"  · {t}")

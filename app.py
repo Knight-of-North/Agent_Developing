@@ -17,30 +17,50 @@ def get_graph():
 
 
 def _run_stream(graph, cmd, config):
-    """真流式执行图，返回和 graph.invoke 一致的结果（完整 state + __interrupt__）。
+    """执行图，返回和 graph.invoke 一致的结果（完整 state + __interrupt__）。
 
-    核心机制：graph.stream(stream_mode=["messages","updates"], version="v2") 会把
-    节点内部 llm.stream() 的每个 token 作为 messages 事件实时吐出来。这里把 token
-    累积显示到占位符（用户等待时能看到 AI"边生成边输出"），遇到 interrupt 时用
-    graph.get_state 拿 checkpoint 里的完整 state 返回。
+    流式策略（关键：隐藏 AI 的内心戏，只展示公开发言）：
+    - DM 开场/揭晓（dm_intro/dm_reveal）：逐 token 显示（台词无秘密，逐字更爽）。
+    - AI 玩家发言（ai_player_turn）：LLM 输出的是 {"think": 内心戏, "speak": 发言} 的 JSON，
+      若逐 token 显示会暴露 think（内心戏=剧透）。所以 AI 发言的 token 不显示，
+      改用 updates 事件——每个 AI 玩家"说完"后，把它的 speak 逐条追加显示，
+      形成"一个一个 NPC 说"的节奏感。
 
     返回的 dict 结构和 graph.invoke 相同：停在 interrupt 时含 "__interrupt__" 键，
     跑完时是完整 state。这样下游逻辑不用改。
     """
     placeholder = st.empty()
-    full_text = ""
+    segments = []   # 已完成的片段（DM 台词 + AI 发言，按顺序）
+    current = ""    # 当前正在生成的 DM 台词 token
+
+    def render():
+        parts = list(segments)
+        if current:
+            parts.append(current)
+        placeholder.markdown("\n\n".join(parts))
+
     for chunk in graph.stream(cmd, config, stream_mode=["messages", "updates"], version="v2"):
         t = chunk.get("type")
         d = chunk.get("data")
         if t == "messages":
             token, meta = d
-            if token.content:
-                full_text += token.content
-                placeholder.markdown(f"⏳ AI 正在生成...\n\n{full_text}")
-        elif t == "updates" and "__interrupt__" in d:
-            # 图暂停在 interrupt：从 checkpoint 拿完整 state，附上 interrupt 信息返回
-            state = graph.get_state(config).values
-            return {**state, "__interrupt__": d["__interrupt__"]}
+            node = meta.get("langgraph_node")
+            # 只显示 DM 台词的 token；AI 发言的 token（含 think）不显示
+            if node in ("dm_intro", "dm_reveal") and token.content:
+                current += token.content
+                render()
+        elif t == "updates":
+            if "__interrupt__" in d:
+                # 图暂停在 interrupt：从 checkpoint 拿完整 state，附上 interrupt 信息返回
+                state = graph.get_state(config).values
+                return {**state, "__interrupt__": d["__interrupt__"]}
+            # 节点完成：把新产生的公开消息（speak，不含 think）逐条封存显示
+            for node, update in d.items():
+                if isinstance(update, dict):
+                    for m in update.get("messages", []):
+                        segments.append(f"**{m['speaker']}**：{m['content']}")
+            current = ""   # 节点结束，清空当前 token 累积
+            render()
     # 图正常跑完（没有 interrupt）
     return graph.get_state(config).values
 
@@ -70,8 +90,17 @@ if not st.session_state.started:
     )
     # 可选：自定义剧情背景，优先级高于上面的主题 + 风格
     background_story = st.text_area(
-        "自定义剧情背景（可选，写下具体背景剧情，AI 会严格基于它创作）",
+        "自定义剧情背景（可选，写下具体背景剧情，AI 会理解后融入创作）",
         placeholder="例如：1935 年上海滩，顾家老爷在寿宴上离奇身亡，三个姨太与管家各怀鬼胎……\n留空则由 AI 根据主题和风格自由发挥",
+    )
+    # 可选：自定义故事时间 / 地点，作为"素材种子"引导 LLM 理解后融入，而不是照抄
+    story_time = st.text_input(
+        "故事发生时间（可选）",
+        placeholder="例如：1935 年深秋 / 宋代江南 / 未来废土纪元",
+    )
+    story_location = st.text_input(
+        "故事发生地点（可选）",
+        placeholder="例如：上海滩租界 / 湖南师大图书馆 / 深山古宅",
     )
     # 嫌疑人名字模式：随机 or 自定义（自定义更有代入感，可用朋友/同学名）
     name_mode = st.radio("嫌疑人名字", ["随机生成", "自定义"], horizontal=True)
@@ -88,12 +117,14 @@ if not st.session_state.started:
         st.session_state.started = True
         theme_val = theme.strip() or "自由发挥"
         story_val = background_story.strip()
+        time_val = story_time.strip()
+        location_val = story_location.strip()
 
         # 真流式生成剧本：边生成边显示，而不是盯着 spinner 干等。
         # generate_script_stream 是生成器，逐 token yield；手动 next() 迭代，
         # 从 StopIteration.value 拿到它 return 的最终 script。
         st.markdown("### 🎬 正在生成剧本...")
-        gen = generate_script_stream(theme_val, background, story_val, custom_names)
+        gen = generate_script_stream(theme_val, background, story_val, custom_names, time_val, location_val)
         placeholder = st.empty()
         full_text = ""
         script = None
@@ -113,6 +144,8 @@ if not st.session_state.started:
                 "theme": theme_val,
                 "background_style": background,
                 "background_story": story_val,
+                "story_time": time_val,
+                "story_location": location_val,
                 "custom_names": custom_names,
                 "messages": [],
                 "thoughts": [],
@@ -203,9 +236,6 @@ else:
                 st.write(f"· {voter} → {target}")
             st.write(f"**得票最多：{result.get('vote_winner', '无人')}**")
             st.write(f"票数分布：{result.get('vote_counts', {})}")
-        with st.expander("🧠 AI 玩家内心戏（调试）"):
-            for t in result.get("thoughts", []):
-                st.write(f"· {t}")
         if st.button("再来一局", type="primary"):
             for key in ["started", "result", "thread_id"]:
                 st.session_state.pop(key, None)
