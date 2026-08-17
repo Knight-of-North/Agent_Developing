@@ -1,11 +1,11 @@
 """
-流程编排 —— Phase 4.5：线索分发（信息差）
+流程编排 —— Phase 5：用户选择角色
 
 图结构：
-    START -> generate_script -> distribute_clues -> dm_intro -+
-                                                              |   （条件边 route_speaker）
-                       +--------------------------------------+
-                       v
+    START -> generate_script -> distribute_clues -> choose_role -> dm_intro -+
+                                                                              |   （条件边 route_speaker）
+                                    +-----------------------------------------+
+                                    v
     human_turn（interrupt 等用户） <----+
     ai_player_turn（AI 发言）      <----+---- 循环
               |                        |
@@ -24,6 +24,7 @@ from game_state import GameState
 from nodes import (
     generate_script_node,
     distribute_clues_node,
+    choose_role_node,
     dm_intro_node,
     ai_player_turn_node,
     human_turn_node,
@@ -41,6 +42,7 @@ def build_graph():
     # 注册节点
     builder.add_node("generate_script", generate_script_node)
     builder.add_node("distribute_clues", distribute_clues_node)   # 信息差：线索分发
+    builder.add_node("choose_role", choose_role_node)             # interrupt：用户选角色
     builder.add_node("dm_intro", dm_intro_node)
     builder.add_node("ai_player_turn", ai_player_turn_node)
     builder.add_node("human_turn", human_turn_node)   # interrupt 节点
@@ -49,10 +51,11 @@ def build_graph():
     builder.add_node("tally", tally_node)
     builder.add_node("dm_reveal", dm_reveal_node)
 
-    # 前半段：生成剧本 -> 分发线索 -> DM 开场
+    # 前半段：生成剧本 -> 分发线索 -> 选角色 -> DM 开场
     builder.add_edge(START, "generate_script")
     builder.add_edge("generate_script", "distribute_clues")
-    builder.add_edge("distribute_clues", "dm_intro")
+    builder.add_edge("distribute_clues", "choose_role")
+    builder.add_edge("choose_role", "dm_intro")
 
     # 条件边：讨论循环的路由（挂在三个"发言入口"之后）
     # route_speaker 根据 phase_round 决定下一个发言者是用户还是 AI，或进入投票

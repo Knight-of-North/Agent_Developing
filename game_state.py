@@ -16,6 +16,10 @@ class GameState(TypedDict, total=False):
     # 背景风格（用户选择：民国豪门 / 校园怪谈 / 古风仙侠 / 现代都市 / 科幻末世 / 自由发挥）
     background_style: str
 
+    # 用户自定义的剧情背景（可选，一段具体的背景剧情：人物关系/事件起因/世界观设定。
+    # 提供时作为 LLM 创作的核心依据，优先级高于 theme + background_style）
+    background_story: str
+
     # 剧本：generate_script_node 生成的结构化数据
     script: dict
 
