@@ -1,10 +1,32 @@
 """
-AI 剧本杀主持人 · 入口（Phase 3.5：用户参与，interrupt 人在回路）
+AI 剧本杀主持人 · 入口（Phase 5：用户选择角色，interrupt 人在回路）
 
 运行方式：python main.py
 """
 from langgraph.types import Command
 from graph import build_graph
+
+
+def print_role_card(result):
+    """打印角色卡：你的角色 + 秘密 + 私密线索（选完角色之后才能打印）"""
+    script = result.get("script", {})
+    user_role = result.get("user_role", "你")
+    suspects = script.get("suspects", [])
+    user_secret = next((s.get("secret", "") for s in suspects if s.get("name") == user_role), "")
+    # 信息差：只显示你自己持有的私密线索，别人的线索你看不到
+    user_clues = result.get("distributed_clues", {}).get(user_role, [])
+    print("=" * 46)
+    print(f"【你的角色卡】你扮演：{user_role}")
+    print(f"  你的秘密（只能自己知道，别主动暴露）：{user_secret}")
+    print("  你掌握的私密线索（只有你知道，是否公开由你决定）：")
+    if user_clues:
+        for c in user_clues:
+            print(f"    · {c}")
+    else:
+        print("    · （你没有任何私密线索，只能靠盘问别人）")
+    print(f"  目标：隐瞒秘密，同时从别人嘴里套线索、找出真凶")
+    print("=" * 46)
+
 
 if __name__ == "__main__":
     graph = build_graph()
@@ -13,24 +35,14 @@ if __name__ == "__main__":
 
     theme = input("请输入剧本杀主题（回车自由发挥）：").strip() or "自由发挥"
     background = input("背景风格（回车自由发挥，可选：民国豪门/校园怪谈/古风仙侠/现代都市/科幻末世）：").strip() or "自由发挥"
+    background_story = input("自定义剧情背景（回车跳过，让 AI 自由发挥；填写则 AI 严格基于它创作）：").strip()
     print(f"\n正在生成剧本，主题：{theme}，背景：{background} ...\n")
 
-    # 第一次调用：跑到第一个 interrupt（轮到你发言）时暂停
+    # 第一次调用：跑到第一个 interrupt（选角色）时暂停
     result = graph.invoke(
-        {"theme": theme, "background_style": background, "messages": [], "thoughts": []},
+        {"theme": theme, "background_style": background, "background_story": background_story, "messages": [], "thoughts": []},
         config,
     )
-
-    # ---- 打印你的角色卡（让你知道自己的秘密，才能带入角色）----
-    script = result.get("script", {})
-    user_role = result.get("user_role", "你")
-    suspects = script.get("suspects", [])
-    user_secret = next((s.get("secret", "") for s in suspects if s.get("name") == user_role), "")
-    print("=" * 46)
-    print(f"【你的角色卡】你扮演：{user_role}")
-    print(f"  你的秘密（只能自己知道，别主动暴露）：{user_secret}")
-    print(f"  目标：隐瞒秘密，同时找出真凶")
-    print("=" * 46)
 
     # ---- 边玩边打印：只打印"新增"的消息 ----
     printed = 0
@@ -41,24 +53,42 @@ if __name__ == "__main__":
             print(f"\n{m['speaker']}: {m['content']}")
         return len(messages)
 
-    # 先打印已经发生的（DM 开场）
-    printed = show_new(result.get("messages", []), printed)
-
     # ---- 循环处理 interrupt：图暂停时，读提示 -> 用户输入 -> 恢复 ----
     while "__interrupt__" in result:
         info = result["__interrupt__"][0].value
 
-        if info["type"] == "human_turn":
+        if info["type"] == "choose_role":
+            # 开局选角色：打印名单让用户挑
+            suspects_list = info["suspects"]
+            print("\n" + "=" * 46)
+            print("【选择角色】你想扮演哪个嫌疑人？")
+            for i, n in enumerate(suspects_list, 1):
+                print(f"  {i}. {n}")
+            print("=" * 46)
+            chosen = input("输入名字或序号：").strip()
+            # 支持按序号选：输入 1/2/3 也能对应到名单
+            if chosen.isdigit() and 1 <= int(chosen) <= len(suspects_list):
+                chosen = suspects_list[int(chosen) - 1]
+            result = graph.invoke(Command(resume=chosen), config)
+
+            # 选完角色后，user_role 才确定，此时打印角色卡 + 已发生的消息（DM 开场 / AI 发言）
+            print_role_card(result)
+            printed = show_new(result.get("messages", []), printed)
+
+        elif info["type"] == "human_turn":
             # 轮到你发言
             user_input = input(f"\n【轮到你了·{info['speaker']}】请输入你的发言：")
             result = graph.invoke(Command(resume=user_input), config)
             printed = show_new(result.get("messages", []), printed)
 
         elif info["type"] == "human_vote":
-            # 轮到你投票
+            # 轮到你投票（校验输入必须是合法嫌疑人名字）
             suspects_list = info["suspects"]
             print(f"\n【投票】嫌疑人名单：{', '.join(suspects_list)}")
             user_input = input("你投谁（输入名字）：").strip()
+            while user_input not in suspects_list:
+                print(f"  ⚠️ 无效投票，请从名单里选：{', '.join(suspects_list)}")
+                user_input = input("你投谁（输入名字）：").strip()
             result = graph.invoke(Command(resume=user_input), config)
             # 投票后图会跑 tally -> dm_reveal，打印 DM 揭晓台词
             printed = show_new(result.get("messages", []), printed)
