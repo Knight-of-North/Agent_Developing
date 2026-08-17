@@ -83,15 +83,34 @@ for _pool in _NAME_POOLS.values():
             _MIXED_POOL.append(_name)
 
 
-def _pick_suspect_names(background: str) -> list:
-    """确定性随机：按背景风格从名字池里抽一组嫌疑人名字（4~6 个，不重复）。
+def _parse_names(text: str) -> list:
+    """解析用户输入的自定义名字列表（支持逗号/顿号/空格/换行分隔，去重保序）。"""
+    if not text:
+        return []
+    text = re.sub(r"[，,、;\s]+", " ", text.strip())
+    seen = set()
+    result = []
+    for name in text.split():
+        name = name.strip()
+        if name and name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
 
-    为什么名字交给 Python 随机抽，而不是让 LLM 自己编？
-    LLM 的"随机"其实是趋同的——temperature 再高，它翻来覆去就那几个
-    高频名字，玩几局就腻。而 random.sample 是"无放回抽样"，从大池子里抽，
-    组合数巨大，几乎每局都不同。这和 tally 数票、线索分发是同一个道理：
-    可预测的部分（抽签）交给确定性代码，创作的部分（围绕名字编故事）才交给 LLM。
+
+def _pick_suspect_names(background: str, custom_names=None) -> list:
+    """选嫌疑人名字：用户自定义优先，否则按背景风格随机抽（4~6 个，不重复）。
+
+    为什么随机抽不用 LLM？LLM 的"随机"趋同（翻来覆去那几个高频名），
+    random.sample 无放回抽样组合数巨大。但用户可能想用自己的朋友/同学名
+    代入角色——这时自定义优先，随机兜底。
     """
+    # 用户自定义名字：至少 3 个才采用，否则退回随机（名字太少撑不起剧本杀）
+    if custom_names:
+        cleaned = [n.strip() for n in custom_names if n and n.strip()]
+        if len(cleaned) >= 3:
+            return cleaned[:6]   # 最多 6 个嫌疑人
+
     pool = _NAME_POOLS.get(background, _MIXED_POOL)
     n = random.randint(4, 6)          # 嫌疑人数量也随机，增强可玩性
     n = min(n, len(pool))             # 名字池不够抽时退而求其次
@@ -180,9 +199,12 @@ def _build_script_prompt(theme: str, background: str, names: list, background_st
     names_text = "、".join(names)
 
     if background_story and background_story.strip():
-        # 用户自定义背景剧情：作为创作核心
-        context = f"""用户自定义的剧情背景（这是创作的核心依据，务必严格基于它展开，不要偏离）：
+        # 用户自定义背景剧情：当作"素材种子"，让 LLM 扩写演化，而不是照抄
+        context = f"""【创作灵感】玩家给了一段背景点子，请把它当作素材种子，用你自己的编剧语言扩写、演化成完整案件：
 {background_story.strip()}
+
+要求：不要照抄上面这段原文，而是把它自然融入、补上具体的时间地点、人物关系、
+动机冲突、可疑之处，发展成一个浑然天成的案件背景。
 
 背景风格参考：{background}"""
     else:
@@ -200,7 +222,7 @@ def _build_script_prompt(theme: str, background: str, names: list, background_st
 
 严格输出 JSON 格式，不要输出任何 JSON 以外的文字。字段如下：
 {{
-  "background": "案件背景故事，约100字",
+  "background": "扩写后的完整案件背景（约100-150字，自然流畅、有画面感；基于玩家的背景点子重新组织扩写，不要照抄原文）",
   "suspects": [
     {{"name": "必须依次使用上面给定的名字", "secret": "这个人的秘密（**必须用第一人称「我」开头**，例如「我暗恋宋知夏」「我曾偷看过考卷」，**禁止**用「他/她」开头——因为玩家会扮演这个角色，第三人称会破坏代入感）", "forbidden": ["这个人绝对不能公开说出的关键词，2~4个"]}}
   ],
@@ -232,9 +254,10 @@ def generate_script_node(state: dict) -> dict:
     theme = state.get("theme", "民国豪门恩怨")
     background = state.get("background_style", "自由发挥")
     background_story = state.get("background_story", "")
+    custom_names = state.get("custom_names")
 
-    # 先由确定性逻辑随机抽好嫌疑人名字，再让 LLM 围绕这些名字编故事
-    names = _pick_suspect_names(background)
+    # 先由确定性逻辑选好嫌疑人名字（自定义优先，否则随机），再让 LLM 编故事
+    names = _pick_suspect_names(background, custom_names)
     prompt = _build_script_prompt(theme, background, names, background_story)
 
     resp = llm.invoke(prompt)
@@ -245,7 +268,7 @@ def generate_script_node(state: dict) -> dict:
     return {"script": script, "current_phase": "intro"}
 
 
-def generate_script_stream(theme: str, background: str, background_story: str = ""):
+def generate_script_stream(theme: str, background: str, background_story: str = "", custom_names=None):
     """真流式生成剧本（生成器函数）。
 
     - yield：每个 token 片段（前端用它实时显示"剧本正在生成"）
@@ -259,7 +282,7 @@ def generate_script_stream(theme: str, background: str, background_story: str = 
     从 StopIteration.value 里取。这是"生成器既流式产出中间结果、
     又能携带最终结果"的惯用法。
     """
-    names = _pick_suspect_names(background)
+    names = _pick_suspect_names(background, custom_names)
     prompt = _build_script_prompt(theme, background, names, background_story)
 
     full = ""
@@ -403,11 +426,11 @@ def dm_intro_node(state: dict) -> dict:
 - 你在开场时只能公布上面的"可公开线索"，绝不能编造或公布私密线索。
 - 你要引导玩家：真相散落在不同人手里，需要大家讨论、互相盘问才能拼出全貌。
 
-请用主持人的口吻：
-1. 宣布案件发生，介绍背景和嫌疑人
+请用主持人的口吻，把案件背景像讲故事一样娓娓道来（自然融入，不要照念、不要机械罗列），依次：
+1. 用一段有画面感的开场，把案件背景和嫌疑人自然引出来
 2. 公布可公开线索
 3. 说明"每人手中握有私密线索"，鼓励玩家互相套话
-4. 宣布进入自由讨论，规则是嫌疑人轮流发言
+4. 自然过渡到自由讨论，规则是嫌疑人轮流发言
 
 注意：{user_role} 是真人玩家扮演的，介绍时正常介绍即可。
 

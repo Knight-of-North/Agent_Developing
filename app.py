@@ -7,7 +7,7 @@ import uuid
 import streamlit as st
 from langgraph.types import Command
 from graph import build_graph
-from nodes import generate_script_stream
+from nodes import generate_script_stream, _parse_names
 
 
 # 缓存图对象：这样 MemorySaver 的状态在 Streamlit 会话内不会丢
@@ -73,6 +73,17 @@ if not st.session_state.started:
         "自定义剧情背景（可选，写下具体背景剧情，AI 会严格基于它创作）",
         placeholder="例如：1935 年上海滩，顾家老爷在寿宴上离奇身亡，三个姨太与管家各怀鬼胎……\n留空则由 AI 根据主题和风格自由发挥",
     )
+    # 嫌疑人名字模式：随机 or 自定义（自定义更有代入感，可用朋友/同学名）
+    name_mode = st.radio("嫌疑人名字", ["随机生成", "自定义"], horizontal=True)
+    custom_names = []
+    if name_mode == "自定义":
+        custom_names_text = st.text_input(
+            "输入嫌疑人名字（3~6 个，用逗号或空格分隔）",
+            placeholder="例如：张三, 李四, 王五, 赵六",
+        )
+        custom_names = _parse_names(custom_names_text)
+        if custom_names and len(custom_names) < 3:
+            st.caption("⚠️ 至少 3 个名字，否则会自动退回随机生成")
     if st.button("开始游戏", type="primary"):
         st.session_state.started = True
         theme_val = theme.strip() or "自由发挥"
@@ -82,7 +93,7 @@ if not st.session_state.started:
         # generate_script_stream 是生成器，逐 token yield；手动 next() 迭代，
         # 从 StopIteration.value 拿到它 return 的最终 script。
         st.markdown("### 🎬 正在生成剧本...")
-        gen = generate_script_stream(theme_val, background, story_val)
+        gen = generate_script_stream(theme_val, background, story_val, custom_names)
         placeholder = st.empty()
         full_text = ""
         script = None
@@ -102,6 +113,7 @@ if not st.session_state.started:
                 "theme": theme_val,
                 "background_style": background,
                 "background_story": story_val,
+                "custom_names": custom_names,
                 "messages": [],
                 "thoughts": [],
             },

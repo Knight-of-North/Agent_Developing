@@ -20,6 +20,9 @@ class GameState(TypedDict, total=False):
     # 提供时作为 LLM 创作的核心依据，优先级高于 theme + background_style）
     background_story: str
 
+    # 用户自定义的嫌疑人名字（可选，列表。提供时优先于随机抽名，更有代入感）
+    custom_names: list
+
     # 剧本：generate_script_node 生成的结构化数据
     script: dict
 

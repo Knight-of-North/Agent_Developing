@@ -5,6 +5,7 @@ AI 剧本杀主持人 · 入口（Phase 5：用户选择角色，interrupt 人�
 """
 from langgraph.types import Command
 from graph import build_graph
+from nodes import _parse_names
 
 
 def print_role_card(result):
@@ -36,11 +37,12 @@ if __name__ == "__main__":
     theme = input("请输入剧本杀主题（回车自由发挥）：").strip() or "自由发挥"
     background = input("背景风格（回车自由发挥，可选：民国豪门/校园怪谈/古风仙侠/现代都市/科幻末世）：").strip() or "自由发挥"
     background_story = input("自定义剧情背景（回车跳过，让 AI 自由发挥；填写则 AI 严格基于它创作）：").strip()
+    custom_names = _parse_names(input("自定义嫌疑人名字（回车跳过用随机；填写如：张三,李四,王五）："))
     print(f"\n正在生成剧本，主题：{theme}，背景：{background} ...\n")
 
     # 第一次调用：跑到第一个 interrupt（选角色）时暂停
     result = graph.invoke(
-        {"theme": theme, "background_style": background, "background_story": background_story, "messages": [], "thoughts": []},
+        {"theme": theme, "background_style": background, "background_story": background_story, "custom_names": custom_names, "messages": [], "thoughts": []},
         config,
     )
 
