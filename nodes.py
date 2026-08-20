@@ -34,8 +34,8 @@ import httpx
 
 from game_state import GameState
 from names import _parse_names, _pick_suspect_names
-from validators import _parse_json, _enforce_names, _normalize_secrets, _fallback_clues, _extract_speak
-from prompts import _build_script_prompt
+from validators import _parse_json, _enforce_names, _normalize_secrets, _fallback_clues, _filter_relations, _ensure_clues, _extract_speak
+from prompts import _build_script_prompt, murderer_defense_pool_text
 
 load_dotenv()
 
@@ -173,12 +173,19 @@ def generate_script_node(state: GameState) -> dict:
     prompt = _build_script_prompt(theme, background, names, background_story, story_time, story_location)
 
     script = None
+    problems = []
     for attempt in range(2):   # 最多生成 2 次（自洽校验不过则重试）
-        resp = get_llm().invoke(prompt)
+        # 8-19：第一次用原始 prompt，重试时把上次失败原因拼进 prompt 让 LLM 知道漏在哪
+        current_prompt = prompt if attempt == 0 else _build_script_prompt(
+            theme, background, names, background_story, story_time, story_location,
+            previous_problems=problems)
+        resp = get_llm().invoke(current_prompt)
         script = _parse_json(resp.content)
         script = _fallback_clues(script)        # 兜底：LLM 没按新格式给线索时，从旧格式抢救
         script = _enforce_names(script, names)  # 兜底：强制剧本名字 = 我们抽的名字
         script = _normalize_secrets(script)     # 兜底：secret 强制第一人称开头
+        script = _filter_relations(script)      # 兜底：剔除名单外角色的关系边（否则关系图崩溃）
+        script = _ensure_clues(script)          # 最后防线：线索全空时从 secret 生成，保证能玩
         problems = _check_script_consistency(script)
         if not problems:
             break
@@ -205,10 +212,15 @@ def generate_script_stream(theme: str, background: str, background_story: str = 
 
     # 生成 + 兜底 + 自洽校验（不过则重试，最多 2 次）
     script = None
+    problems = []
     for attempt in range(2):
+        # 8-19：第一次用原始 prompt，重试时把上次失败原因拼进 prompt 让 LLM 知道漏在哪
+        current_prompt = prompt if attempt == 0 else _build_script_prompt(
+            theme, background, names, background_story, story_time, story_location,
+            previous_problems=problems)
         # 用 list 累积 token，最后 join（O(n)），避免 `full += token` 的 O(n²) 复制
         parts = []
-        for chunk in get_llm().stream(prompt):
+        for chunk in get_llm().stream(current_prompt):
             token = chunk.content or ""
             if token:
                 parts.append(token)
@@ -219,6 +231,8 @@ def generate_script_stream(theme: str, background: str, background_story: str = 
         script = _fallback_clues(script)
         script = _enforce_names(script, names)
         script = _normalize_secrets(script)   # 兜底：secret 强制第一人称开头
+        script = _filter_relations(script)    # 兜底：剔除名单外角色的关系边（否则关系图崩溃）
+        script = _ensure_clues(script)        # 最后防线：线索全空时从 secret 生成，保证能玩
         problems = _check_script_consistency(script)
         if not problems:
             break
@@ -398,6 +412,53 @@ def dm_intro_node(state: GameState) -> dict:
     }
 
 
+def self_intro_node(state: GameState) -> dict:
+    """节点 2.5：自我介绍（dm_intro 之后、讨论循环之前）。
+
+    调研报告五阶段标准：每位玩家以角色身份依次介绍「姓名/职业/与死者关系/案发时在哪」，
+    这是玩家建立"谁是谁、谁和死者什么关系"的信息基础——之前跳过这步直接自由讨论，
+    玩家会陷入"我是谁、该说什么、大家在说什么"的茫然（报告风险 1）。
+
+    实现：每个 AI 角色单独一次 LLM 调用做自我介绍，只给公开信息（职业/关系/不在场证明），
+    绝不给 secret（信息差安全）；真人玩家跳过（玩家已有个人剧本，可在第一轮自由发言时介绍）。
+    串行调用 n-1 次，和 ai_vote 逐人投票是同一模式。
+    """
+    script = state.get("script", {})
+    suspects = script.get("suspects", [])
+    user_role = state.get("user_role", "")
+
+    intro_messages = []
+    for s in suspects:
+        name = s.get("name", "")
+        if name == user_role:
+            continue   # 真人玩家跳过，不用 LLM 替玩家自我介绍
+        profession = s.get("profession", "")
+        relation = s.get("relation_to_victim", "")
+        alibi = s.get("alibi", "")
+        personality = s.get("personality", "")
+        speech_style = s.get("speech_style", "")
+
+        prompt = f"""你正在扮演剧本杀角色「{name}」，现在进入【自我介绍】阶段。
+
+你的性格：{personality or "未指定"}
+你的说话风格：{speech_style or "未指定"}
+你的职业：{profession or "未指定"}
+你与死者的关系：{relation or "未指定"}
+你的不在场证明（案发时你声称自己在哪）：{alibi or "未提供"}
+
+请用 1~2 句做自我介绍，依次说明：你的姓名、职业、与死者的关系、案发时你在哪里。
+要求：
+- 只介绍上面给出的公开信息，绝不能提到你的秘密或任何不该公开的线索。
+- 符合你的性格和说话风格，让玩家感受到你是个活人，而不是照稿念。
+
+只输出自我介绍本身，不要 JSON、不要「自我介绍」这类前缀。"""
+
+        resp = _stream_full_text(prompt)
+        intro_messages.append({"speaker": name, "content": f"（自我介绍）{resp}"})
+
+    return {"messages": intro_messages}
+
+
 def dm_midpoint_node(state: GameState) -> dict:
     """节点 3.5：DM 中场引导（讨论过半时触发一次，基于线索公开情况给方向提示）。
 
@@ -453,15 +514,34 @@ def ai_player_turn_node(state: GameState) -> dict:
     forbidden = speaker.get("forbidden", [])   # 禁忌词：绝对不能公开说
     personality = speaker.get("personality", "")
     speech_style = speaker.get("speech_style", "")
+    # 结构化角色信息：职业/与死者关系/不在场证明/任务。
+    # 与 personal_script 互补——personal_script 是叙事故事，这四个是精确注入的"行为锚点"，
+    # 尤其 task 决定了 AI 讨论时的行为方向（隐瞒/查案/保护某人/转移嫌疑），避免千人一面。
+    profession = speaker.get("profession", "")
+    relation_to_victim = speaker.get("relation_to_victim", "")
+    alibi = speaker.get("alibi", "")
+    task = speaker.get("task", "")
+    # 个人剧本：这个角色完整的背景故事（身份/动机/人际关系/目标），
+    # 发言必须基于它，而不是只靠一句 secret 干巴巴地编。
+    personal_script = speaker.get("personal_script", "")
 
     # 判断当前发言者是否为凶手，注入不同目标（凶手脱罪 vs 无辜者找凶）——
     # 没有目标的 agent 只是聊天机器人，有目标才有策略、欺骗、博弈
     murderer = _get_murderer(script, suspect_names)
     if name == murderer:
+        # 8-20：数 messages 历史里玩家"指控"消息数，决定凶手用哪套狡辩策略。
+        # 飞哥反馈："凶手被指控只会说同样的话"——给一个 5 套策略池循环使用，
+        # 严禁 LLM 重复同一种话术。accusation_count = 0 时不拼策略池（未被指控过）。
+        user_role_in_state = state.get("user_role", "")
+        messages = state.get("messages", [])
+        accusation_count = sum(
+            1 for m in messages
+            if m.get("speaker") == user_role_in_state and "指控" in (m.get("content") or "")
+        )
         goal_text = """【你的目标】你是真凶，首要目标是不被投出去：
 - 不要主动提及任何能指向你的线索，尽量把嫌疑引向有动机的其他人
 - 被直接指控时，用你手里的有利线索为自己辩护
-- 可以撒谎、编造不在场证明，但要圆得回来，不能自相矛盾"""
+- 可以撒谎、编造不在场证明，但要圆得回来，不能自相矛盾""" + murderer_defense_pool_text(accusation_count)
     else:
         goal_text = """【你的目标】你是无辜者，首要目标是找出真凶：
 - 分享你手里的线索（但可保留最关键的一条作底牌）
@@ -486,7 +566,13 @@ def ai_player_turn_node(state: GameState) -> dict:
 
 你的性格：{personality or "未指定"}
 你的说话风格：{speech_style or "未指定"}
+你的职业：{profession or "未指定"}
+你与死者的关系：{relation_to_victim or "未指定"}
+你的不在场证明（案发时你声称自己在哪）：{alibi or "未提供"}
 你的秘密（只能你自己知道，绝不能在发言中直接承认）：{secret}
+
+你的个人剧本（你完整的背景故事，发言必须基于它、贴合你的人设和动机，不能凭空编造出与它矛盾的内容）：
+{personal_script or "（未提供）"}
 
 你之前说过的话（必须与之保持一致，不能自相矛盾；若之前说了谎，要圆回来而不是推翻）：
 {memory_text}
@@ -499,9 +585,13 @@ def ai_player_turn_node(state: GameState) -> dict:
 
 {goal_text}
 
+你的专属任务（比上面的通用目标更具体，你每一次发言和行动都要围绕它，而不是只做不痛不痒的推理）：
+{task or "（未指定，按上面的通用目标行事）"}
+
 【发言要求】
 - 说话必须体现你的性格和说话风格，让玩家感受到你是一个"活人"，而不是复读机。
 - 若最近对话中有人直接向你提问、点名质疑你，你必须先正面回应（可以撒谎、可以回避、可以反将一军，但绝不能无视），再展开你自己的内容。
+- **若玩家最近发言明显是胡言乱语 / 装疯卖傻 / 发梗 / 开玩笑**（如"666""哈哈哈""666杀手""导导导"这种无意义或捣乱的内容），你必须**自然地回应这种行为本身**——可以调侃、装傻、反问、或按字面意思接梗展开（8-20 飞哥反馈：玩家装疯卖傻时 NPC 不理或强行曲解都不自然，要把这种行为融入游戏氛围）。严禁完全无视玩家发言（显得没听到），也严禁强行曲解成别的语义（显得自说自话）。
 
 请以「{name}」的口吻，输出 JSON：
 {{
@@ -549,30 +639,89 @@ def ai_player_turn_node(state: GameState) -> dict:
 
 
 def human_turn_node(state: GameState) -> dict:
-    """节点 4：轮到用户发言（interrupt 暂停，等用户在终端输入）
+    """节点 4：轮到用户行动（interrupt 暂停，等用户发言或选动作）。
 
-    interrupt() 会在这里"冻结"图，把控制权交还给 main.py，
-    等 main.py 用 Command(resume=用户输入) 恢复时，interrupt() 返回用户输入的内容。
+    现在支持四种动作，靠 resume 值的类型区分：
+    - str：普通发言（向后兼容旧前端，也兼容 main.py 直接 input）
+    - {"action": "reveal_clue", "clue": "..."}：公开自己一条私密线索
+    - {"action": "accuse", "target": "..."}：正式指控某人（触发对方强制回应）
+    - {"action": "investigate"}：调查一条隐藏线索（从 hidden_clues 揭示）
+
+    这是豆包报告"玩家无法行动只能说话"的修复——玩家从旁观者变成主动者。
     """
     user_role = state.get("user_role", "你")
     round_num = state.get("phase_round", 0)
-    # 暂停，把提示信息传给 main.py
-    user_input = interrupt({"type": "human_turn", "speaker": user_role})
-    # 更新线索公开状态
-    revealed = _update_revealed_clues(user_input, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
-    # 检测玩家点名了哪个 AI（排除自己），被点名者下一个优先回应
     script = state.get("script", {})
     suspect_names = [s.get("name", "") for s in script.get("suspects", [])]
-    addressed = _detect_addressed(user_input, [n for n in suspect_names if n != user_role])
-    # 点名了 AI → 给一次追问机会（follow_up=1）；没点名 → 归零（恢复轮换）
-    follow_up = 1 if addressed else 0
-    return {
-        "messages": [{"speaker": user_role, "content": user_input}],
+    # 排除自己的可指控对象
+    targets = [n for n in suspect_names if n != user_role]
+    # 玩家自己持有的私密线索（可公开）
+    own_clues = state.get("distributed_clues", {}).get(user_role, [])
+    # 还能调查的隐藏线索（用于前端禁用/隐藏"调查"按钮）
+    hidden = script.get("hidden_clues", [])
+    investigated = state.get("investigated_clues", [])
+    available_hidden = [c for c in hidden if c not in investigated]
+
+    # 暂停，把玩家可用的行动信息传给前端（前端据此渲染"公开线索/指控/调查"按钮）
+    action = interrupt({
+        "type": "human_turn",
+        "speaker": user_role,
+        "own_clues": own_clues,
+        "targets": targets,
+        "can_investigate": bool(available_hidden),
+    })
+
+    # ---- 兼容两种 resume：str = 发言，dict = 动作 ----
+    investigated_new: list[str] = []
+    if isinstance(action, dict):
+        kind = action.get("action", "speak")
+        if kind == "reveal_clue":
+            clue = action.get("clue", "")
+            text = f"我公开一条线索：{clue}"
+            addressed = ""
+            follow_up = 0
+            # 精确标记该线索公开（确定性，不靠关键词匹配）
+            revealed = {clue: user_role} if clue else {}
+        elif kind == "accuse":
+            target = action.get("target", "")
+            text = f"我正式指控 {target} 是凶手！"
+            addressed = target if target in targets else ""
+            follow_up = 1 if addressed else 0
+            revealed = _update_revealed_clues(text, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
+        elif kind == "investigate":
+            if available_hidden:
+                clue = available_hidden[0]   # 按序取第一条未调查的隐藏线索
+                text = f"🔍 我调查后发现了一条新线索：{clue}"
+                investigated_new = [clue]
+                revealed = {clue: user_role}   # 调查到的线索也标记公开
+            else:
+                text = "我调查了一番，但没有新发现。"
+                revealed = {}
+            addressed = ""
+            follow_up = 0
+        else:
+            # dict 但 action 未知，兜底当发言（取 text 字段）
+            text = str(action.get("text", ""))
+            revealed = _update_revealed_clues(text, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
+            addressed = _detect_addressed(text, targets)
+            follow_up = 1 if addressed else 0
+    else:
+        # str = 普通发言（向后兼容）
+        text = action
+        revealed = _update_revealed_clues(text, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
+        addressed = _detect_addressed(text, targets)
+        follow_up = 1 if addressed else 0
+
+    result = {
+        "messages": [{"speaker": user_role, "content": text}],
         "phase_round": round_num + 1,
         "revealed_clues": revealed,
         "pending_reply_to": addressed,
         "follow_up": follow_up,
     }
+    if investigated_new:
+        result["investigated_clues"] = investigated_new
+    return result
 
 
 def _vote_one_player(name: str, secret: str, own_clues: list, history: str, suspect_names: list[str]) -> tuple[str, str | None]:
@@ -675,13 +824,25 @@ def tally_node(state: GameState) -> dict:
     counter = Counter(votes.values())
     vote_counts = dict(counter)
     if not counter:
-        return {"vote_counts": {}, "vote_winner": "无人投票"}
+        return {"vote_counts": {}, "vote_winner": "无人投票", "game_result": "平局"}
 
     top = counter.most_common()
     max_n = top[0][1]
     winners = [k for k, v in top if v == max_n]
     vote_winner = "平票（" + "、".join(winners) + "）" if len(winners) > 1 else winners[0]
-    return {"vote_counts": vote_counts, "vote_winner": vote_winner}
+
+    # 全局胜负判定：对比得票最多者与真凶（剧本杀"平民 vs 凶手"的对抗性核心，报告风险 2）。
+    # 之前无论投对投错都揭晓真相，投票没有 stakes；现在投出真凶=平民胜利，真凶逃脱=凶手胜利。
+    script = state.get("script", {})
+    murderer = _get_murderer(script, [s.get("name", "") for s in script.get("suspects", [])])
+    if len(winners) > 1:
+        game_result = "平局"        # 平票，胜负未分
+    elif vote_winner == murderer:
+        game_result = "平民胜利"    # 投出了真凶
+    else:
+        game_result = "凶手胜利"    # 真凶逃脱
+
+    return {"vote_counts": vote_counts, "vote_winner": vote_winner, "game_result": game_result}
 
 
 def final_statement_node(state: GameState) -> dict:
@@ -734,6 +895,43 @@ def _format_private_clues(distributed_clues: dict) -> str:
     return "\n".join(lines) if lines else "（没有私密线索）"
 
 
+def _judge_ending(state: GameState) -> tuple[str, str]:
+    """根据玩家行为判定结局类型，返回 (结局标签, 演绎提示)。
+
+    五种结局（豆包报告玩法5.1「结局唯一」+ 深度5.2「玩家选凶手体验断裂」的修复）：
+    - 完美犯罪：玩家是真凶且未被投出
+    - 凶手伏法：玩家是真凶但被识破投出
+    - 侦探：玩家不是凶手、投对、且主导了推理（发言多或调查过/公开过线索）
+    - 幸运旁观者：玩家不是凶手、投对、但全程低调
+    - 被蒙蔽：玩家不是凶手、投错（被真凶误导）
+
+    纯确定性判定（统计发言次数、投给谁、是否凶手），不调 LLM——
+    和 tally 数票、线索分发是同一个分层思路。
+    """
+    user_role = state.get("user_role", "你")
+    user_is_murderer = state.get("user_is_murderer", False)
+    votes = state.get("votes", {})
+    user_vote = votes.get(user_role, "未投")
+    vote_winner = str(state.get("vote_winner", ""))
+    script = state.get("script", {})
+    murderer = _get_murderer(script, [s.get("name", "") for s in script.get("suspects", [])])
+
+    if user_is_murderer:
+        if vote_winner != user_role:
+            return "完美犯罪", f"（真人玩家 {user_role} 是真凶却成功脱罪！请点出他/她是如何瞒天过海、误导全场的）"
+        return "凶手伏法", f"（真人玩家 {user_role} 是真凶但被识破投出，请演绎他/她的伏法与不甘）"
+
+    # 玩家不是凶手
+    if murderer and user_vote == murderer:
+        # 投对：按活跃度区分"侦探" vs "幸运旁观者"
+        speak_count = sum(1 for m in state.get("messages", []) if m.get("speaker") == user_role)
+        investigated = bool(state.get("investigated_clues"))
+        if speak_count >= 3 or investigated:
+            return "侦探", f"（真人玩家 {user_role} 投对了真凶且积极主导了推理，请夸赞他/她的洞察力）"
+        return "幸运旁观者", f"（真人玩家 {user_role} 投对了但全程低调，像是个运气不错的旁观者）"
+    return "被蒙蔽", f"（真人玩家 {user_role} 投错了、被真凶误导，请演绎'真凶逍遥法外'的遗憾尾声，让玩家恍然大悟又懊恼）"
+
+
 def dm_reveal_node(state: GameState) -> dict:
     """节点 8：DM 揭晓真相 + 对比投票结果 + 线索复盘（信息差闭环）"""
     script = state.get("script", {})
@@ -752,14 +950,19 @@ def dm_reveal_node(state: GameState) -> dict:
     user_role = state.get("user_role", "你")
     user_vote = votes.get(user_role, "未投")
 
-    # 玩家是否为凶手（"完美犯罪"结局）
-    user_is_murderer = state.get("user_is_murderer", False)
-    perfect_crime_note = ""
-    if user_is_murderer:
-        if str(vote_winner) != user_role:
-            perfect_crime_note = f"（注意：真人玩家 {user_role} 是真凶却未被投出，这是一场「完美犯罪」！请点出他/她是如何瞒天过海的）"
-        else:
-            perfect_crime_note = f"（真人玩家 {user_role} 是真凶且被识破了，请演绎他/她的伏法）"
+    # 全局胜负（tally_node 判定）：平民胜利/凶手胜利/平局，给 DM 一个明确的"谁赢了"前提
+    game_result = state.get("game_result", "")
+    if game_result == "平民胜利":
+        result_note = "（全局胜负：平民胜利！真凶已被投出，请庆祝正义得到伸张）"
+    elif game_result == "凶手胜利":
+        result_note = "（全局胜负：凶手胜利！真凶逃脱了，请先点明「凶手逃脱」，再复盘真凶是如何瞒天过海、误导全场的）"
+    elif game_result == "平局":
+        result_note = "（全局胜负：平局，票数并列未能决出真凶）"
+    else:
+        result_note = ""
+
+    # 结局判定：根据玩家行为给差异化结局（侦探/旁观者/被蒙蔽/完美犯罪/凶手伏法）
+    ending_label, ending_note = _judge_ending(state)
 
     # 信息差闭环：把"私密线索总账"+"公开讨论记录"交给 LLM，让它复盘哪些线索被埋没
     clues_text = _format_private_clues(state.get("distributed_clues", {}))
@@ -773,6 +976,7 @@ def dm_reveal_node(state: GameState) -> dict:
 投票明细（谁投了谁，务必照实公布，禁止编造）：{votes_text}
 票数统计：{vote_counts}（得票最多的是：{vote_winner}）{winner_note}
 真人玩家（{user_role}）投给了：{user_vote}
+{result_note}
 
 【私密线索总账】开局时每个玩家私下只握有这些线索（别人不知道）：
 {clues_text}
@@ -785,7 +989,7 @@ def dm_reveal_node(state: GameState) -> dict:
 2. 揭晓真相（凶手、动机、手法）
 3. 对比投票和真相：多数人投对了吗？点出投对和投错的玩家
 4. 【线索复盘】对照私密线索总账和公开讨论记录，指出哪些私密线索从头到尾没被任何人在讨论中提及（被埋没了），并简要说明这些线索若被挖出，对破案有什么帮助
-5. 【结局演绎】对照真相，判断真人玩家（{user_role}）投对了还是投错了：若投错，演绎一段"真凶逍遥法外"的遗憾尾声（真凶暗自庆幸、蒙混过关，玩家恍然大悟又懊恼）；若投对，正常庆祝破案{perfect_crime_note}
+5. 【结局演绎】真人玩家（{user_role}）本局的结局是「{ending_label}」{ending_note}
 6. 为整场游戏收尾"""
 
     resp = _stream_full_text(prompt)

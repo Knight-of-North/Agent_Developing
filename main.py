@@ -15,11 +15,25 @@ def print_role_card(result):
     user_role = result.get("user_role", "你")
     suspects = script.get("suspects", [])
     user_secret = next((s.get("secret", "") for s in suspects if s.get("name") == user_role), "")
+    user_script = next((s.get("personal_script", "") for s in suspects if s.get("name") == user_role), "")
+    user_suspect = next((s for s in suspects if s.get("name") == user_role), {})
     # 信息差：只显示你自己持有的私密线索，别人的线索你看不到
     user_clues = result.get("distributed_clues", {}).get(user_role, [])
     print("=" * 46)
     print(f"【你的角色卡】你扮演：{user_role}")
-    print(f"  你的秘密（只能自己知道，别主动暴露）：{user_secret}")
+    if result.get("user_is_murderer"):
+        print("  ⚠️ 你是真凶！你的目标：误导其他人、隐藏证据、别被投出去。")
+    if user_suspect.get("profession"):
+        print(f"  职业：{user_suspect.get('profession')}")
+    if user_suspect.get("relation_to_victim"):
+        print(f"  与死者的关系：{user_suspect.get('relation_to_victim')}")
+    if user_suspect.get("alibi"):
+        print(f"  不在场证明：{user_suspect.get('alibi')}")
+    if user_suspect.get("task"):
+        print(f"  你的任务：{user_suspect.get('task')}")
+    if user_script:
+        print(f"\n  【你的个人剧本】（开局先读，发言和推理都靠它）：\n  {user_script}")
+    print(f"\n  你的秘密（只能自己知道，别主动暴露）：{user_secret}")
     print("  你掌握的私密线索（只有你知道，是否公开由你决定）：")
     if user_clues:
         for c in user_clues:
@@ -81,9 +95,41 @@ if __name__ == "__main__":
             printed = show_new(result.get("messages", []), printed)
 
         elif info["type"] == "human_turn":
-            # 轮到你发言
-            user_input = input(f"\n【轮到你了·{info['speaker']}】请输入你的发言：")
-            result = graph.invoke(Command(resume=user_input), config)
+            # 玩家回合：支持发言 + 公开线索/指控/调查三种行动（终端版用菜单选择）
+            own_clues = info.get("own_clues", [])
+            targets = info.get("targets", [])
+            can_investigate = info.get("can_investigate", False)
+
+            print(f"\n【轮到你了·{info['speaker']}】你可以：")
+            print("  · 直接输入文字 = 发言")
+            if own_clues:
+                print("  · 输入 2 = 公开一条你的私密线索")
+            if targets:
+                print("  · 输入 3 = 指控某人是凶手")
+            if can_investigate:
+                print("  · 输入 4 = 调查现场（发现隐藏线索）")
+
+            user_input = input("你的行动：").strip()
+
+            if user_input == "2" and own_clues:
+                print("  你的私密线索：")
+                for i, c in enumerate(own_clues, 1):
+                    print(f"    {i}. {c}")
+                choice = input("  公开哪条（输入序号）：").strip()
+                if choice.isdigit() and 1 <= int(choice) <= len(own_clues):
+                    resume = {"action": "reveal_clue", "clue": own_clues[int(choice) - 1]}
+                else:
+                    resume = user_input   # 非法序号，退回当发言
+            elif user_input == "3" and targets:
+                print(f"  可指控对象：{', '.join(targets)}")
+                target = input("  指控谁（输入名字）：").strip()
+                resume = {"action": "accuse", "target": target}
+            elif user_input == "4" and can_investigate:
+                resume = {"action": "investigate"}
+            else:
+                resume = user_input   # 默认当发言
+
+            result = graph.invoke(Command(resume=resume), config)
             printed = show_new(result.get("messages", []), printed)
 
         elif info["type"] == "human_vote":

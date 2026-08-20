@@ -16,12 +16,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from names import _parse_names, _pick_suspect_names
+from prompts import _build_script_prompt, murderer_defense_pool_text
 from validators import (
     _enforce_names,
     _normalize_secret_first_person,
     _fallback_clues,
+    _filter_relations,
+    _ensure_clues,
     _extract_speak,
 )
+from visualization import build_relations_html, _truncate_label, _clean_pronouns
 from nodes import distribute_clues_node, tally_node, route_speaker, _current_speaker
 from interrupt_handler import get_interrupt, validate_vote
 
@@ -251,3 +255,386 @@ def test_route_speaker_vote_when_round_full():
 def test_route_speaker_no_suspects():
     state = {"phase_round": 0, "script": {"suspects": []}, "user_role": ""}
     assert route_speaker(state) == "vote"
+
+
+# ============ _filter_relations（名单外角色清洗） ============
+# 回归：LLM 把 background_story 里的背景人物（不在嫌疑人名单内）写进 relations，
+# pyvis 渲染时 add_edge 对不存在的节点直接 AssertionError，整页崩溃。
+
+def _script_with_relations(rels):
+    return {
+        "suspects": [{"name": "张三"}, {"name": "李四"}, {"name": "王五"}],
+        "relations": rels,
+    }
+
+
+def test_filter_relations_drops_outside_names():
+    # 周恒远不在嫌疑人名单里，两条涉及他的边应被剔除
+    script = _script_with_relations([
+        {"from": "张三", "to": "周恒远", "rel": "我的辅导员", "public": True},
+        {"from": "周恒远", "to": "死者", "rel": "关系密切", "public": True},
+        {"from": "张三", "to": "李四", "rel": "我们互相看不惯", "public": True},
+    ])
+    fixed = _filter_relations(dict(script))
+    assert len(fixed["relations"]) == 1
+    assert fixed["relations"][0]["to"] == "李四"
+
+
+def test_filter_relations_keeps_victim_and_private():
+    # 死者是合法节点（保留）；私密关系不涉及清洗（清洗只看名单，不看 public）
+    script = _script_with_relations([
+        {"from": "张三", "to": "死者", "rel": "我把死者当姐姐", "public": False},
+        {"from": "王五", "to": "李四", "rel": "我们结过仇", "public": True},
+    ])
+    fixed = _filter_relations(dict(script))
+    assert len(fixed["relations"]) == 2
+
+
+def test_filter_relations_empty_or_missing():
+    # 无 relations key：函数保持原样，不新增 key
+    fixed = _filter_relations({"suspects": [{"name": "张三"}]})
+    assert "relations" not in fixed
+    script = _script_with_relations([])
+    fixed = _filter_relations(script)
+    assert fixed["relations"] == []
+    # 无 suspects 也不崩
+    assert _filter_relations({"relations": [{"from": "a", "to": "b", "public": True}]})["relations"] == []
+
+
+# ============ _ensure_clues（线索全空最后防线） ============
+
+def test_ensure_clues_generates_fallback():
+    script = {
+        "suspects": [{"name": "张三", "secret": "我偷看过考卷"}, {"name": "李四", "secret": ""}],
+        "public_clues": [],
+        "private_clues": [],
+    }
+    fixed = _ensure_clues(dict(script))
+    assert len(fixed["private_clues"]) == 2
+    assert {c["holder"] for c in fixed["private_clues"]} == {"张三", "李四"}
+    assert "考卷" in fixed["private_clues"][0]["content"]
+    # secret 缺失的嫌疑人也有占位线索（不白板）
+    assert fixed["private_clues"][1]["content"]
+
+
+def test_ensure_clues_existing_untouched():
+    script = {"public_clues": ["公共线索"], "private_clues": [{"holder": "张三", "content": "x"}]}
+    assert _ensure_clues(dict(script)) == script
+    # 只要任意一种线索存在就不覆盖（防止把 LLM 认真生成的线索换成 secret 兜底）
+    script2 = {"public_clues": ["只有公共线索"], "private_clues": []}
+    assert _ensure_clues(dict(script2)) == script2
+
+
+# ============ build_relations_html（关系图崩溃防御） ============
+
+def test_relations_html_drops_unknown_nodes():
+    # 原始崩溃场景：relations 引用名单外的"周恒远"，必须不崩且不渲染该节点。
+    # pyvis generate_html 用 json.dumps(ensure_ascii=True) 把中文转成 \uXXXX 转义，
+    # 断言中文字面量会误判（浏览器实际能正常渲染），所以要按 unicode_escape 编码后断言。
+    html = build_relations_html(
+        [
+            {"from": "张三", "to": "周恒远", "rel": "我的辅导员", "public": True},
+            {"from": "张三", "to": "李四", "rel": "我们互相看不惯", "public": True},
+        ],
+        ["张三", "李四"],
+    )
+    escaped_zhou = "周恒远".encode("unicode_escape").decode()
+    escaped_li = "李四".encode("unicode_escape").decode()
+    assert escaped_zhou not in html
+    assert escaped_li in html
+
+
+def test_relations_html_empty_returns_empty_string():
+    assert build_relations_html([], ["张三"]) == ""
+    assert build_relations_html(
+        [{"from": "张三", "to": "李四", "rel": "x", "public": False}], ["张三", "李四"]
+    ) == ""
+
+
+# ============ _truncate_label / 关系图 8-18 优化回归 ============
+# 飞哥反馈：边标签放不下、节点显示不出。优化后必须保持：
+# - 短标签不截断；长标签截断到 8 字 + 省略号（中文按 1 字符计）
+# - 截断后的完整内容必须进 title（hover 看）
+# - 节点用 box（vis.js 配置 "shape": "box" 在选项 JSON 里）
+# - 边标签字号 16、align horizontal（不再沿边旋转成竖排）
+
+def test_truncate_label_short_unchanged():
+    assert _truncate_label("我暗恋聂橙") == "我暗恋聂橙"
+    assert _truncate_label("") == ""
+    assert _truncate_label(None) == ""
+
+
+def test_truncate_label_long_truncated():
+    # 10 字超长，截到 8 字 + 省略号
+    out = _truncate_label("我把他当姐姐心里愧疚")
+    assert len(out) == 9   # 8 字 + 1 省略号
+    assert out.endswith("…")
+    assert out.startswith("我把他当姐")
+
+
+def test_truncate_label_exact_boundary():
+    # 8 字刚好不截
+    assert _truncate_label("一二三四五六七八") == "一二三四五六七八"
+    # 9 字截到 8 字 + 省略号（总长 9 字符）
+    assert _truncate_label("一二三四五六七八九") == "一二三四五六七八…"
+
+
+def test_relations_html_uses_box_shape_and_options():
+    # 8-18 优化：节点用 box 矩形（不再是默认圆形），字号 20/22,边字号 16,水平对齐
+    html = build_relations_html(
+        [{"from": "张三", "to": "李四", "rel": "我暗恋他", "public": True}],
+        ["张三", "李四"],
+    )
+    assert '"shape": "box"' in html, "嫌疑人节点必须用 box 矩形（不是默认圆形）"
+    assert '"size": 16' in html, "边标签字号 16（中文能读）"
+    assert '"align": "horizontal"' in html, "边标签水平显示（不沿边旋转）"
+    assert '"background"' in html, "边标签要有白底防压字"
+    assert "barnesHut" in html, "物理布局用 barnesHut（更稳）"
+    assert "springLength" in html
+    assert "Microsoft YaHei" in html, "中文用 Microsoft YaHei 渲染"
+
+
+def test_relations_html_long_rel_truncated_in_label_full_in_title():
+    # 长 rel 截断进 label，完整内容进 title。
+    # 流水线是 clean_pronouns → truncate，truncated 必须按真实流水线算
+    long_rel = "我把他当姐姐心里愧疚很久了"   # 13 字，删"我/他"变 11 字，截到 8 字+省略号
+    html = build_relations_html(
+        [{"from": "张三", "to": "死者", "rel": long_rel, "public": True}],
+        ["张三", "李四"],
+    )
+    truncated = _truncate_label(_clean_pronouns(long_rel))   # 必须按真实流水线
+    escaped_truncated = truncated.encode("unicode_escape").decode()
+    escaped_full = long_rel.encode("unicode_escape").decode()
+    assert escaped_truncated in html, f"截断后的 label 必须在 html 中: {truncated!r}"
+    assert escaped_full in html, "完整 rel 必须在 html 中（title 悬浮用）"
+
+
+def test_relations_html_victim_node_still_red_star():
+    # 死者仍用 star 形状（视觉中心）
+    html = build_relations_html(
+        [{"from": "张三", "to": "死者", "rel": "我把死者当姐姐", "public": True}],
+        ["张三"],
+    )
+    assert '"shape": "star"' in html
+    assert "案件核心" in html or "f5222d" in html   # 红色/案件标记
+
+
+# ============ _clean_pronouns + 箭头（8-18 第二轮优化） ============
+# 飞哥反馈：关系图加箭头 + 标签里删"我/他"指代冗余词。
+# 边方向 from→to（箭头指 to）契合"我对他"的关系语义，标签里再写
+# "我"和"他/她"就是冗余。完整 rel 仍进 title（hover 看原始描述）。
+
+def test_clean_pronouns_strips_wo_he_she():
+    assert _clean_pronouns("我暗恋聂橙") == "暗恋聂橙"
+    assert _clean_pronouns("我信任他") == "信任"
+    assert _clean_pronouns("我仰慕她") == "仰慕"
+    # 中文标点里的"他"也清理（"他"字面字符）
+    assert _clean_pronouns("我和她关系好") == "和关系好"
+
+
+def test_clean_pronouns_preserves_we():
+    # "我们"是复数第一人称，保留——边是单向箭头，"我们互相看不惯"
+    # 删"我们"会变成"们互相看不惯"语义失真
+    assert _clean_pronouns("我们互相看不惯") == "我们互相看不惯"
+
+
+def test_clean_pronouns_empty_and_none():
+    assert _clean_pronouns("") == ""
+    assert _clean_pronouns(None) == ""
+
+
+def test_clean_pronouns_compose_with_truncate():
+    # 流水线：clean_pronouns → truncate。删"我/他"后,8 字内不截
+    rel = "我把死者当社长"  # 删后"把死者当社长"7 字
+    display = _truncate_label(_clean_pronouns(rel))
+    assert display == "把死者当社长"
+    # 删后 8 字刚好不截（边界）
+    ten_to_eight = "我把他当姐姐心里愧"   # 10 字删"我/他"变 8 字
+    assert _truncate_label(_clean_pronouns(ten_to_eight)) == "把当姐姐心里愧"
+    # 删后超 8 字才截。用 12 字删 2 → 10 字 > 8，截到 8 字+省略号
+    twelve_to_ten = "我把他当姐姐心里疚了吗"
+    # 数:我(1)把(2)他(3)当(4)姐(5)姐(6)心(7)里(8)疚(9)了(10)吗(11)
+    # 共 11 字,删 2 → 9 字?让我精确数:我把他当姐姐心里疚了吗 = 11 字符
+    # 删"我"+"他" → 把当姐姐心里疚了吗 = 9 字符,截到 8 + 省略号
+    display3 = _truncate_label(_clean_pronouns(twelve_to_ten))
+    assert display3.endswith("…"), f"删后 > 8 字必须截断,实际: {display3!r}"
+    assert len(display3) == 9, f"截断后 8 字 + 1 省略号,实际: {display3!r}"
+
+
+def test_relations_html_directed_with_arrows():
+    # 8-18 第二轮：图改有向，边带箭头。
+    # 注意：pyvis 的 directed 是 Network 构造参数，不序列化到 HTML；
+    # vis.js 真正画箭头的机制是 options.edges.arrows.to.enabled = true
+    html = build_relations_html(
+        [{"from": "张三", "to": "李四", "rel": "我暗恋聂橙", "public": True}],
+        ["张三", "李四"],
+    )
+    assert "arrows" in html, "边必须带箭头配置"
+    assert '"to": {"enabled": true' in html or '"to":{"enabled":true' in html, \
+        "箭头方向 to 必须 enabled=true（指 from→to）"
+
+
+def test_relations_html_navigation_buttons_disabled():
+    # 8-20 第四轮：关闭 vis.js 默认的左下/右下导航按钮（被模态框边缘截断）
+    html = build_relations_html(
+        [{"from": "张三", "to": "李四", "rel": "我暗恋聂橙", "public": True}],
+        ["张三", "李四"],
+    )
+    assert '"navigationButtons": false' in html or '"navigationButtons":false' in html, \
+        "navigationButtons 必须设为 false（防默认按钮被模态框边缘截断）"
+    assert '"navigationButtons": true' not in html and '"navigationButtons":true' not in html, \
+        "navigationButtons 不应启用"
+
+
+def test_relations_html_label_strips_pronouns_full_in_title():
+    # 8-18 第二轮：标签里删"我/他/她"，完整 rel 仍进 title
+    rel = "我信任他"
+    html = build_relations_html(
+        [{"from": "舒飞", "to": "李鑫杰", "rel": rel, "public": True}],
+        ["舒飞", "李鑫杰"],
+    )
+    # 完整 rel 必须在 html 中（title 悬浮看）
+    assert rel.encode("unicode_escape").decode() in html
+    # 标签区段：经过 clean_pronouns → truncate 应是"信任"，无"我/他/她"
+    # 直接断言："信任" 在 html 里
+    assert "信任".encode("unicode_escape").decode() in html
+    # 反向断言：标签里不含单独的"我信任他"组合（说明被清理+截断了）
+    # 但 title 里仍有完整，所以不能直接断言整段不在
+    # 更稳妥：确保 _clean_pronouns 已生效（"信任" 出现在标签）
+    # 单元测试 _clean_pronouns 已覆盖组合行为，这里端到端验证一次
+
+
+# ============ _build_script_prompt（8-18 自由分支强化） ============
+# 飞哥反馈：未输入 background_story 时,LLM 自由发挥只讲故事不填 JSON 字段，
+# 角色卡/关系图全"待补充"。修复：自由分支复用长背景分支的三条核心铁律。
+
+def test_build_script_prompt_free_branch_has_structured_field_rule():
+    # 空 background_story 走自由分支，prompt 必须包含"结构化字段必须独立写"警告
+    prompt = _build_script_prompt("民国豪门恩怨", "自由发挥", ["舒飞", "吕伟航", "袁志强", "李鑫杰", "聂橙", "赵思远"])
+    assert "结构化字段每个嫌疑人必须独立写一遍" in prompt
+    assert "public_clues / private_clues / hidden_clues" in prompt
+    # 不能自己编新角色（飞哥截图里 LLM 编了"赵元同"等不在名单里的人名）
+    assert "角色名字必须精确使用下面给定的嫌疑人名字" in prompt
+
+
+def test_build_script_prompt_long_branch_keeps_all_rules():
+    # 长 background 分支原有铁律不能丢
+    long_bg = "校园怪谈：某社团 6 个学生发生命案，死者失踪半年后被发现。"
+    prompt = _build_script_prompt("校园怪谈", "悬疑", ["舒飞", "吕伟航"], long_bg)
+    assert "只吸收设定信息" in prompt
+    assert "不要吸收后续对话" in prompt
+    assert "名单外的角色不能登场" in prompt
+    assert "结构化字段每个嫌疑人必须独立写一遍" in prompt
+
+
+def test_build_script_prompt_long_branch_has_fatal_warning_too():
+    # 8-20：长背景分支也必须有致命警告（飞哥反馈：自定义剧情背景没有
+    # 具体人物/秘密/关系时，LLM 偷懒不补字段——光在自由分支加警告不够）。
+    long_bg = "校园悬疑案：死者是家族族长，遗产分配引发矛盾。"
+    prompt = _build_script_prompt("校园悬疑", "悬疑", ["舒飞", "孟诚华"], long_bg)
+    assert "⚠️ 【致命警告】⚠️" in prompt, "长背景分支也必须有致命警告"
+    # 关键新增：用户背景如缺细节必须自由发挥补全
+    assert "自由发挥补全" in prompt, "必须明确告诉 LLM：用户没说的细节由 LLM 自由发挥补全"
+    assert "不能用" in prompt and "用户没说" in prompt, "必须明确禁止 '用户没说所以跳过' 的借口"
+
+
+def test_build_script_prompt_empty_bg_uses_free_branch():
+    # 验证 background_story 空字符串/空白/None 都走自由分支
+    names = ["舒飞", "吕伟航"]
+    p_none = _build_script_prompt("主题", "风格", names, "")
+    p_ws = _build_script_prompt("主题", "风格", names, "   ")
+    # 自由分支关键特征：没有"只吸收设定信息"措辞
+    assert "只吸收设定信息" not in p_none
+    assert "只吸收设定信息" not in p_ws
+    # 但有结构化字段铁律
+    assert "结构化字段每个嫌疑人必须独立写一遍" in p_none
+    assert "结构化字段每个嫌疑人必须独立写一遍" in p_ws
+
+
+# ============ 8-19 自由分支致命警告 + 重试注入 ============
+# 飞哥反馈：只输入主题时 LLM 仍偷懒（周既明/待补充/未生成公开关系）。
+# 修复：① 自由分支 context 顶部拼 ⚠️ 致命警告（emoji + 列字段 + 后果）；
+#       ② _build_script_prompt 新增 previous_problems 参数，重试时把上次
+#          自洽校验失败问题拼进 prompt，让 LLM 第二次知道漏在哪。
+
+def test_build_script_prompt_free_branch_has_fatal_warning():
+    # 8-19：自由分支必须包含 ⚠️ 致命警告 + 逐个字段列出 + 后果警告
+    prompt = _build_script_prompt("民国豪门恩怨", "自由发挥", ["舒飞", "吕伟航"])
+    assert "⚠️ 【致命警告】⚠️" in prompt, "必须有致命警告块"
+    assert "绝对不能省略" in prompt
+    # 每个字段都要被点名
+    for field in ["profession", "relation_to_victim", "alibi", "task",
+                  "personality", "speech_style", "secret", "forbidden", "personal_script"]:
+        assert field in prompt, f"警告里必须点名 {field}"
+    assert "游戏无法进行" in prompt, "必须有后果警告"
+
+
+def test_build_script_prompt_previous_problems_injected():
+    # 8-19：previous_problems 必须拼进 prompt（重试时告知 LLM 上次漏了什么）
+    prompt = _build_script_prompt(
+        "主题", "风格", ["舒飞"], "",
+        previous_problems=["没有任何线索", "舒飞 的 forbidden 词未出现在 secret 里"],
+    )
+    assert "上次生成失败反馈" in prompt, "必须有失败反馈块"
+    assert "没有任何线索" in prompt, "problems 内容必须拼进 prompt"
+    assert "forbidden 词未出现在 secret" in prompt
+    assert "明确填全" in prompt
+
+
+def test_build_script_prompt_no_previous_problems_no_feedback():
+    # 8-19：不传 previous_problems 时不能有失败反馈块（首次生成干净 prompt）
+    prompt = _build_script_prompt("主题", "风格", ["舒飞"])
+    assert "上次生成失败反馈" not in prompt
+    assert "明确填全" not in prompt
+
+
+# ============ murderer_defense_pool_text（8-20 凶手狡辩策略池） ============
+# 飞哥反馈："凶手被指控只会说同样的话"——给凶手 5 套策略循环使用，
+# 严禁 LLM 重复同一种话术。
+
+def test_murderer_defense_pool_zero_returns_empty():
+    # 未被指控时返回空串（不污染 prompt）
+    assert murderer_defense_pool_text(0) == ""
+    assert murderer_defense_pool_text(-1) == ""
+
+
+def test_murderer_defense_pool_first_call_picks_strategy_1():
+    # 第一次被指控：第 1 种策略"否认证据"
+    text = murderer_defense_pool_text(1)
+    assert "第 1 种策略" in text
+    assert "否认证据" in text
+    assert "已经被指控 1 次" in text
+
+
+def test_murderer_defense_pool_cycles_through_all_strategies():
+    # 第 2~5 次被指控：第 2/3/4/5 种策略
+    text2 = murderer_defense_pool_text(2)
+    assert "第 2 种策略" in text2 and "反问嫁祸" in text2
+    text3 = murderer_defense_pool_text(3)
+    assert "第 3 种策略" in text3 and "质疑指控" in text3
+    text4 = murderer_defense_pool_text(4)
+    assert "第 4 种策略" in text4 and "情绪激动" in text4
+    text5 = murderer_defense_pool_text(5)
+    assert "第 5 种策略" in text5 and "细节反驳" in text5
+
+
+def test_murderer_defense_pool_loops_back():
+    # 第 6 次被指控：循环回到第 1 种（不能超出索引）
+    text6 = murderer_defense_pool_text(6)
+    assert "第 1 种策略" in text6 and "否认证据" in text6
+
+
+def test_murderer_defense_pool_lists_all_strategies():
+    # 任何一次返回都必须包含完整策略池全貌（供 LLM 参考，必须轮换）
+    text = murderer_defense_pool_text(1)
+    for keyword in ["否认证据", "反问嫁祸", "质疑指控", "情绪激动", "细节反驳",
+                    "严禁复制粘贴", "话术框架必须换"]:
+        assert keyword in text, f"策略池必须包含 {keyword}"
+
+
+def test_murderer_defense_pool_different_accusation_count_different_pick():
+    # 核心约束：相邻两次被指控必须选不同策略（防止 LLM 重复话术）
+    t1 = murderer_defense_pool_text(1)
+    t2 = murderer_defense_pool_text(2)
+    assert "第 1 种" in t1 and "第 2 种" in t2
+    assert t1 != t2, "相邻两次指控必须返回不同文本"

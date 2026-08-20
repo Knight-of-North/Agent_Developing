@@ -123,6 +123,66 @@ def _fallback_clues(script: dict) -> dict:
     return script
 
 
+def _filter_relations(script: dict) -> dict:
+    """兜底：清洗 relations 里引用名单外角色的关系边。
+
+    LLM 生成剧本时，可能把 background_story 素材种子里的背景人物
+    （老师/管理员/路人等，不在嫌疑人名单内）写进 relations——
+    关系图渲染时 pyvis 对不存在的节点直接断言崩溃（页面红屏）。
+    这里确定性剔除：关系边两端必须都在「嫌疑人名单 ∪ {死者}」内。
+
+    注意：这里做的是"整条边剔除"，而不是"把名单外名字改成某人"——
+    名单外角色不是登场角色，他/她的关系对玩家没有盘问价值，留着反而误导。
+    """
+    suspects = script.get("suspects") or []
+    names = [s.get("name", "") for s in suspects if isinstance(s, dict) and s.get("name")]
+    valid = set(names) | {"死者"}
+
+    rels = script.get("relations") or []
+    kept = [
+        r for r in rels
+        if isinstance(r, dict)
+        and r.get("from") in valid and r.get("to") in valid
+    ]
+    if len(kept) != len(rels):
+        script["relations"] = kept
+    return script
+
+
+def _ensure_clues(script: dict) -> dict:
+    """最后防线：剧本完全没有线索时，从嫌疑人的 secret 生成兜底线索。
+
+    LLM 偶尔整份剧本都不生成 public_clues / private_clues（空列表），
+    自洽校验会报"没有任何线索"，玩家一局白板玩不下去。
+    兜底策略（纯确定性，不调 LLM）：把每个嫌疑人的 secret 作为一条
+    "只有他自己知道"的私密线索，holder 就是本人——每个角色至少 1 条，
+    信息差仍然成立（别人的秘密你不知道）。secret 缺失的用占位文本，
+    保证数量对得上。
+
+    这层是"最后防线"：正常剧本（LLM 有线索）完全不受影响。
+    """
+    if script.get("private_clues") or script.get("public_clues"):
+        return script   # 已有线索，不动
+
+    suspects = script.get("suspects") or []
+    private = []
+    for s in suspects:
+        if not isinstance(s, dict):
+            continue
+        name = s.get("name", "")
+        secret = s.get("secret", "").strip()
+        if not name:
+            continue
+        if secret:
+            content = f"我自己的秘密：{secret}"
+        else:
+            content = "我知道一些关于自己的事，但一时想不起来。"
+        private.append({"holder": name, "content": content})
+
+    script["private_clues"] = private
+    return script
+
+
 def _extract_speak(out: dict) -> str:
     """从 LLM 解析结果里安全提取"公开发言"。
 

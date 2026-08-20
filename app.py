@@ -18,6 +18,16 @@ def get_graph():
     return build_graph()
 
 
+@st.dialog("🕸️ 人物关系图（仅公开关系）", width="large")
+def _relations_dialog(relations_html):
+    """屏幕中央弹出的人物关系图（模态框，右上角自带 X 可关闭）。
+
+    侧边栏空间小，关系图挤在 380px 高的框里看不清；改成点按钮后在大弹窗里看。
+    st.dialog 是 Streamlit 的模态框：调用即弹出、点右上角 X 或点弹窗外区域关闭。
+    """
+    st.components.v1.html(relations_html, height=640)
+
+
 def _run_stream(graph, cmd, config):
     """执行图，返回和 graph.invoke 一致的结果（完整 state + __interrupt__）。
 
@@ -232,6 +242,14 @@ else:
     user_secret = next((s.get("secret", "") for s in suspects if s.get("name") == user_role), "")
     # 信息差：只显示你自己持有的私密线索
     user_clues = result.get("distributed_clues", {}).get(user_role, [])
+    # 个人剧本：玩家自己的完整背景故事（开局必读，发言和推理的根基）
+    user_script = next((s.get("personal_script", "") for s in suspects if s.get("name") == user_role), "")
+    # 结构化角色信息（职业/与死者关系/不在场证明/任务），角色卡要展示、让玩家快速锚定"我是谁我要干嘛"
+    user_suspect = next((s for s in suspects if s.get("name") == user_role), {})
+    user_profession = user_suspect.get("profession", "")
+    user_relation = user_suspect.get("relation_to_victim", "")
+    user_alibi = user_suspect.get("alibi", "")
+    user_task = user_suspect.get("task", "")
 
     # 角色卡（侧边栏）
     with st.sidebar:
@@ -240,6 +258,20 @@ else:
         # 玩家是凶手时给特殊提示（否则会陷入"知道自己是凶手却无事可做"的断裂）
         if result.get("user_is_murderer"):
             st.warning("🩸 你是真凶！你的目标：误导其他人、隐藏证据、别被投出去。")
+        # 结构化角色信息：让玩家一眼锚定"我是谁、我和死者什么关系、我要干嘛"
+        if user_profession:
+            st.caption("💼 职业")
+            st.markdown(user_profession)
+        if user_relation:
+            st.caption("🔗 与死者的关系")
+            st.markdown(user_relation)
+        if user_alibi:
+            st.caption("🕐 你的不在场证明")
+            st.markdown(user_alibi)
+        if user_task:
+            st.caption("🎯 你的任务")
+            st.markdown(user_task)
+        st.divider()
         st.caption("你的秘密（别主动暴露）")
         st.info(user_secret)
         st.divider()
@@ -255,13 +287,42 @@ else:
             mark = "（你）" if s.get("name") == user_role else ""
             st.write(f"· {s.get('name')}{mark}")
         st.divider()
-        # 人物关系图（仅公开关系，私密关系属信息差不显示）
-        st.caption("🕸️ 人物关系图（仅公开关系）")
+        # 人物关系图（仅公开关系，私密关系属信息差不显示）：侧边栏放按钮，点击后屏幕中央弹大图
+        st.caption("🕸️ 人物关系图")
         relations_html = build_relations_html(script.get("relations", []), [s.get("name", "?") for s in suspects])
         if relations_html:
-            st.components.v1.html(relations_html, height=380)
+            if st.button("🔍 全屏查看人物关系图", use_container_width=True):
+                _relations_dialog(relations_html)
         else:
             st.caption("（剧本未生成公开关系）")
+
+    # 个人剧本册子（开局必读）：玩家自己的完整背景故事 + 自己与他人的关系。
+    # 信息差铁律：只展示「玩家自己」的剧本；其他角色的 secret / personal_script 绝不在此公开，
+    # 否则凶手开局就暴露。关系清单也只提取「涉及玩家自己」的边（自己知情，无论是否公开）。
+    if user_script:
+        with st.expander("📖 你的个人剧本（开局先读，发言和推理都靠它）", expanded=True):
+            st.markdown(user_script)
+            my_relations = [
+                r for r in script.get("relations", [])
+                if r.get("from") == user_role or r.get("to") == user_role
+            ]
+            if my_relations:
+                st.divider()
+                st.caption("你与他人的关系")
+                for r in my_relations:
+                    rel_text = r.get("rel", "")
+                    if r.get("from") == user_role:
+                        # 玩家是 from：rel 已经是"我..."第一人称，直接展示
+                        other = r.get("to", "?")
+                        st.markdown(f"· **{other}**：{rel_text}")
+                    else:
+                        # 玩家是 to：rel 是 from 视角的"我..."，把"我"替换成 from 名字。
+                        # 飞哥 8-19 反馈：括号里"X视角"暗示第一人称，改成"X·第三人称"
+                        # 明确这是第三人称描述，避免玩家误读为"我视角"。
+                        other = r.get("from", "?")
+                        # 占位符保住"我们"里的"我"不被误替换（"我们互相看不惯" → 不能变"张三们互相看不惯"）
+                        rel_translated = rel_text.replace("我们", "⌈W⌉").replace("我", other).replace("⌈W⌉", "我们")
+                        st.markdown(f"· **{other}**（{other}·第三人称）：{rel_translated}")
 
     # 对话历史（主区域）：直接渲染。
     # 真流式已经在"等待时"实时显示过了，这里无需再打字机回放。
@@ -275,8 +336,45 @@ else:
     info = get_interrupt(result)
     if info:
         if info["type"] == "human_turn":
-            # 显式 key：让"发言输入框"和"投票输入框"完全独立，
-            # 避免 st.chat_input 值残留把发言文本带进投票环节
+            # 玩家回合现在支持「发言」+「公开线索 / 指控 / 调查」三种行动。
+            # 行动按钮在 expander 里，默认玩家直接用 chat_input 发言（str），
+            # 点行动按钮则 resume 传 dict（human_turn_node 里区分处理）。
+            own_clues = info.get("own_clues", [])
+            targets = info.get("targets", [])
+            can_investigate = info.get("can_investigate", False)
+
+            with st.expander("⚡ 行动选项（公开线索 / 指控 / 调查）", expanded=False):
+                col1, col2 = st.columns(2)
+                with col1:
+                    if own_clues:
+                        clue = st.selectbox("📣 公开哪条线索", own_clues, key="reveal_select")
+                        if st.button("公开这条线索", key="reveal_btn"):
+                            st.session_state.result = _run_stream(
+                                graph, Command(resume={"action": "reveal_clue", "clue": clue}), config
+                            )
+                            st.rerun()
+                    else:
+                        st.caption("（你没有可公开的私密线索）")
+                with col2:
+                    if targets:
+                        target = st.selectbox("👉 指控谁", targets, key="accuse_select")
+                        if st.button("正式指控 TA", key="accuse_btn"):
+                            st.session_state.result = _run_stream(
+                                graph, Command(resume={"action": "accuse", "target": target}), config
+                            )
+                            st.rerun()
+                    else:
+                        st.caption("（没有可指控的对象）")
+                if can_investigate:
+                    if st.button("🔍 调查现场（发现隐藏线索）", key="investigate_btn"):
+                        st.session_state.result = _run_stream(
+                            graph, Command(resume={"action": "investigate"}), config
+                        )
+                        st.rerun()
+                else:
+                    st.caption("（现场已经搜遍，没有新发现了）")
+
+            # 发言输入（默认动作，显式 key 与投票输入框隔离，防止值残留串台）
             user_input = st.chat_input(f"轮到你了（{info['speaker']}），输入你的发言...", key="speak_input")
             if user_input:
                 st.session_state.result = _run_stream(graph, Command(resume=user_input), config)

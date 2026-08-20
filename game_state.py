@@ -85,6 +85,10 @@ class GameState(TypedDict, total=False):
     # 供 DM 中场引导、AI 发言提示"未公开线索"、复盘数据化使用（报告⑨）。
     revealed_clues: Annotated[dict, _merge_dict]
 
+    # 已调查的隐藏线索（list，追加）。玩家每「调查」一次，从 script.hidden_clues 里
+    # 揭示一条、记录到这里，避免重复调查同一条。也用于判断"是否还能调查"。
+    investigated_clues: Annotated[list, operator.add]
+
     # AI 自我记忆 {角色名: [该角色说过的关键陈述，最多保留最近 3 条]}。
     # 防 AI 自相矛盾（第 2 轮说"在书房"第 8 轮说"在厨房"），凶手忘词会意外露馅
     agent_memory: Annotated[dict, _merge_dict]
@@ -98,3 +102,7 @@ class GameState(TypedDict, total=False):
 
     # 各嫌疑人得票数 {嫌疑人: 票数}（tally_node 统计得出）
     vote_counts: dict
+
+    # 全局胜负（tally_node 判定）：平民胜利（投出真凶）/ 凶手胜利（真凶逃脱）/ 平局（平票）。
+    # 剧本杀是"平民 vs 凶手"的对抗游戏，这个字段让投票有了真正的 stakes（报告风险 2）
+    game_result: str

@@ -26,6 +26,7 @@ from nodes import (
     distribute_clues_node,
     choose_role_node,
     dm_intro_node,
+    self_intro_node,
     dm_midpoint_node,
     ai_player_turn_node,
     human_turn_node,
@@ -46,6 +47,7 @@ def build_graph():
     builder.add_node("distribute_clues", distribute_clues_node)   # 信息差：线索分发
     builder.add_node("choose_role", choose_role_node)             # interrupt：用户选角色
     builder.add_node("dm_intro", dm_intro_node)
+    builder.add_node("self_intro", self_intro_node)            # 自我介绍（每个 AI 依次介绍，玩家跳过）
     builder.add_node("dm_midpoint", dm_midpoint_node)             # DM 中场引导（讨论过半触发）
     builder.add_node("ai_player_turn", ai_player_turn_node)
     builder.add_node("human_turn", human_turn_node)   # interrupt 节点
@@ -55,11 +57,12 @@ def build_graph():
     builder.add_node("final_statement", final_statement_node)   # 被投最高者的最终陈词
     builder.add_node("dm_reveal", dm_reveal_node)
 
-    # 前半段：生成剧本 -> 分发线索 -> 选角色 -> DM 开场
+    # 前半段：生成剧本 -> 分发线索 -> 选角色 -> DM 开场 -> 自我介绍
     builder.add_edge(START, "generate_script")
     builder.add_edge("generate_script", "distribute_clues")
     builder.add_edge("distribute_clues", "choose_role")
     builder.add_edge("choose_role", "dm_intro")
+    builder.add_edge("dm_intro", "self_intro")
 
     # 条件边：讨论循环的路由（挂在三个"发言入口"之后 + 中场引导之后）
     # route_speaker 根据 phase_round 决定下一个发言者是用户还是 AI、中场引导、或进入投票
@@ -69,7 +72,7 @@ def build_graph():
         "midpoint": "dm_midpoint",
         "vote": "ai_vote",
     }
-    builder.add_conditional_edges("dm_intro", route_speaker, route_map)
+    builder.add_conditional_edges("self_intro", route_speaker, route_map)
     builder.add_conditional_edges("ai_player_turn", route_speaker, route_map)
     builder.add_conditional_edges("human_turn", route_speaker, route_map)
     builder.add_conditional_edges("dm_midpoint", route_speaker, route_map)
