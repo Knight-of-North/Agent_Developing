@@ -55,11 +55,14 @@ if __name__ == "__main__":
     story_time = input("故事发生时间（回车跳过，如：1935年深秋 / 宋代江南）：").strip()
     story_location = input("故事发生地点（回车跳过，如：上海滩租界 / 湖南师大图书馆）：").strip()
     custom_names = _parse_names(input("自定义嫌疑人名字（回车跳过用随机；填写如：张三,李四,王五）："))
+    # 讨论节奏（8-20 审查修复：与 Web 版对齐，终端版也可调快/标准/深入 → 每人 2/3/4 轮）
+    pace = input("讨论节奏（回车标准；快=每人2轮 / 标准=每人3轮 / 深入=每人4轮）：").strip()
+    rounds_per_player = {"快": 2, "深入": 4}.get(pace, 3)
     print(f"\n正在生成剧本，主题：{theme}，背景：{background} ...\n")
 
     # 第一次调用：跑到第一个 interrupt（选角色）时暂停
     result = graph.invoke(
-        {"theme": theme, "background_style": background, "background_story": background_story, "story_time": story_time, "story_location": story_location, "custom_names": custom_names, "messages": [], "thoughts": []},
+        {"theme": theme, "background_style": background, "background_story": background_story, "story_time": story_time, "story_location": story_location, "custom_names": custom_names, "rounds_per_player": rounds_per_player, "messages": [], "thoughts": []},
         config,
     )
 

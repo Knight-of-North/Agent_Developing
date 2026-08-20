@@ -20,13 +20,19 @@ from prompts import _build_script_prompt, murderer_defense_pool_text
 from validators import (
     _enforce_names,
     _normalize_secret_first_person,
+    _normalize_secrets,
     _fallback_clues,
     _filter_relations,
     _ensure_clues,
     _extract_speak,
+    _parse_json,
 )
 from visualization import build_relations_html, _truncate_label, _clean_pronouns
-from nodes import distribute_clues_node, tally_node, route_speaker, _current_speaker
+from nodes import (
+    distribute_clues_node, tally_node, route_speaker, _current_speaker,
+    _check_script_consistency, _get_murderer, _extract_clue_keywords,
+    _update_revealed_clues, _detect_addressed, _format_private_clues, _judge_ending,
+)
 from interrupt_handler import get_interrupt, validate_vote
 
 
@@ -233,18 +239,48 @@ def _make_state(round_num, names, user_role):
     }
 
 
-def test_current_speaker_round_robin():
+def test_current_speaker_follows_last_message():
+    # 8-20 终审 M2 修复：轮换由"上一位实际发言者"驱动（读 messages 末位取下一位），
+    # 不再按 phase_round 取模——点名/追问插队发言不再打乱轮换顺序。
     state = _make_state(0, ["张三", "李四", "王五"], "张三")
+    # 无消息（讨论开始前）→ 从第一个开始
     assert _current_speaker(state)["name"] == "张三"
-    state["phase_round"] = 1
+    # 张三刚发言 → 轮到李四
+    state["messages"] = [{"speaker": "张三", "content": "..."}]
     assert _current_speaker(state)["name"] == "李四"
-    state["phase_round"] = 3
-    assert _current_speaker(state)["name"] == "张三"   # 循环回第一个
+    # 李四刚发言 → 王五
+    state["messages"] = [{"speaker": "李四", "content": "..."}]
+    assert _current_speaker(state)["name"] == "王五"
+    # 王五刚发言 → 循环回张三
+    state["messages"] = [{"speaker": "王五", "content": "..."}]
+    assert _current_speaker(state)["name"] == "张三"
+    # 最后发言者不在名单（如"主持人"）→ 从头开始
+    state["messages"] = [{"speaker": "主持人", "content": "..."}]
+    assert _current_speaker(state)["name"] == "张三"
 
 
 def test_route_speaker_human_vs_ai():
-    assert route_speaker(_make_state(0, ["张三", "李四"], "张三")) == "human"
-    assert route_speaker(_make_state(1, ["张三", "李四"], "张三")) == "ai"
+    # 张三(玩家)刚发言 → 下一位李四 → ai
+    state = _make_state(0, ["张三", "李四"], "张三")
+    state["messages"] = [{"speaker": "张三", "content": "..."}]
+    assert route_speaker(state) == "ai"
+    # 李四刚发言 → 下一位张三(玩家) → human
+    state["messages"] = [{"speaker": "李四", "content": "..."}]
+    assert route_speaker(state) == "human"
+
+
+def test_route_speaker_pointed_reply_does_not_skip_next():
+    # 8-20 终审 M2 关键回归：点名 C 插队回应 + 玩家追问后，
+    # 下一轮仍是正常顺序（B 不被跳过、C 不连续发言）。
+    # 推演：A(玩家)点名 C → C 插队回应 → A 追问 → 下一轮轮到 B。
+    suspects = ["张三", "李四", "王五"]   # 张三=玩家
+    # C(王五)刚插队发言完，pending 已清 → 下一位按 messages 末位取 → 李四
+    state = _make_state(0, suspects, "张三")
+    state["messages"] = [{"speaker": "王五", "content": "..."}]
+    assert _current_speaker(state)["name"] == "张三"   # 王五的下一位 = 张三(玩家)
+    # 玩家追问完（最后发言者是张三）→ 下一位李四，不再跳人
+    state["messages"] = [{"speaker": "王五", "content": "..."}, {"speaker": "张三", "content": "..."}]
+    assert _current_speaker(state)["name"] == "李四"
 
 
 def test_route_speaker_vote_when_round_full():
@@ -638,3 +674,226 @@ def test_murderer_defense_pool_different_accusation_count_different_pick():
     t2 = murderer_defense_pool_text(2)
     assert "第 1 种" in t1 and "第 2 种" in t2
     assert t1 != t2, "相邻两次指控必须返回不同文本"
+
+
+# ============ _parse_json（8-20 审查补测） ============
+
+def test_parse_json_plain_object():
+    assert _parse_json('{"a": 1}') == {"a": 1}
+
+
+def test_parse_json_with_code_fence():
+    assert _parse_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert _parse_json('```\n{"a": 1}\n```') == {"a": 1}
+
+
+def test_parse_json_with_leading_text():
+    # LLM 常在 JSON 前后加"好的，这是剧本："引导文字，必须能从文本中提取
+    assert _parse_json('好的，这是你要的剧本：\n{"a": 1}\n希望你喜欢') == {"a": 1}
+
+
+def test_parse_json_invalid_returns_raw():
+    # 完全解析不出时返回 {"raw": 原文}，由下游兜底（_extract_speak 会从 raw 抢救）
+    out = _parse_json("这不是 JSON")
+    assert out == {"raw": "这不是 JSON"}
+
+
+# ============ _check_script_consistency（8-20 审查补测） ============
+
+def _consistent_script():
+    return {
+        "suspects": [
+            {"name": "张三", "secret": "我偷了东西", "forbidden": ["偷了东西"]},
+            {"name": "李四", "secret": "我暗恋王五", "forbidden": ["暗恋"]},
+        ],
+        "truth": "张三因为债务问题杀害了死者",
+        "private_clues": [{"holder": "张三", "content": "有人在案发前换过锁"}],
+        "public_clues": ["死者死于中毒"],
+    }
+
+
+def test_check_script_consistency_passes_ok():
+    assert _check_script_consistency(_consistent_script()) == []
+
+
+def test_check_script_consistency_truth_no_name():
+    script = _consistent_script()
+    script["truth"] = "凶手因为债务问题杀人"   # 没提到任何嫌疑人名字
+    problems = _check_script_consistency(script)
+    assert "truth 未提到任何嫌疑人名字" in problems
+
+
+def test_check_script_consistency_forbidden_not_in_secret():
+    script = _consistent_script()
+    script["suspects"][0]["forbidden"] = ["毒药"]   # forbidden 词不在 secret 里
+    problems = _check_script_consistency(script)
+    assert any("forbidden 词未出现在 secret" in p for p in problems)
+
+
+def test_check_script_consistency_no_clues():
+    script = _consistent_script()
+    script["private_clues"] = []
+    script["public_clues"] = []
+    assert "没有任何线索" in _check_script_consistency(script)
+
+
+# ============ _get_murderer（8-20 审查补测） ============
+
+def test_get_murderer_from_murderer_field():
+    script = {"murderer": "李四", "truth": "xxx", "suspects": [{"name": "张三"}, {"name": "李四"}]}
+    assert _get_murderer(script, ["张三", "李四"]) == "李四"
+
+
+def test_get_murderer_fallback_from_truth():
+    # 无 murderer 字段时，从 truth 里找第一个出现的嫌疑人名字
+    script = {"truth": "张三因为债务问题杀人", "suspects": [{"name": "张三"}, {"name": "李四"}]}
+    assert _get_murderer(script, ["张三", "李四"]) == "张三"
+
+
+def test_get_murderer_empty():
+    assert _get_murderer({"truth": ""}, []) == ""
+
+
+# ============ _extract_clue_keywords（8-20 审查补测） ============
+
+def test_extract_clue_keywords_splits():
+    assert _extract_clue_keywords("有人在案发前换过锁，是熟人") == ["有人在案发前换过锁", "是熟人"]
+    assert _extract_clue_keywords("") == []
+    # 长度 >= 2 的片段都保留（"短词""不保留"各 2 字）；单个字符 "a" 被过滤
+    assert _extract_clue_keywords("短词 不保留 a") == ["短词", "不保留"]
+
+
+# ============ _update_revealed_clues（8-20 审查补测） ============
+
+def test_update_revealed_clues_newly_revealed():
+    distributed = {"张三": ["有人在案发前换过锁"], "李四": ["我听见了争吵声"]}
+    # 发言里完整出现了线索关键词"有人在案发前换过锁" → 张三的这条线索标记公开。
+    # 注意：检测机制是"线索的完整关键词片段出现在发言里"（启发式），发言必须包含整段。
+    newly = _update_revealed_clues("我坦白，有人在案发前换过锁", distributed, {})
+    assert "有人在案发前换过锁" in newly
+    assert newly["有人在案发前换过锁"] == "张三"
+
+
+def test_update_revealed_clues_skips_already_revealed():
+    distributed = {"张三": ["有人在案发前换过锁"]}
+    newly = _update_revealed_clues("又提到换过锁", distributed, {"有人在案发前换过锁": "张三"})
+    assert newly == {}   # 已公开，不再重复返回
+
+
+# ============ _detect_addressed（8-20 审查补测） ============
+
+def test_detect_addressed_finds_name():
+    assert _detect_addressed("李四，你案发当晚在哪", ["张三", "李四"]) == "李四"
+
+
+def test_detect_addressed_not_found():
+    assert _detect_addressed("没有人被点名", ["张三", "李四"]) == ""
+
+
+# ============ _format_private_clues（8-20 审查补测） ============
+
+def test_format_private_clues_lines():
+    text = _format_private_clues({"张三": ["线索A"], "李四": ["线索B", "线索C"]})
+    assert "张三：线索A" in text
+    assert "李四：线索B" in text
+    assert "李四：线索C" in text
+
+
+def test_format_private_clues_empty():
+    assert "没有私密线索" in _format_private_clues({})
+
+
+# ============ _judge_ending（8-20 审查补测，五结局） ============
+
+def _ending_state(**overrides):
+    state = {
+        "user_role": "张三",
+        "user_is_murderer": False,
+        "votes": {"张三": "李四", "李四": "张三"},
+        "vote_winner": "李四",
+        "script": {
+            "suspects": [{"name": "张三"}, {"name": "李四"}],
+            "truth": "李四杀人", "murderer": "李四",
+        },
+        "messages": [{"speaker": "张三", "content": "我怀疑李四"}],
+        "investigated_clues": [],
+    }
+    state.update(overrides)
+    return state
+
+
+def test_judge_ending_detective_active():
+    # 投对 + 发言>=3 → 侦探
+    state = _ending_state(messages=[{"speaker": "张三", "content": "x"} for _ in range(3)])
+    label, _ = _judge_ending(state)
+    assert label == "侦探"
+
+
+def test_judge_ending_lucky_bystander_quiet():
+    # 投对但只发言 1 次 → 幸运旁观者
+    label, _ = _judge_ending(_ending_state())
+    assert label == "幸运旁观者"
+
+
+def test_judge_ending_deceived_wrong_vote():
+    # 投错（投给了无辜者）→ 被蒙蔽
+    state = _ending_state(votes={"张三": "王五", "王五": "张三"}, vote_winner="王五")
+    label, _ = _judge_ending(state)
+    assert label == "被蒙蔽"
+
+
+def test_judge_ending_murderer_escapes():
+    # 玩家是真凶且未被投出 → 完美犯罪
+    state = _ending_state(user_is_murderer=True, votes={"张三": "李四"}, vote_winner="李四")
+    label, _ = _judge_ending(state)
+    assert label == "完美犯罪"
+
+
+def test_judge_ending_murderer_caught():
+    # 玩家是真凶且被投出 → 凶手伏法
+    state = _ending_state(user_is_murderer=True, votes={"张三": "张三", "李四": "张三"}, vote_winner="张三")
+    label, _ = _judge_ending(state)
+    assert label == "凶手伏法"
+
+
+# ============ _normalize_secrets（8-20 审查补测） ============
+
+def test_normalize_secrets_all_suspects_first_person():
+    script = {"suspects": [
+        {"name": "张三", "secret": "他偷了东西"},
+        {"name": "李四", "secret": "她暗恋王五"},
+        {"name": "王五", "secret": "我已经在正确人称"},   # "我"开头不动
+    ]}
+    _normalize_secrets(script)
+    assert script["suspects"][0]["secret"].startswith("我")
+    assert script["suspects"][1]["secret"].startswith("我")
+    assert script["suspects"][2]["secret"] == "我已经在正确人称"
+
+
+def test_normalize_secrets_missing_secret_untouched():
+    script = {"suspects": [{"name": "张三"}]}
+    _normalize_secrets(script)   # 无 secret 字段不崩、不加字段
+    assert "secret" not in script["suspects"][0]
+
+
+# ============ 8-20 性别称呼一致性 ============
+# 飞哥反馈：同一玩家"沈长卿"在不同发言轮被 NPC 分别称为"沈小姐"/"沈先生"。
+# 根因：suspect schema 没有 gender 字段，LLM 看中性名自己猜性别，前后不一致。
+# 修复：prompts.py 加 gender 字段 + 称呼一致性铁律；nodes.py ai_player_turn_node
+# 注入玩家 gender 强制 AI 严格按 gender 用称呼。
+
+def test_build_script_prompt_suspect_has_gender_field():
+    # 8-20：每个 suspect 必须有 gender 字段（"男"或"女"），LLM 显式确定而非猜名字字面
+    long_bg = "民国豪门故事：沈家家族聚会，6人嫌疑人。"
+    prompt = _build_script_prompt("民国豪门", "悬疑", ["沈长卿", "沈碧如"], long_bg)
+    assert "gender" in prompt, "suspect schema 必须有 gender 字段"
+    assert "「男」或「女」" in prompt or '"男"或"女"' in prompt, "gender 字段说明必须是「男」或「女」"
+
+
+def test_build_script_prompt_has_address_consistency_rule():
+    # 8-20：新增"称呼一致性铁律"——整局游戏按 gender 称呼，严禁混用先生/小姐
+    prompt = _build_script_prompt("民国豪门", "悬疑", ["沈长卿"])
+    assert "称呼一致性铁律" in prompt, "必须有称呼一致性铁律"
+    assert "严禁混用" in prompt, "必须禁止混用先生/小姐"
+    # 必须点出"长卿""怀瑾"等中性名猜性别的问题
+    assert "中性" in prompt or "字面" in prompt, "必须提醒 LLM 中性名字面会矛盾"

@@ -13,8 +13,11 @@ llm = ChatDeepSeek(
     model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-    max_tokens=int(os.getenv("DEEPSEEK_MAX_TOKENS", "16384")),
-    reasoning_effort=os.getenv("DEEPSEEK_REASONING_EFFORT", "high"),
+    # 8-20 审查修复：参数必须与 nodes.py 的 get_llm() 保持一致——
+    # 之前 reasoning_effort="high" + max_tokens=16384 测的是"思考模式"行为，
+    # 和游戏实际跑的 reasoning_effort="none"(关 thinking)不一致，排查会误导。
+    max_tokens=4096,
+    reasoning_effort="none",
 )
 
 print(f"模型: {os.getenv('DEEPSEEK_MODEL')}")

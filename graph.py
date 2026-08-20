@@ -1,15 +1,13 @@
 """
 流程编排 —— Phase 5：用户选择角色
 
-图结构：
-    START -> generate_script -> distribute_clues -> choose_role -> dm_intro -+
-                                                                              |   （条件边 route_speaker）
-                                    +-----------------------------------------+
-                                    v
-    human_turn（interrupt 等用户） <----+
-    ai_player_turn（AI 发言）      <----+---- 循环
-              |                        |
-              +---- 轮满 -> ai_vote -> human_vote -> tally -> dm_reveal -> END
+图结构（13 个节点，与 nodes.py docstring 一致）：
+    START -> generate_script -> distribute_clues -> choose_role -> dm_intro
+         -> self_intro -> [讨论循环] -> ai_vote -> human_vote -> tally
+         -> final_statement -> dm_reveal -> END
+
+讨论循环：dm_intro 之后进入 self_intro（AI 自我介绍），然后 route_speaker 条件边
+在 ai_player_turn / human_turn / dm_midpoint 之间路由，轮满进入投票。
 
 关键：本图带 checkpointer（MemorySaver），才能在 interrupt 处"暂停并记住进度"。
 """
