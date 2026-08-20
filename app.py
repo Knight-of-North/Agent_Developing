@@ -3,6 +3,7 @@ AI 剧本杀主持人 · 图形界面版（Streamlit）
 
 运行方式：streamlit run app.py
 """
+import json
 import uuid
 import streamlit as st
 from langgraph.types import Command
@@ -25,7 +26,7 @@ def _relations_dialog(relations_html):
     侧边栏空间小，关系图挤在 380px 高的框里看不清；改成点按钮后在大弹窗里看。
     st.dialog 是 Streamlit 的模态框：调用即弹出、点右上角 X 或点弹窗外区域关闭。
     """
-    st.components.v1.html(relations_html, height=640)
+    st.components.v1.html(relations_html, height=700)   # L7 修复：与 visualization.py 的 canvas 680px 对齐，避免滚动条
 
 
 def _run_stream(graph, cmd, config):
@@ -196,6 +197,11 @@ if not st.session_state.started:
             st.session_state.started = False   # 回到输入页，允许重试
             st.stop()
         placeholder.code("".join(parts), language=None)   # 收尾：显示完整原始 JSON
+        # 8-20 审查优化：完整剧本 JSON 改折叠展示（默认收起）——新手不用直面一坨 JSON，
+        # 排查问题时仍可展开查看原始生成结果（演示时也保留"真流式生成"的过程感）
+        # M3 修复：dict 直接给 st.code 会被 str() 转义成 \uXXXX，用 json.dumps(ensure_ascii=False) 还原中文
+        with st.expander("📄 查看生成剧本（开发者/排查用）", expanded=False):
+            st.code(json.dumps(script, ensure_ascii=False, indent=2), language="json")
         st.success("剧本生成完成！")
 
         # 把预生成好的 script 传给图（generate_script_node 检测到已有 script 会跳过）

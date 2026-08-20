@@ -36,11 +36,6 @@ def get_interrupt_type(result: dict) -> str:
     return get_interrupt(result).get("type", "")
 
 
-def validate_role_choice(chosen: str, names: list[str]) -> str:
-    """校验选角色：合法则返回原值，非法则兜底到名单第一个。"""
-    return chosen if chosen in names else (names[0] if names else "玩家")
-
-
 def validate_vote(vote: str, suspects: list[str]) -> str | None:
     """校验投票：合法嫌疑人名字才返回，否则返回 None（弃权）。"""
     return vote if vote in suspects else None

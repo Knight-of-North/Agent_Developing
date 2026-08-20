@@ -109,14 +109,17 @@ Agent_Developing/
 ├── visualization.py     # 人物关系图可视化（pyvis 生成交互 HTML）
 ├── game_state.py        # 共享状态定义（TypedDict + reducer）
 ├── tests/               # 纯函数单元测试（pytest，不烧 token）
-├── diagnose.py          # 调试脚本（查看模型原始返回）
+├── diagnose.py          # 调试脚本：查看模型对"输出JSON"的原始返回
+├── diag.py              # 网络诊断：直连测试 DeepSeek（trust_env 开/关对比，排查代理问题）
+├── test_api.py          # API 连通性测试：跑一次真实调用（参数与 nodes.py 一致）
+├── docs/                # 代码审查报告 / 玩法评估报告 / 调研报告（归档）
 ├── requirements.txt     # 依赖清单
 └── .env.example         # 密钥配置模板
 ```
 
 ---
 
-## 🔍 图结构（14 个节点）
+## 🔍 图结构（13 个节点）
 
 ```
 START

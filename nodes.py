@@ -1,17 +1,20 @@
 """
 节点函数 —— LangGraph 里的"演员"
 
-Phase 5 节点清单（用户选择角色）：
+节点清单（13 个，与 graph.py 的 add_node 一致）：
 1. generate_script_node ：生成剧本 + 线索（LLM）
 1.5 distribute_clues_node：线索分发，信息差（确定性节点，不调 LLM）
 1.6 choose_role_node    ：用户选择扮演的角色（interrupt 暂停等选择）
 2. dm_intro_node       ：DM 开场介绍（LLM）
+2.5 self_intro_node    ：自我介绍（每个 AI 依次介绍，玩家跳过）（LLM）
 3. ai_player_turn_node ：AI 玩家发言，think/speak 双通道（LLM）
+3.5 dm_midpoint_node   ：DM 中场引导（讨论过半触发一次）（LLM）
 4. human_turn_node     ：轮到用户发言（interrupt 暂停等输入）
 5. ai_vote_node        ：AI 玩家投票（LLM）
 6. human_vote_node     ：用户投票（interrupt 暂停等输入）
-7. tally_node          ：统计票数（确定性节点，不调 LLM）
-8. dm_reveal_node      ：DM 揭晓真相 + 对比投票（LLM）
+7. tally_node          ：统计票数 + 全局胜负（确定性节点，不调 LLM）
+7.5 final_statement_node：被投最高者的最终陈词（LLM）
+8. dm_reveal_node      ：DM 揭晓真相 + 对比投票 + 线索复盘（LLM）
 9. route_speaker       ：条件边路由（判断下一个发言者是谁）
 
 模块拆分（曾是 700+ 行的 God module）：
@@ -404,7 +407,7 @@ def dm_intro_node(state: GameState) -> dict:
 
 只输出主持台词本身，不要额外解释。"""
 
-    resp = _stream_full_text(prompt)
+    resp = _stream_full_text(prompt, allow_partial=False)   # 关键台词：断连宁可报错重试，不能拿半截文本
     return {
         "messages": [{"speaker": "主持人", "content": resp}],
         "current_phase": "discuss",
@@ -453,7 +456,7 @@ def self_intro_node(state: GameState) -> dict:
 
 只输出自我介绍本身，不要 JSON、不要「自我介绍」这类前缀。"""
 
-        resp = _stream_full_text(prompt)
+        resp = _stream_full_text(prompt, allow_partial=False)   # 关键台词：断连宁可报错重试，不能拿半截文本
         intro_messages.append({"speaker": name, "content": f"（自我介绍）{resp}"})
 
     return {"messages": intro_messages}
@@ -485,7 +488,7 @@ def dm_midpoint_node(state: GameState) -> dict:
 
 只输出主持台词本身，不要额外解释。"""
 
-    resp = _stream_full_text(prompt)
+    resp = _stream_full_text(prompt, allow_partial=False)   # 关键台词：断连宁可报错重试，不能拿半截文本
     return {
         "messages": [{"speaker": "主持人", "content": resp}],
         "midpoint_done": True,   # 标记中场引导已做，避免重复触发
@@ -552,6 +555,19 @@ def ai_player_turn_node(state: GameState) -> dict:
     own_clues = state.get("distributed_clues", {}).get(name, [])
     clues_text = "\n".join(f"- {c}" for c in own_clues) if own_clues else "（你没有额外的私密线索）"
 
+    # 8-20：注入玩家性别（从剧本里 user_role 查 suspects 拿 gender 字段）——
+    # 飞哥反馈"沈长卿在两轮发言里被 NPC 分别称为'沈小姐'和'沈先生'"，中性名字
+    # LLM 自己猜性别前后会矛盾。这里把剧本里显式确定的 gender 直接告诉 AI，
+    # 让 AI 严格按此称呼玩家（先生/小姐），严禁混用。
+    user_role = state.get("user_role", "")
+    user_suspect = next(
+        (s for s in script.get("suspects", []) if s.get("name") == user_role), {}
+    )
+    user_gender = user_suspect.get("gender", "")
+    gender_hint = ""
+    if user_gender:
+        gender_hint = f"\n真人玩家（{user_role}）性别：{user_gender}——**必须严格按此性别称呼**（男→「先生/他」/女→「小姐/她」），整局游戏前后必须一致，严禁混用「先生/小姐」。\n"
+
     # 历史窗口动态化：至少保留最近 6 条；嫌疑人多时保留两轮完整讨论，
     # 避免 AI 忘掉两轮前别人说过的话（之前写死 [-6:]，12~18 条消息只看到 6 条）
     history = "\n".join(
@@ -573,7 +589,7 @@ def ai_player_turn_node(state: GameState) -> dict:
 
 你的个人剧本（你完整的背景故事，发言必须基于它、贴合你的人设和动机，不能凭空编造出与它矛盾的内容）：
 {personal_script or "（未提供）"}
-
+{gender_hint}
 你之前说过的话（必须与之保持一致，不能自相矛盾；若之前说了谎，要圆回来而不是推翻）：
 {memory_text}
 
@@ -596,7 +612,7 @@ def ai_player_turn_node(state: GameState) -> dict:
 请以「{name}」的口吻，输出 JSON：
 {{
   "think": "你的内心推理（不公开）：你在隐瞒什么、怀疑谁、想引导什么、手里的线索指向谁",
-  "speak": "你公开说的话（1~3 句，符合人设。可选择性抛出部分线索引导他人，也可隐瞒）
+  "speak": "你公开说的话（1~3 句，符合人设。可选择性抛出部分线索引导他人，也可隐瞒）"
 }}"""
 
     # 防跑飞（确定性校验 + 重试）：
@@ -776,8 +792,11 @@ def ai_vote_node(state: GameState) -> dict:
     ai_names = [n for n in suspect_names if n != user_role]
 
     distributed = state.get("distributed_clues", {})
+    # L4 修复（终审）：投票窗口从写死 [-10:] 改为动态——
+    # 深入节奏（每人 4 轮）下讨论可达 24+ 条消息，只给 10 条会让 AI 忘记前期线索。
+    # 与 ai_player_turn 一致：至少 10 条，嫌疑人多时保留两轮完整讨论。
     history = "\n".join(
-        f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])[-10:]
+        f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])[-max(10, len(suspect_names) * 2):]
     )
 
     votes = {}
@@ -862,12 +881,22 @@ def final_statement_node(state: GameState) -> dict:
     suspects = script.get("suspects", [])
     winner = next((s for s in suspects if s.get("name") == vote_winner), None)
     secret = winner.get("secret", "无") if winner else "无"
+
+    # L5 修复（终审）：完整 truth 只给真凶本人（它本来就知道，用于"认罪/狡辩"抉择）；
+    # 无辜者只告诉它"你不是真凶"——之前把含真凶姓名的 truth 交给无辜者，
+    # 它喊冤时可能无意中说出"真凶其实是 XX"，提前剧透、削弱 dm_reveal 的悬念。
     truth = script.get("truth", "")
+    suspects_names = [s.get("name", "") for s in suspects]
+    murderer = _get_murderer(script, suspects_names)
+    if vote_winner == murderer:
+        truth_hint = f"案件真相（你此刻扮演这个角色，请根据自己是否真凶来决定喊冤还是认罪）：{truth}"
+    else:
+        truth_hint = "事实：你不是真凶，你被冤枉了——喊冤时语气要符合被冤枉的处境，但绝不要说破真凶是谁（悬念留给揭晓环节）"
 
     prompt = f"""你是剧本杀角色「{vote_winner}」，你在投票中被最多人指认为凶手。
 
 你的秘密：{secret}
-案件真相（你此刻扮演这个角色，请根据自己是否真凶来决定喊冤还是认罪）：{truth}
+{truth_hint}
 
 请输出一段 2 句的最终陈词（这是你最后的自辩机会）：
 - 若你是凶手：可以继续狡辩、嫁祸他人，也可以突然认罪，由你自由发挥
@@ -875,7 +904,7 @@ def final_statement_node(state: GameState) -> dict:
 
 只输出陈词本身，不要 JSON、不要解释、不要"最终陈词"这类前缀。"""
 
-    resp = _stream_full_text(prompt)
+    resp = _stream_full_text(prompt, allow_partial=False)   # 关键台词：断连宁可报错重试，不能拿半截文本
     return {
         "messages": [{"speaker": vote_winner, "content": f"（最终陈词）{resp}"}],
     }
@@ -992,7 +1021,7 @@ def dm_reveal_node(state: GameState) -> dict:
 5. 【结局演绎】真人玩家（{user_role}）本局的结局是「{ending_label}」{ending_note}
 6. 为整场游戏收尾"""
 
-    resp = _stream_full_text(prompt)
+    resp = _stream_full_text(prompt, allow_partial=False)   # 关键台词：断连宁可报错重试，不能拿半截文本
     return {
         "messages": [{"speaker": "主持人", "content": resp}],
         "current_phase": "reveal",
@@ -1000,18 +1029,29 @@ def dm_reveal_node(state: GameState) -> dict:
 
 
 def _current_speaker(state: GameState) -> dict:
-    """根据当前轮次确定"这一轮轮到谁发言"（单一事实源）。
+    """根据"上一位实际发言者"确定"这一轮轮到谁"（单一事实源）。
 
-    之前 `suspects[round_num % len(suspects)]` 在 ai_player_turn_node 和
-    route_speaker 里各写一遍，两处若改一处忘另一处，"路由判断"和"实际发言者"
-    就会错位。现在统一从这里取，保证二者永远用同一个 speaker。
+    8-20 终审 M2 修复：之前用 `suspects[round_num % len(suspects)]` 决定轮换，
+    但"点名回应/追问"会让被点名者插队发言、phase_round 照常 +1，
+    按取模计算的轮次就会错位——有人被整轮跳过、有人连续发言。
+    现在改成：读 messages 最后一条的 speaker（上一位真正发言的人），
+    从名单里取它的下一位。插队发言后，下一位仍是正常顺序里的下一位，
+    轮换顺序不再被点名/追问机制打乱。
 
     调用前提：suspects 非空（调用方先判过空）。
     """
     script = state.get("script", {})
     suspects = script.get("suspects", [])
-    round_num = state.get("phase_round", 0)
-    return suspects[round_num % len(suspects)]
+    if not suspects:
+        return {}
+    # 讨论开始前 messages 可能为空（或最后发言是"主持人"等名单外角色），从头开始
+    last = state.get("messages", [])[-1].get("speaker", "") if state.get("messages") else ""
+    if not last:
+        return suspects[0]
+    for i, s in enumerate(suspects):
+        if s.get("name") == last:
+            return suspects[(i + 1) % len(suspects)]
+    return suspects[0]
 
 
 def route_speaker(state: GameState) -> str:

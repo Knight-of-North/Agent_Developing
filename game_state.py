@@ -65,7 +65,7 @@ class GameState(TypedDict, total=False):
     # 玩家点名 AI 后置 1，AI 回应后玩家可追问一次，追问后归零——形成小交锋（报告④的轻量版）
     follow_up: int
 
-    # 用户扮演的角色名（generate_script_node 自动设为第一个嫌疑人）
+    # 用户扮演的角色名（choose_role_node 里由用户自选；选完才确定）
     user_role: str
 
     # 用户扮演的角色是否为凶手（choose_role_node 里对比 user_role 与 murderer 得出）。
