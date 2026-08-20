@@ -14,7 +14,8 @@ model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 
 print(f"base_url: {base_url}")
 print(f"model: {model}")
-print(f"api_key 前8位: {api_key[:8]}...（长度 {len(api_key)}）")
+# 脱敏：不打印密钥任何片段，只报告"是否已配置 + 长度"，避免密钥进入终端历史/日志
+print(f"api_key: {'已配置' if api_key else '未配置'}（长度 {len(api_key)}）")
 
 
 def test(name, trust_env):
