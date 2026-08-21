@@ -93,7 +93,7 @@ cp .env.example .env       # Windows: copy .env.example .env
 # 编辑 .env，把 DEEPSEEK_API_KEY=... 换成你的 key
 ```
 
-到 [platform.deepseek.com](https://platform.deepseek.com) 注册并创建 key（需充值少量余额，每局约 ¥1~3）。
+到 [platform.deepseek.com](https://platform.deepseek.com) 注册并创建 key（需充值少量余额，每局约 ¥0.1~0.3）。
 
 ### 第 4 步：启动
 
@@ -206,7 +206,7 @@ pytest -q     # → 92 passed in 4.7s
 
 | 问题 | 解答 |
 |---|---|
-| **一局要多少钱？** | 约 ¥1~3（DeepSeek 按 token 计费），自定义剧情背景 / 长讨论会更贵 |
+| **一局要多少钱？** | 约 ¥0.1~0.3（DeepSeek 按 token 计费），自定义剧情背景 / 长讨论会更贵 |
 | **能纯本地跑吗？** | 不能，剧本生成必须调 LLM；其他确定性逻辑全在本地 |
 | **Streamlit 改了代码不生效？** | `nodes.py` / `prompts.py` / `app.py` 改完要 **Ctrl+C 重启**（CSS / HTML 改动会热重载） |
 | **为什么用 DeepSeek 而不是 GPT？** | 中文生成稳 + 便宜。¥3.28 余额能跑很多局，预算友好 |
@@ -225,5 +225,5 @@ pytest -q     # → 92 passed in 4.7s
 ---
 
 > 📅 **项目周期**：2026 年暑假（大一升大二）
-> 👤 **作者**：飞哥（湖南师范大学 · 软件工程 2025 级 · 数字智能方向）
-> 🎯 **目标**：智能体开发课程项目产出 + 推免武大计算机学院的练习
+> 👤 **作者**：舒飞（湖南师范大学 · 软件工程 2025 级 · 数字智能方向）
+> 🎯 **目标**：智能体开发课程项目产出
