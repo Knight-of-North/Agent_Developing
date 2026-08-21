@@ -703,12 +703,33 @@ def test_parse_json_invalid_returns_raw():
 def _consistent_script():
     return {
         "suspects": [
-            {"name": "张三", "secret": "我偷了东西", "forbidden": ["偷了东西"]},
-            {"name": "李四", "secret": "我暗恋王五", "forbidden": ["暗恋"]},
+            {
+                "name": "张三",
+                "secret": "我偷了东西",
+                "forbidden": ["偷了东西"],
+                "personal_script": "我叫张三，是社团摄影师，案发当天在社团活动室整理照片……",
+                "profession": "摄影师",
+                "relation_to_victim": "死者的室友",
+                "alibi": "案发时我在图书馆整理照片",
+            },
+            {
+                "name": "李四",
+                "secret": "我暗恋王五",
+                "forbidden": ["暗恋"],
+                "personal_script": "我叫李四，是文学社成员，对死者心存感激……",
+                "profession": "文学社社长",
+                "relation_to_victim": "死者是文学社顾问",
+                "alibi": "案发时我在文学社会议室写稿",
+            },
         ],
         "truth": "张三因为债务问题杀害了死者",
         "private_clues": [{"holder": "张三", "content": "有人在案发前换过锁"}],
         "public_clues": ["死者死于中毒"],
+        "relations": [
+            {"from": "张三", "to": "李四", "rel": "我们是好朋友", "public": True},
+            {"from": "张三", "to": "死者", "rel": "死者是我的室友，我们关系不错", "public": True},
+            {"from": "李四", "to": "死者", "rel": "死者是我的社团顾问，我感激她", "public": True},
+        ],
     }
 
 
@@ -735,6 +756,39 @@ def test_check_script_consistency_no_clues():
     script["private_clues"] = []
     script["public_clues"] = []
     assert "没有任何线索" in _check_script_consistency(script)
+
+
+def test_check_script_consistency_empty_structured_fields():
+    # 8-20：飞哥反馈——输入完整《桃花坪埋尸案》背景时 LLM 偷懒只讲故事不填字段。
+    # 检测兜底：secret/personal_script/profession/relation_to_victim/alibi 为空或"待补充"应触发 problems
+    script = _consistent_script()
+    script["suspects"][0]["secret"] = ""                # 空
+    script["suspects"][0]["personal_script"] = "待补充"  # 占位符
+    script["suspects"][1]["profession"] = "  "          # 空白
+    problems = _check_script_consistency(script)
+    problems_text = " ".join(problems)
+    # problem 文本格式是 "张三 缺 secret, personal_script, ..."，用单字段名匹配即可
+    assert "secret" in problems_text
+    assert "personal_script" in problems_text
+    assert "profession" in problems_text
+
+
+def test_check_script_consistency_no_relations():
+    # 8-20：飞哥反馈截图——"剧本未生成公开关系"。relations 必须有公开边（>=2 人局）
+    script = _consistent_script()
+    script["relations"] = []
+    problems = _check_script_consistency(script)
+    assert any("没有公开边" in p for p in problems)
+
+
+def test_check_script_consistency_victim_not_center():
+    # 8-20 A+C 修复：公开边里直接涉及「死者」的不足 2 条时，关系图里死者被
+    # 高连接度嫌疑人挤到边缘（飞哥截图"死者和嫌疑人位置互换"）。有公开边但
+    # 死者边不足，必须报错触发重试。
+    script = _consistent_script()
+    script["relations"] = [{"from": "张三", "to": "李四", "rel": "我们是好朋友", "public": True}]
+    problems = _check_script_consistency(script)
+    assert any("涉及「死者」的不足 2 条" in p for p in problems)
 
 
 # ============ _get_murderer（8-20 审查补测） ============

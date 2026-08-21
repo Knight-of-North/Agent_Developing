@@ -108,10 +108,15 @@ def _check_script_consistency(script: dict) -> list[str]:
     """剧本自洽性确定性检查，返回问题列表（空列表 = 通过）。
 
     对应"赢不了的局"风险：线索与真相不自洽时，玩家认真推理却必然失败，
-    且事后看不出是系统问题。这里做三条低成本检查：
+    且事后看不出是系统问题。这里做五条低成本检查：
     1. truth 里必须提到某个嫌疑人名字（凶手在名单内）
     2. 每个嫌疑人的 forbidden 词至少有 1 个出现在自己的 secret 里（防泄露机制才有效）
     3. 至少要有私密线索（信息差的基础，全空则玩不下去）
+    4. 8-20 新增：每个嫌疑人的关键结构化字段（secret/personal_script/profession/relation_to_victim/alibi）
+       必须独立填写（非空且不是"待补充"占位符）。LLM 偷懒只把信息塞进 DM 开场叙事、
+       不填 JSON 字段会导致左栏全空、玩家拿不到角色卡——这是飞哥用完整《桃花坪埋尸案》
+       背景测试时实际遇到的坑，必须靠代码硬检测 + 重试机制兜底。
+    5. 8-20 新增：relations 必须有至少 1 条公开边（>=3 人局时），让玩家能盘问人物关系。
     """
     problems = []
     suspects = script.get("suspects") or []
@@ -131,6 +136,65 @@ def _check_script_consistency(script: dict) -> list[str]:
 
     if not (script.get("private_clues") or script.get("public_clues")):
         problems.append("没有任何线索")
+
+    # 8-20：检测结构化字段是否仍为空/占位符——LLM 偷懒只讲故事不填 JSON 字段的兜底
+    empty_field_suspects = []
+    for s in suspects:
+        if not isinstance(s, dict):
+            continue
+        name = s.get("name", "?")
+        missing = []
+        # secret / personal_script 是空就报（"待补充" 视为空）
+        for fld in ["secret", "personal_script", "profession", "relation_to_victim", "alibi"]:
+            val = s.get(fld, "")
+            if not (isinstance(val, str) and val.strip()) or val == "待补充":
+                missing.append(fld)
+        if missing:
+            empty_field_suspects.append(f"{name} 缺 {', '.join(missing)}")
+    if empty_field_suspects:
+        problems.append(
+            "以下嫌疑人的结构化字段仍为空/占位符，必须独立写齐（不能用『待补充』占位）："
+            + "; ".join(empty_field_suspects)
+        )
+
+    # 8-20：relations 必须有公开边（2 人以上局），否则玩家没东西盘问。
+    # 单人/空名单跳过（单人局不存在人物关系）。
+    relations = script.get("relations") or []
+    public_relations = [r for r in relations if isinstance(r, dict) and r.get("public")]
+    if not public_relations and len(names) >= 2:
+        problems.append("relations 数组没有公开边（人物关系图会显示『剧本未生成公开关系』，必须至少 1 条公开关系）")
+
+    # 8-20 A+C 修复：公开边里必须有至少 2 条直接涉及「死者」，否则关系图里
+    # 死者只有 1 度连接、被高连接度的嫌疑人（如赵思远）挤到边缘，视觉上像
+    # "死者和嫌疑人位置互换"。有公开边时兜底校验（无公开边已由上一分支拦截）。
+    victim_edges = [
+        r for r in public_relations
+        if isinstance(r, dict) and (r.get("from") == "死者" or r.get("to") == "死者")
+    ]
+    if public_relations and len(victim_edges) < 2:
+        problems.append(
+            "relations 的公开边里直接涉及「死者」的不足 2 条（关系图里死者会被边缘化，"
+            "必须至少 2 条公开边的一端是「死者」）"
+        )
+
+    # 8-20 飞哥建议"以死者为中心，其他人物围绕死者互相连线"：嫌疑人之间
+    # 也必须有公开边（不能只有「嫌疑人→死者」的放射线）。4 人及以上局兜底校验，
+    # 阈值 ⌈嫌疑人数/2⌉（6 人局 ≥ 3 条）。小局跳过避免误报。
+    if public_relations and len(names) >= 4:
+        suspect_names_set = set(names)
+        suspect_pair_edges = [
+            r for r in public_relations
+            if isinstance(r, dict)
+            and r.get("from") in suspect_names_set
+            and r.get("to") in suspect_names_set
+            and r.get("from") != r.get("to")
+        ]
+        threshold = max(2, (len(names) + 1) // 2)   # 6 人局 → 3, 5 人局 → 3, 4 人局 → 2
+        if len(suspect_pair_edges) < threshold:
+            problems.append(
+                f"嫌疑人之间的公开边不足 {threshold} 条（飞哥建议：嫌疑人之间也要互相连线，"
+                f"不能全靠嫌疑人→死者。当前 {len(suspect_pair_edges)} 条，阈值 {threshold} 条）"
+            )
 
     return problems
 
@@ -402,6 +466,12 @@ def dm_intro_node(state: GameState) -> dict:
 3. 公布可公开线索
 4. 说明"每人手中握有私密线索"，鼓励玩家互相套话
 5. 自然过渡到自由讨论，规则是嫌疑人轮流发言
+
+【硬性人称约束 · 8-20 飞哥反馈"主持人旁白用『我』破坏沉浸感"】
+- 严禁使用第一人称"我"——你是全知旁观者，不是事件参与者
+- 描述自己的动作/位置/神态时，用"主持人""他/她"或无主语客观描写，绝不能用"我"
+- ✅ "主持人站在书房门口，目光扫过在座各位。壁炉的火光映着死者脸上凝固的惊愕。"
+- ❌ "我站在书房门口，目光扫过你们每个人。"
 
 注意：{user_role} 是真人玩家扮演的，介绍时正常介绍即可。
 
@@ -1012,6 +1082,8 @@ def dm_reveal_node(state: GameState) -> dict:
 
 【完整公开讨论记录】：
 {history if history else "（无）"}
+
+【硬性人称约束 · 8-20 飞哥反馈】严禁使用第一人称"我"——你是全知旁观者。描述自己的动作/位置时用"主持人"或无主语客观描写，绝不能用"我"。
 
 请用主持人的口吻，依次：
 1. 照实公布投票明细（谁投了谁、谁得票最多）
