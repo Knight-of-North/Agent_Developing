@@ -129,12 +129,19 @@ def build_relations_html(relations: list, suspect_names: list[str]) -> str:
             margin=8,
         )
 
-    # 节点：死者用红色星形
+    # 节点：死者用红色星形 + fixed 居中
+    # 飞哥 17:17 建议"以死者为中心"：fixed x/y 钉死中心，physics 不会挪动它，
+    # 嫌疑人围绕它做物理布局；mass=2 让嫌疑人被它吸引（比之前的 mass=3 温和，
+    # 飞哥上一轮反对过"紧张主题"）。x=0/y=0 是 vis.js 初始坐标，fit 后会被
+    # 居中到 canvas。
     net.add_node(
         "死者",
         label="死者",
         shape="star",
         size=40,
+        mass=2,
+        x=0, y=0,
+        fixed={"x": True, "y": True},
         color={"background": "#f5222d", "border": "#a8071a", "highlight": {"background": "#a8071a", "border": "#5b0000"}},
         font={"color": "#ffffff", "size": 22, "face": "Microsoft YaHei", "strokeWidth": 3, "strokeColor": "#a8071a"},
         title="<b>死者</b><br/>案件核心",

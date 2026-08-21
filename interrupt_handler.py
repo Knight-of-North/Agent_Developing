@@ -20,6 +20,10 @@ def get_interrupt(result: dict) -> dict:
     注意：LangGraph 的 __interrupt__ 列表元素是 Interrupt 对象（内容在 .value 属性），
     不是 dict；但测试里可能用 dict 模拟，所以两种结构都兼容。
     """
+    # 8-20 防御：result 可能为 None（started=True 但剧本生成被刷新中断），
+    # 直接返回空 dict，避免 AttributeError 崩掉整个页面。
+    if not isinstance(result, dict):
+        return {}
     interrupts = result.get("__interrupt__") or []
     if not interrupts:
         return {}

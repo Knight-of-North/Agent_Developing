@@ -164,6 +164,38 @@ def _check_script_consistency(script: dict) -> list[str]:
     if not public_relations and len(names) >= 2:
         problems.append("relations 数组没有公开边（人物关系图会显示『剧本未生成公开关系』，必须至少 1 条公开关系）")
 
+    # 8-20 A+C 修复：公开边里必须有至少 2 条直接涉及「死者」，否则关系图里
+    # 死者只有 1 度连接、被高连接度的嫌疑人（如赵思远）挤到边缘，视觉上像
+    # "死者和嫌疑人位置互换"。有公开边时兜底校验（无公开边已由上一分支拦截）。
+    victim_edges = [
+        r for r in public_relations
+        if isinstance(r, dict) and (r.get("from") == "死者" or r.get("to") == "死者")
+    ]
+    if public_relations and len(victim_edges) < 2:
+        problems.append(
+            "relations 的公开边里直接涉及「死者」的不足 2 条（关系图里死者会被边缘化，"
+            "必须至少 2 条公开边的一端是「死者」）"
+        )
+
+    # 8-20 飞哥建议"以死者为中心，其他人物围绕死者互相连线"：嫌疑人之间
+    # 也必须有公开边（不能只有「嫌疑人→死者」的放射线）。4 人及以上局兜底校验，
+    # 阈值 ⌈嫌疑人数/2⌉（6 人局 ≥ 3 条）。小局跳过避免误报。
+    if public_relations and len(names) >= 4:
+        suspect_names_set = set(names)
+        suspect_pair_edges = [
+            r for r in public_relations
+            if isinstance(r, dict)
+            and r.get("from") in suspect_names_set
+            and r.get("to") in suspect_names_set
+            and r.get("from") != r.get("to")
+        ]
+        threshold = max(2, (len(names) + 1) // 2)   # 6 人局 → 3, 5 人局 → 3, 4 人局 → 2
+        if len(suspect_pair_edges) < threshold:
+            problems.append(
+                f"嫌疑人之间的公开边不足 {threshold} 条（飞哥建议：嫌疑人之间也要互相连线，"
+                f"不能全靠嫌疑人→死者。当前 {len(suspect_pair_edges)} 条，阈值 {threshold} 条）"
+            )
+
     return problems
 
 

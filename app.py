@@ -96,14 +96,48 @@ div.stButton > button[kind="primary"] {
   color: #9a8e75 !important;   /* 8-20 提亮：#6f6550 → #9a8e75 */
   font-family: var(--murder-sans);
 }
-[data-testid="stSelectbox"] > div > div,
+/* Selectbox 暗色化（飞哥 8-20 反馈"填入栏还是白底"——下拉打开态已 OK，但收起态触发器漏了）：
+   Streamlit 1.61 baseweb Select 触发器可能用 background-image 或 box-shadow 模拟白底，
+   或者有更高优先级的 specificity 元素盖在前面。必须：
+   ① 列尽所有可能的元素类型（div/span/input/button + role=button/combobox）
+   ③ background-image: none + box-shadow: none 兜底（baseweb 常用这两种方式做白底）
+   ④ 给整个 selectbox 容器加 padding 让深色背景延伸覆盖触发器边框 */
+[data-testid="stSelectbox"] div,
+[data-testid="stSelectbox"] span,
+[data-testid="stSelectbox"] input,
+[data-testid="stSelectbox"] button,
+[data-testid="stSelectbox"] [role="button"],
+[data-testid="stSelectbox"] [role="combobox"],
+[data-testid="stSelectbox"] [data-baseweb="select"],
+[data-testid="stSelectbox"] [data-baseweb="select"] * {
+  background-color: var(--murder-input) !important;
+  background-image: none !important;   /* 兜底：baseweb 可能用 image 模拟白底 */
+  box-shadow: none !important;         /* 兜底：baseweb 可能用 shadow 模拟白底光晕 */
+  color: var(--murder-text) !important;
+}
+[data-testid="stSelectbox"] [data-baseweb="select"] {
+  border: 1px solid var(--murder-border) !important;
+  border-radius: 8px;
+}
+[data-testid="stSelectbox"] [data-baseweb="select"]:hover {
+  border-color: var(--murder-gold) !important;
+}
 [data-testid="stRadio"] label {
   color: var(--murder-text);
 }
-[data-testid="stSelectbox"] > div {
-  background: var(--murder-input);
-  border: 1px solid var(--murder-border);
-  border-radius: 8px;
+/* 下拉打开后的虚拟 dropdown（baseweb Menu/Listbox，DOM 在 stSelectbox 之外的 portal）：
+   同样用 * 通配穿透所有子元素 + image/shadow 兜底；hover/选中态给金色高亮提示。 */
+[data-testid="stSelectboxVirtualDropdown"] * {
+  background-color: var(--murder-input) !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  color: var(--murder-text) !important;
+}
+[data-testid="stSelectboxVirtualDropdown"] [role="option"]:hover,
+[data-testid="stSelectboxVirtualDropdown"] [aria-selected="true"] {
+  background-color: var(--murder-card) !important;
+  background-image: none !important;
+  color: var(--murder-gold) !important;
 }
 [data-testid="stChatMessage"] {
   background: var(--murder-card);
@@ -149,14 +183,42 @@ div.stButton > button[kind="primary"] {
   background: #E8DCC8 !important;
   color: #141110 !important;
 }
+/* Expander 暗色化（飞哥 8-20 反馈"展开后内容区是白底"——和 selectbox 同类问题）：
+   Streamlit 1.61 expander 用 baseweb Accordion，details 内容区有自己的白底样式覆盖在前面。
+   必须用和 selectbox 同款的「* 通配 + image/shadow 兜底」穿透所有子元素。
+   标题栏保留 serif 衬线感（沉浸感），内容区用 sans-serif（清晰可读）。
+   8-20 飞哥再次反馈"expander header 还是白的"：之前漏了 <summary>（原生 HTML
+   的折叠头）和 .streamlit-expanderHeader 的 background 选择器，浏览器默认
+   summary 是白底，必须显式压住。 */
+[data-testid="stExpander"],
+[data-testid="stExpander"] details,
+[data-testid="stExpander"] details > div,
+[data-testid="stExpander"] details > summary,
+[data-testid="stExpander"] summary,
+[data-testid="stExpander"] [data-baseweb="accordion"],
+[data-testid="stExpander"] [data-baseweb="accordion"] *,
+[data-testid="stExpander"] [data-baseweb="accordion"] summary,
+[data-testid="stExpander"] .streamlit-expanderHeader {
+  background-color: var(--murder-card) !important;
+  background-image: none !important;   /* 兜底：baseweb 可能用 image 模拟白底 */
+  box-shadow: none !important;         /* 兜底：baseweb 可能用 shadow 模拟白底光晕 */
+}
 [data-testid="stExpander"] {
-  background: var(--murder-card);
-  border: 1px solid var(--murder-border);
+  border: 1px solid var(--murder-border) !important;
   border-radius: 10px;
 }
 .streamlit-expanderHeader {
   color: var(--murder-text) !important;
   font-family: var(--murder-serif);
+  background-color: var(--murder-card) !important;
+  background-image: none !important;
+}
+/* 内容区文字色强制米色（默认 baseweb 强制黑底白字会变白底黑字，必须显式覆盖） */
+[data-testid="stExpander"] [data-testid="stMarkdownContainer"],
+[data-testid="stExpander"] [data-testid="stMarkdownContainer"] p,
+[data-testid="stExpander"] [data-testid="stMarkdownContainer"] li {
+  color: var(--murder-text) !important;
+  background-color: transparent !important;   /* 让 expander 容器背景透出，避免嵌套白底 */
 }
 [data-testid="stCaptionContainer"] {
   color: var(--murder-muted);
@@ -546,6 +608,9 @@ if "last_error" in st.session_state:
     if st.button("清除错误，继续游戏"):
         del st.session_state.last_error
         st.rerun()
+if "interrupt_notice" in st.session_state:
+    # 8-20：剧本生成被中断（刷新页面）后回滚输入页时的一次性提示
+    st.warning(st.session_state.pop("interrupt_notice"))
 
 # ---- 初始化会话状态（跨 rerun 保存）----
 if "thread_id" not in st.session_state:
@@ -659,6 +724,13 @@ if not st.session_state.started:
 # ---- 已开始：显示游戏 ----
 else:
     result = st.session_state.result
+    # 8-20 防御：started=True 但 result 仍为 None（剧本生成中刷新页面/生成被中断残留）。
+    # 刷新会终止正在执行的生成循环，result 永远不会被赋值——直接回滚到输入页
+    # 并提示重新开始，而不是让 get_interrupt_type(None) 抛 AttributeError。
+    if result is None:
+        st.session_state.started = False
+        st.session_state.interrupt_notice = "剧本生成被中断（可能是页面刷新导致），请重新立案侦查。"
+        st.rerun()
 
     # ---- 阶段 1：开局选角色（图停在 choose_role interrupt，此时 user_role 还没定）----
     if get_interrupt_type(result) == "choose_role":

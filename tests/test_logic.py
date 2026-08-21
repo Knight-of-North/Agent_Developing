@@ -725,7 +725,11 @@ def _consistent_script():
         "truth": "张三因为债务问题杀害了死者",
         "private_clues": [{"holder": "张三", "content": "有人在案发前换过锁"}],
         "public_clues": ["死者死于中毒"],
-        "relations": [{"from": "张三", "to": "李四", "rel": "我们是好朋友", "public": True}],
+        "relations": [
+            {"from": "张三", "to": "李四", "rel": "我们是好朋友", "public": True},
+            {"from": "张三", "to": "死者", "rel": "死者是我的室友，我们关系不错", "public": True},
+            {"from": "李四", "to": "死者", "rel": "死者是我的社团顾问，我感激她", "public": True},
+        ],
     }
 
 
@@ -775,6 +779,16 @@ def test_check_script_consistency_no_relations():
     script["relations"] = []
     problems = _check_script_consistency(script)
     assert any("没有公开边" in p for p in problems)
+
+
+def test_check_script_consistency_victim_not_center():
+    # 8-20 A+C 修复：公开边里直接涉及「死者」的不足 2 条时，关系图里死者被
+    # 高连接度嫌疑人挤到边缘（飞哥截图"死者和嫌疑人位置互换"）。有公开边但
+    # 死者边不足，必须报错触发重试。
+    script = _consistent_script()
+    script["relations"] = [{"from": "张三", "to": "李四", "rel": "我们是好朋友", "public": True}]
+    problems = _check_script_consistency(script)
+    assert any("涉及「死者」的不足 2 条" in p for p in problems)
 
 
 # ============ _get_murderer（8-20 审查补测） ============
