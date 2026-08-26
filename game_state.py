@@ -65,6 +65,13 @@ class GameState(TypedDict, total=False):
     # 玩家点名 AI 后置 1，AI 回应后玩家可追问一次，追问后归零——形成小交锋（报告④的轻量版）
     follow_up: int
 
+    # 连续追问计数（F5）：玩家每次"点名→AI回应→追问"算一轮连续交锋，
+    # 超过 MAX_CONSECUTIVE_FOLLOWUPS 后强制回到正常轮换，防止霸麦饿死其他 AI。
+    consecutive_followups: int
+
+    # 玩家已使用的调查次数（H4：investigate 有每局上限，防止搜完所有隐藏线索）
+    investigations_used: int
+
     # 用户扮演的角色名（choose_role_node 里由用户自选；选完才确定）
     user_role: str
 
