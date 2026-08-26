@@ -16,13 +16,21 @@ AI 剧本杀主持人 · 图形界面版（Streamlit）
 4. 阶段幕布 key = thread_id + phase，跨局重玩不串动画
 """
 import json
+import re
 import uuid
 import streamlit as st
 from langgraph.types import Command
 from graph import build_graph
-from nodes import generate_script_stream, _parse_names
+from nodes import generate_script_stream, _parse_names, ScriptGenerationError
 from interrupt_handler import get_interrupt, get_interrupt_type, validate_vote
 from visualization import build_relations_html
+from logging_config import setup_logging
+from config import (
+    MAX_THEME_LEN, MAX_STORY_TIME_LEN, MAX_STORY_LOCATION_LEN, MAX_BG_STORY_LEN,
+    MAX_CHAT_LEN, DEV_MODE, INVESTIGATE_LIMIT,
+)
+
+setup_logging()
 
 
 # ==================== G0：暗色档案风主题（全局 CSS） ====================
@@ -441,6 +449,12 @@ def get_graph():
     return build_graph()
 
 
+@st.cache_data
+def _cached_relations_html(relations_tuple, names_tuple):
+    """L9：relations 不变时复用 pyvis HTML，避免每次 rerun 重新生成。"""
+    return build_relations_html(list(relations_tuple), list(names_tuple))
+
+
 @st.dialog("🕸️ 人物关系图（仅公开关系）", width="large")
 def _relations_dialog(relations_html):
     """屏幕中央弹出的人物关系图（模态框，右上角自带 X 可关闭）。
@@ -560,7 +574,7 @@ def _run_stream(graph, cmd, config):
                     if not thinking:
                         thinking = True
                         thinking_ph.markdown("💭 有嫌疑人正在思考……")
-                elif node in ("dm_intro", "dm_reveal") and token.content:
+                elif node in ("dm_intro", "dm_reveal", "dm_midpoint", "final_statement") and token.content:
                     current_parts.append(token.content)
                     pending += len(token.content)
                     if pending >= 24:      # 节流：攒够 24 字符才渲染，避免每个 token 全量重写 DOM
@@ -665,10 +679,16 @@ if not st.session_state.started:
     rounds_per_player = {"快（每人2轮）": 2, "标准（每人3轮）": 3, "深入（每人4轮）": 4}[pace]
     if st.button("🔍 立案侦查", type="primary"):
         st.session_state.started = True
-        theme_val = theme.strip() or "自由发挥"
-        story_val = background_story.strip()
-        time_val = story_time.strip()
-        location_val = story_location.strip()
+        # F2：输入长度限制，防超长输入烧 token + 降低注入攻击面
+        theme_val = (theme.strip() or "自由发挥")[:MAX_THEME_LEN]
+        story_val = background_story.strip()[:MAX_BG_STORY_LEN]
+        time_val = story_time.strip()[:MAX_STORY_TIME_LEN]
+        location_val = story_location.strip()[:MAX_STORY_LOCATION_LEN]
+
+        # F2：自定义名字白名单校验（只允许中英数字和间隔号，2-10 字，防名字里塞 prompt）
+        def _valid_name(n: str) -> bool:
+            return bool(re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9·]{2,10}", n or ""))
+        custom_names = [n for n in custom_names if _valid_name(n)]
 
         # 真流式生成剧本：边生成边显示，而不是盯着 spinner 干等。
         # generate_script_stream 是生成器，逐 token yield；手动 next() 迭代，
@@ -681,7 +701,15 @@ if not st.session_state.started:
         script = None
         try:
             while True:
-                token = next(gen)
+                item = next(gen)
+                # H17：生成器 yield ("token", 文本) 或 ("retry", 提示)；
+                # 自洽校验重试时清空已显示的半截 JSON，避免两段拼接混乱
+                if isinstance(item, tuple) and item[0] == "retry":
+                    parts = []
+                    pending = 0
+                    placeholder.code(item[1], language=None)
+                    continue
+                token = item[1] if isinstance(item, tuple) else item
                 parts.append(token)
                 pending += len(token)
                 if pending >= 48:   # 攒够 48 字符才刷新，避免每个 token 全量重写 DOM
@@ -689,6 +717,12 @@ if not st.session_state.started:
                     pending = 0
         except StopIteration as e:
             script = e.value   # 生成器 return 的最终 script
+        except ScriptGenerationError as e:
+            # H1：剧本致命问题（凶手无效/无线索）重试耗尽，提示重开而非带病启动
+            st.error(f"剧本生成质量不达标：{e}")
+            st.info("请调整主题或背景后重新立案侦查。")
+            st.session_state.started = False
+            st.stop()
         except Exception as e:
             # LLM 网络异常 / 限流 / 超时会在这里抛出，不能让页面直接崩溃
             st.error(f"剧本生成失败：{type(e).__name__}：{e}")
@@ -741,9 +775,11 @@ else:
             st.session_state.intro_played = True
         st.markdown("### 🎭 选择你想扮演的角色")
         st.markdown("剧本已生成，请选一个嫌疑人扮演：")
-        cols = st.columns(len(info["suspects"]))
+        # L4：6 列按钮在窄屏挤压，每行最多 3 个
+        n_sus = len(info["suspects"])
+        cols = st.columns(min(n_sus, 3))
         for i, name in enumerate(info["suspects"]):
-            if cols[i].button(name, key=f"role_{i}", use_container_width=True):
+            if cols[i % 3].button(name, key=f"role_{i}", use_container_width=True):
                 st.session_state.result = _run_stream(graph, Command(resume=name), config)
                 st.rerun()
         with st.sidebar:
@@ -824,7 +860,10 @@ else:
         st.divider()
         # 人物关系图（仅公开关系，私密关系属信息差不显示）：侧边栏放按钮，点击后屏幕中央弹大图
         st.caption("🕸️ 人物关系图")
-        relations_html = build_relations_html(script.get("relations", []), [s.get("name", "?") for s in suspects])
+        relations_html = _cached_relations_html(
+            tuple(json.dumps(r, ensure_ascii=False, sort_keys=True) for r in script.get("relations", [])),
+            tuple(s.get("name", "?") for s in suspects),
+        )
         if relations_html:
             if st.button("🔍 展开关系网", use_container_width=True):
                 _relations_dialog(relations_html)
@@ -870,6 +909,24 @@ else:
         with st.chat_message(role):
             st.markdown(f"**{m['speaker']}**：{m['content']}")
 
+    # H14：DEV_MODE 下显示 AI 内心戏和调试状态（默认关闭，防剧透）
+    if DEV_MODE:
+        thoughts = result.get("thoughts", [])
+        if thoughts:
+            with st.expander("🧠 AI 内心戏（DEV_MODE）", expanded=False):
+                for t in thoughts:
+                    st.caption(t)
+        with st.expander("🔧 状态调试（DEV_MODE）", expanded=False):
+            st.json({
+                "phase_round": result.get("phase_round"),
+                "pending_reply_to": result.get("pending_reply_to"),
+                "follow_up": result.get("follow_up"),
+                "consecutive_followups": result.get("consecutive_followups"),
+                "midpoint_done": result.get("midpoint_done"),
+                "investigations_used": result.get("investigations_used"),
+                "revealed_clues": list(result.get("revealed_clues", {}).keys()),
+            })
+
     # 处理 interrupt（human_turn / human_vote）
     info = get_interrupt(result)
     if info:
@@ -904,7 +961,8 @@ else:
                     else:
                         st.caption("（没有可指控的对象）")
                 if can_investigate:
-                    if st.button("🌙 暗中调查现场", key="investigate_btn"):
+                    remaining = info.get("investigations_remaining", INVESTIGATE_LIMIT)
+                    if st.button(f"🌙 暗中调查现场（剩余 {remaining} 次）", key="investigate_btn"):
                         st.session_state.result = _run_stream(
                             graph, Command(resume={"action": "investigate"}), config
                         )
@@ -944,6 +1002,6 @@ else:
                 graph.checkpointer.delete(old_config)
             except Exception:
                 pass
-            for key in ["started", "result", "thread_id", "intro_played"]:
+            for key in ["started", "result", "thread_id", "intro_played", "last_error"]:
                 st.session_state.pop(key, None)
             st.rerun()

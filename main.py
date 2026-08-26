@@ -7,6 +7,13 @@ from langgraph.types import Command
 from graph import build_graph
 from nodes import _parse_names
 from interrupt_handler import get_interrupt, validate_vote
+from logging_config import setup_logging
+from config import (
+    MAX_THEME_LEN, MAX_STORY_TIME_LEN, MAX_STORY_LOCATION_LEN,
+    MAX_BG_STORY_LEN, MAX_CHAT_LEN, INVESTIGATE_LIMIT,
+)
+
+setup_logging()
 
 
 def print_role_card(result):
@@ -49,12 +56,15 @@ if __name__ == "__main__":
     # thread_id 标识"这一局游戏"，每次调用都带上，图才知道接着上次跑
     config = {"configurable": {"thread_id": "murder_1"}}
 
-    theme = input("请输入剧本杀主题（回车自由发挥）：").strip() or "自由发挥"
+    theme = (input("请输入剧本杀主题（回车自由发挥）：").strip() or "自由发挥")[:MAX_THEME_LEN]
     background = input("背景风格（回车自由发挥，可选：民国豪门/校园怪谈/古风仙侠/现代都市/科幻末世）：").strip() or "自由发挥"
-    background_story = input("自定义剧情背景（回车跳过，让 AI 自由发挥；填写则 AI 理解后融入创作）：").strip()
-    story_time = input("故事发生时间（回车跳过，如：1935年深秋 / 宋代江南）：").strip()
-    story_location = input("故事发生地点（回车跳过，如：上海滩租界 / 湖南师大图书馆）：").strip()
+    background_story = input("自定义剧情背景（回车跳过，让 AI 自由发挥；填写则 AI 理解后融入创作）：").strip()[:MAX_BG_STORY_LEN]
+    story_time = input("故事发生时间（回车跳过，如：1935年深秋 / 宋代江南）：").strip()[:MAX_STORY_TIME_LEN]
+    story_location = input("故事发生地点（回车跳过，如：上海滩租界 / 湖南师大图书馆）：").strip()[:MAX_STORY_LOCATION_LEN]
     custom_names = _parse_names(input("自定义嫌疑人名字（回车跳过用随机；填写如：张三,李四,王五）："))
+    # F2：名字白名单校验，过滤含特殊字符的名字
+    import re as _re
+    custom_names = [n for n in custom_names if _re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9·]{2,10}", n or "")]
     # 讨论节奏（8-20 审查修复：与 Web 版对齐，终端版也可调快/标准/深入 → 每人 2/3/4 轮）
     pace = input("讨论节奏（回车标准；快=每人2轮 / 标准=每人3轮 / 深入=每人4轮）：").strip()
     rounds_per_player = {"快": 2, "深入": 4}.get(pace, 3)
@@ -102,6 +112,7 @@ if __name__ == "__main__":
             own_clues = info.get("own_clues", [])
             targets = info.get("targets", [])
             can_investigate = info.get("can_investigate", False)
+            inv_remaining = info.get("investigations_remaining", INVESTIGATE_LIMIT)
 
             print(f"\n【轮到你了·{info['speaker']}】你可以：")
             print("  · 直接输入文字 = 发言")
@@ -110,7 +121,7 @@ if __name__ == "__main__":
             if targets:
                 print("  · 输入 3 = 指控某人是凶手")
             if can_investigate:
-                print("  · 输入 4 = 调查现场（发现隐藏线索）")
+                print(f"  · 输入 4 = 调查现场（剩余 {inv_remaining} 次）")
 
             user_input = input("你的行动：").strip()
 
@@ -118,19 +129,31 @@ if __name__ == "__main__":
                 print("  你的私密线索：")
                 for i, c in enumerate(own_clues, 1):
                     print(f"    {i}. {c}")
-                choice = input("  公开哪条（输入序号）：").strip()
-                if choice.isdigit() and 1 <= int(choice) <= len(own_clues):
-                    resume = {"action": "reveal_clue", "clue": own_clues[int(choice) - 1]}
-                else:
-                    resume = user_input   # 非法序号，退回当发言
+                # L2：序号非法时重新提示，而不是把"2"当发言发出去
+                while True:
+                    choice = input("  公开哪条（输入序号，回车取消）：").strip()
+                    if choice == "":
+                        resume = input("你的发言：").strip()[:MAX_CHAT_LEN]
+                        break
+                    if choice.isdigit() and 1 <= int(choice) <= len(own_clues):
+                        resume = {"action": "reveal_clue", "clue": own_clues[int(choice) - 1]}
+                        break
+                    print(f"  ⚠️ 请输入 1~{len(own_clues)} 之间的序号")
             elif user_input == "3" and targets:
                 print(f"  可指控对象：{', '.join(targets)}")
-                target = input("  指控谁（输入名字）：").strip()
-                resume = {"action": "accuse", "target": target}
+                while True:
+                    target = input("  指控谁（输入名字，回车取消）：").strip()
+                    if target == "":
+                        resume = input("你的发言：").strip()[:MAX_CHAT_LEN]
+                        break
+                    if target in targets:
+                        resume = {"action": "accuse", "target": target}
+                        break
+                    print(f"  ⚠️ 「{target}」不在可指控名单里")
             elif user_input == "4" and can_investigate:
                 resume = {"action": "investigate"}
             else:
-                resume = user_input   # 默认当发言
+                resume = user_input[:MAX_CHAT_LEN]   # 默认当发言（F2：截断超长输入）
 
             result = graph.invoke(Command(resume=resume), config)
             printed = show_new(result.get("messages", []), printed)
