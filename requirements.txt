@@ -8,3 +8,7 @@ httpx>=0.27
 pyvis>=0.3
 pytest>=7
 
+# L3：PERSISTENT_CHECKPOINT=1 时 graph.py 用 SqliteSaver 做跨进程持久化。
+# 未安装时代码会自动回退 MemorySaver（仅日志提示），故为可选依赖；
+# 但 requirements 里不声明的话，用户按 README 开持久化必踩 ImportError。
+langgraph-checkpoint-sqlite>=2.0

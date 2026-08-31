@@ -37,7 +37,14 @@ LLM_CONFIG = {
 }
 
 LLM_TIMEOUT = _get_int("LLM_TIMEOUT", 120)
-LLM_MAX_RETRIES = _get_int("LLM_MAX_RETRIES", 5)
+# R15：默认 5→3。langchain 层每次重试都可能吃满 LLM_TIMEOUT，5×120s 最坏让
+# Streamlit UI 冻结约 10 分钟且无取消按钮；瞬时抖动 2~3 次已足够，持续故障下
+# 快速失败 + _run_stream/main.safe_resume 的"重试"闭环体验更好。
+LLM_MAX_RETRIES = _get_int("LLM_MAX_RETRIES", 3)
+
+# L6：reasoning_effort 此前硬编码 "none"，违背"全参数可环境变量覆盖"的设计承诺。
+# deepseek-v4 系列该参数对延迟/成本影响显著，正是最值得暴露的开关。
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "none")
 
 # trust_env：之前硬编码 False（规避 streamlit 坏代理），但企业代理环境需要可配
 TRUST_ENV = _get_bool("TRUST_ENV", False)

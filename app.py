@@ -18,19 +18,23 @@ AI 剧本杀主持人 · 图形界面版（Streamlit）
 import json
 import re
 import uuid
+import html
+import logging
 import streamlit as st
 from langgraph.types import Command
 from graph import build_graph
 from nodes import generate_script_stream, _parse_names, ScriptGenerationError
-from interrupt_handler import get_interrupt, get_interrupt_type, validate_vote
+from interrupt_handler import get_interrupt, get_interrupt_type, validate_vote, is_abstain, is_silence
+from game_session import build_config
 from visualization import build_relations_html
-from logging_config import setup_logging
+from logging_config import setup_logging, set_game_id
 from config import (
     MAX_THEME_LEN, MAX_STORY_TIME_LEN, MAX_STORY_LOCATION_LEN, MAX_BG_STORY_LEN,
     MAX_CHAT_LEN, DEV_MODE, INVESTIGATE_LIMIT,
 )
 
 setup_logging()
+logger = logging.getLogger(__name__)
 
 
 # ==================== G0：暗色档案风主题（全局 CSS） ====================
@@ -467,6 +471,20 @@ def _relations_dialog(relations_html):
 
 # ==================== 沉浸 UI 渲染函数 ====================
 
+# L5：markdown 控制字符转义。messages 的 content / speaker 来自用户输入和 LLM 输出，
+# 直接拼进 st.markdown 会被当成排版指令（标题/链接/图片/表格）注入聊天流。
+# Streamlit 会剥 HTML 标签，但 markdown 语法不在其消毒范围——逐字符转义按字面量渲染。
+_MD_ESCAPE_RE = re.compile(r"([\\`*_\[\]|~#])")
+
+
+def _sanitize_md(text: str) -> str:
+    """转义 markdown 控制字符 + 尖括号，让外部文本按字面量显示。"""
+    if not isinstance(text, str):
+        return str(text)
+    escaped = _MD_ESCAPE_RE.sub(r"\\\1", text)
+    return escaped.replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _render_ambient_audio():
     """侧边栏底部：氛围音乐控制条（常驻，rerun 不闪断）。
 
@@ -514,7 +532,7 @@ def _render_intro_animation(result: dict):
     st.components.v1.html(html, height=310)
 
 
-def _render_phase_banner(result: dict, total_rounds: int):
+def _render_phase_banner(result: dict):
     """阶段过渡幕布 + 事件音效（HTML 含 thread_id + phase，阶段变或跨局重玩才重挂载）。
 
     phase: discuss →「自由讨论开始」/ vote →「烛光投票」/ reveal →「真相大白」。
@@ -533,6 +551,24 @@ def _render_phase_banner(result: dict, total_rounds: int):
             .replace("__SFX__", sfx)
             .replace("__TID__", st.session_state.thread_id))
     st.components.v1.html(html, height=58)
+
+
+def _reset_game_state() -> None:
+    """清理当前 thread 的 checkpoint 并复位会话状态（R5：弃局/新局共用一份逻辑）。
+
+    @st.cache_resource 让图单例常驻，MemorySaver 会累积每局的每一步快照，
+    不清理的话长时间运行内存持续增长。此前只有结算页能清理，中途弃局
+    （直接关页/弃玩）的 checkpoint 永久残留——侧边栏"弃局重开"补上入口，
+    两处共用本函数，避免清理逻辑写两遍。
+    """
+    tid = st.session_state.get("thread_id")
+    if tid:
+        try:
+            graph.checkpointer.delete_thread(tid)
+        except Exception as e:
+            logger.warning("checkpoint 清理失败 thread=%s: %s", tid, e)
+    for key in ["started", "result", "thread_id", "intro_played", "last_error"]:
+        st.session_state.pop(key, None)
 
 
 def _run_stream(graph, cmd, config):
@@ -574,6 +610,14 @@ def _run_stream(graph, cmd, config):
                     if not thinking:
                         thinking = True
                         thinking_ph.markdown("💭 有嫌疑人正在思考……")
+                elif node in ("self_intro", "tie_break", "ai_vote"):
+                    # M3/M8：这三个节点是多角色串行/并发 LLM 调用，token 流式会把
+                    # 不同角色的台词混在一起（ai_vote 更是 think 推理，全为剧透），
+                    # 只给"思考中"占位消除冷场，不逐字显示。
+                    if not thinking:
+                        thinking = True
+                        hint = "🕯 各嫌疑人正在写下各自的指认……" if node == "ai_vote" else "💭 有嫌疑人正在发言……"
+                        thinking_ph.markdown(hint)
                 elif node in ("dm_intro", "dm_reveal", "dm_midpoint", "final_statement") and token.content:
                     current_parts.append(token.content)
                     pending += len(token.content)
@@ -591,7 +635,8 @@ def _run_stream(graph, cmd, config):
                 for node, update in d.items():
                     if isinstance(update, dict):
                         for m in update.get("messages", []):
-                            segments.append(f"**{m['speaker']}**：{m['content']}")
+                            # L5：发言内容按字面量渲染（防 markdown 注入聊天流）
+                            segments.append(f"**{_sanitize_md(m['speaker'])}**：{_sanitize_md(m['content'])}")
                 current_parts = []   # 节点结束，清空当前 token 累积
                 pending = 0
                 render()
@@ -629,6 +674,11 @@ if "interrupt_notice" in st.session_state:
 # ---- 初始化会话状态（跨 rerun 保存）----
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())   # 每局一个唯一 ID
+if "used_names" not in st.session_state:
+    # R8：跨局名字回避集合（浏览器会话粒度）。_pick_suspect_names 会对传入集合
+    # 原地 update，抽完名字自动写回；此前流式主路径用 names.py 模块级全局，
+    # GameState.used_names 成死字段、跨进程重启后撞名回归。
+    st.session_state.used_names = set()
 if "started" not in st.session_state:
     st.session_state.started = False
 if "result" not in st.session_state:
@@ -636,7 +686,10 @@ if "result" not in st.session_state:
 if "intro_played" not in st.session_state:
     st.session_state.intro_played = False   # 开场动画只播一次
 
-config = {"configurable": {"thread_id": st.session_state.thread_id}}
+# M1：thread_id → config 全项目唯一构造点（与 GameSession/终端版同一语义）
+config = build_config(st.session_state.thread_id)
+# M12：对局 ID 注入日志上下文（rerun 时重复 set 无害，contextvars 是本协程私有）
+set_game_id(st.session_state.thread_id)
 
 st.title("🕯 剧本杀 · 推理之夜")
 st.caption("卷宗已开启——你扮演其中一个嫌疑人，找出真凶。")
@@ -693,8 +746,10 @@ if not st.session_state.started:
         # 真流式生成剧本：边生成边显示，而不是盯着 spinner 干等。
         # generate_script_stream 是生成器，逐 token yield；手动 next() 迭代，
         # 从 StopIteration.value 拿到它 return 的最终 script。
+        # R8：传跨局已用名字集合（生成器内部原地 update，抽用自动写回）。
         st.markdown("### 🎬 正在生成剧本...")
-        gen = generate_script_stream(theme_val, background, story_val, custom_names, time_val, location_val)
+        gen = generate_script_stream(theme_val, background, story_val, custom_names,
+                                     time_val, location_val, used=st.session_state.used_names)
         placeholder = st.empty()
         parts = []   # 用 list 累积 token（O(n)），避免 full_text += token 的 O(n²)
         pending = 0  # 距上次刷新累计的字符数，用于节流显示
@@ -738,6 +793,7 @@ if not st.session_state.started:
         st.success("剧本生成完成！")
 
         # 把预生成好的 script 传给图（generate_script_node 检测到已有 script 会跳过）
+        # R8：used_names 一并写入状态，GameState.used_names 不再是死字段
         st.session_state.result = graph.invoke(
             {
                 "script": script,
@@ -748,6 +804,7 @@ if not st.session_state.started:
                 "story_location": location_val,
                 "custom_names": custom_names,
                 "rounds_per_player": rounds_per_player,
+                "used_names": sorted(st.session_state.used_names),
                 "messages": [],
                 "thoughts": [],
             },
@@ -805,7 +862,7 @@ else:
     user_task = user_suspect.get("task", "")
 
     # C-4：阶段过渡幕布 + 事件音效（key 随 thread_id + phase，跨局重玩不串动画）
-    _render_phase_banner(result, len(suspects) * result.get("rounds_per_player", 3))
+    _render_phase_banner(result)
     # 轮次进度（普通 markdown，每次 rerun 更新；无动画，不干扰幕布）
     round_num = result.get("phase_round", 0)
     total_rounds = len(suspects) * result.get("rounds_per_player", 3)
@@ -870,6 +927,12 @@ else:
         else:
             st.caption("（剧本未生成公开关系）")
         st.divider()
+        # R5：中途弃局的清理入口——此前只有结算页能 delete_thread，直接关页/弃玩
+        # 会让 checkpoint 永久残留在 @st.cache_resource 的图单例里（内存累积）。
+        if st.button("🚪 弃局重开（清理本局存档）", use_container_width=True):
+            _reset_game_state()
+            st.rerun()
+        st.divider()
         # C-2：氛围音乐控制条（常驻，固定 key）
         _render_ambient_audio()
 
@@ -903,11 +966,12 @@ else:
 
     # 对话历史（主区域）：直接渲染。
     # 真流式已经在"等待时"实时显示过了，这里无需再打字机回放。
+    # L5：speaker/content 均按字面量渲染，防用户输入/AI 输出注入 markdown 排版。
     for m in result.get("messages", []):
         is_user = m["speaker"] == user_role
         role = "user" if is_user else "assistant"
         with st.chat_message(role):
-            st.markdown(f"**{m['speaker']}**：{m['content']}")
+            st.markdown(f"**{_sanitize_md(m['speaker'])}**：{_sanitize_md(m['content'])}")
 
     # H14：DEV_MODE 下显示 AI 内心戏和调试状态（默认关闭，防剧透）
     if DEV_MODE:
@@ -969,17 +1033,33 @@ else:
                         st.rerun()
                 else:
                     st.caption("（现场已经搜遍，没有新发现了）")
+                # M9：发言不是强制的——保持沉默也是剧本杀的合法策略
+                if st.button("🤐 保持沉默（这一轮不发言）", key="silence_btn"):
+                    st.session_state.result = _run_stream(
+                        graph, Command(resume={"action": "silence"}), config
+                    )
+                    st.rerun()
 
             # 发言输入（默认动作，显式 key 与投票输入框隔离，防止值残留串台）
+            # M9：输入「沉默」保留字 = 点沉默按钮（终端/Web 协议一致）
             user_input = st.chat_input(f"轮到你了（{info['speaker']}），说出你的证词...", key="speak_input")
             if user_input:
-                st.session_state.result = _run_stream(graph, Command(resume=user_input), config)
+                resume = "沉默" if is_silence(user_input) else user_input[:MAX_CHAT_LEN]
+                st.session_state.result = _run_stream(graph, Command(resume=resume), config)
                 st.rerun()
         elif info["type"] == "human_vote":
-            user_input = st.chat_input(f"🕯 烛光投票：{', '.join(info['suspects'])}，你指认谁？", key="vote_input")
+            # M9：投票不是强制的——弃权通道显式暴露（规则层一直有 None 通道）
+            if st.button("🕊 弃权（不指认任何人）", key="abstain_btn"):
+                st.session_state.result = _run_stream(graph, Command(resume="弃权"), config)
+                st.rerun()
+            user_input = st.chat_input(f"🕯 烛光投票：{', '.join(info['suspects'])}，你指认谁？（也可点上方弃权）", key="vote_input")
             if user_input:
+                # M9：弃权保留字直通（否则会掉进"非法输入"循环纠错）
+                if is_abstain(user_input):
+                    st.session_state.result = _run_stream(graph, Command(resume="弃权"), config)
+                    st.rerun()
                 # 校验：必须是合法嫌疑人名字，防止残留的发言文本被当成投票
-                if validate_vote(user_input, info["suspects"]):
+                elif validate_vote(user_input, info["suspects"]):
                     st.session_state.result = _run_stream(graph, Command(resume=user_input), config)
                     st.rerun()
                 else:
@@ -989,19 +1069,20 @@ else:
     else:
         st.success("🎉 真相大白！")
         with st.expander("📊 投票结果", expanded=True):
+            # M9 配套：弃权票（None）显示为「（弃权）」而非 Python 的 None
             for voter, target in result.get("votes", {}).items():
-                st.write(f"· {voter} → {target}")
+                st.write(f"· {voter} → {target or '（弃权）'}")
             st.write(f"**得票最多：{result.get('vote_winner', '无人')}**")
+            # L4 配套：平票时并列名单来自结构化字段 tie_candidates，不再反解字符串
+            if result.get("tie_candidates"):
+                st.write(f"平票并列：{'、'.join(result['tie_candidates'])}")
             st.write(f"票数分布：{result.get('vote_counts', {})}")
+            game_result = result.get("game_result", "")
+            if game_result:
+                st.write(f"全局胜负：**{game_result}**")
         if st.button("🕯 翻开新卷宗", type="primary"):
-            # 清理当前 thread 的所有 checkpoint，释放 MemorySaver 内存。
-            # @st.cache_resource 让图单例常驻，MemorySaver 会累积每局的每一步快照，
-            # 不清理的话长时间运行内存持续增长（checkpointer.delete 是 langgraph>=1.0 的接口）
-            old_config = {"configurable": {"thread_id": st.session_state.thread_id}}
-            try:
-                graph.checkpointer.delete(old_config)
-            except Exception:
-                pass
-            for key in ["started", "result", "thread_id", "intro_played", "last_error"]:
-                st.session_state.pop(key, None)
+            # R5：清理逻辑抽成 _reset_game_state（与侧边栏"弃局重开"共用一份）。
+            # C2 修复历史：langgraph 1.2.x 的接口是 delete_thread(thread_id: str)，
+            # 旧代码调 delete(config) 必抛 AttributeError 被 except 吞掉。
+            _reset_game_state()
             st.rerun()

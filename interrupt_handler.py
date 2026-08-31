@@ -43,3 +43,26 @@ def get_interrupt_type(result: dict) -> str:
 def validate_vote(vote: str, suspects: list[str]) -> str | None:
     """校验投票：合法嫌疑人名字才返回，否则返回 None（弃权）。"""
     return vote if vote in suspects else None
+
+
+# M9：与 nodes.py 的 _ABSTAIN_WORDS 保持一致。抽到这里是因为 app.py / main.py
+# 的 UI 层都要"输入保留字 → 走弃权通道，而不是报非法输入循环纠错"。
+ABSTAIN_WORDS = ("弃权", "弃权不投", "abstain")
+
+
+def is_abstain(text: str) -> bool:
+    """判断玩家输入是否为弃权保留字（strip + 大小写不敏感）。"""
+    if not isinstance(text, str):
+        return False
+    return text.strip().lower() in ABSTAIN_WORDS
+
+
+# M9：发言沉默保留字（发言不是强制的——"沉默观察"是剧本杀真实策略）。
+SILENCE_WORDS = ("沉默", "保持沉默", "silence")
+
+
+def is_silence(text: str) -> bool:
+    """判断玩家输入是否为沉默保留字（strip + 大小写不敏感）。"""
+    if not isinstance(text, str):
+        return False
+    return text.strip().lower() in SILENCE_WORDS

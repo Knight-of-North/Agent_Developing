@@ -66,12 +66,18 @@ def _parse_names(text: str) -> list[str]:
     return result
 
 
-def _pick_suspect_names(background: str, custom_names: list[str] | None = None) -> list[str]:
+def _pick_suspect_names(background: str, custom_names: list[str] | None = None,
+                        used: set[str] | None = None) -> list[str]:
     """选嫌疑人名字：用户自定义优先，否则按背景风格随机抽（4~6 个，不重复）。
 
-    为什么随机抽不用 LLM？LLM 的"随机"趋同（翻来覆去那几个高频名），
+    为什么随机抽不用 LLM？LLM 的"随机"趋同（翻来翻去那几个高频名），
     random.sample 无放回抽样组合数巨大。但用户可能想用自己的朋友/同学名
     代入角色——这时自定义优先，随机兜底。
+
+    L7：used 参数把"名字回避"从模块级全局收编为调用方传入的集合——
+    状态归状态（GameState.used_names），函数归函数（纯函数更可测）。
+    used=None 时沿用模块级 _used_names（向后兼容旧调用方）；
+    显式传 set 时只读写该集合，多会话共享进程不再互相消耗名字池。
     """
     # 用户自定义名字：至少 3 个才采用，否则退回随机（名字太少撑不起剧本杀）
     if custom_names:
@@ -79,15 +85,19 @@ def _pick_suspect_names(background: str, custom_names: list[str] | None = None) 
         if len(cleaned) >= 3:
             return cleaned[:6]   # 最多 6 个嫌疑人
 
+    # L7：调用方显式传入 used 时用局内集合；None 时退回模块级全局（兼容旧路径）
+    own_global = used is None
+    used_set = _used_names if own_global else used
+
     pool = _NAME_POOLS.get(background, _MIXED_POOL)
     # 优先从未用过的名字里抽，避免和之前几局撞脸
-    fresh = [n for n in pool if n not in _used_names]
+    fresh = [n for n in pool if n not in used_set]
     if len(fresh) < 4:
         # 新鲜名字不够抽一整局了，重置（允许从头复用）
-        _used_names.clear()
+        used_set.clear()
         fresh = list(pool)
     n = random.randint(4, 6)          # 嫌疑人数量也随机，增强可玩性
     n = min(n, len(fresh))            # 名字池不够抽时退而求其次
     picked = random.sample(fresh, n)
-    _used_names.update(picked)        # 标记本会话已用
+    used_set.update(picked)           # 标记已用（只更新实际持有的那个集合）
     return picked

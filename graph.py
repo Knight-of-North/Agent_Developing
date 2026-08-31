@@ -46,7 +46,10 @@ def _build_checkpointer():
             from langgraph.checkpoint.sqlite import SqliteSaver
             db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints.sqlite")
             import sqlite3
-            conn = sqlite3.connect(db_path, check_same_thread=False)
+            # R13：timeout=30 让并发写等待锁释放而非立即抛 "database is locked"。
+            # 单连接无写锁，多浏览器会话同时游玩仍有锁竞争上限——单机自玩无碍，
+            # 多人联机前需换 AsyncSqliteSaver 或每线程独立连接。
+            conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
             return SqliteSaver(conn)
         except Exception as e:
             import logging

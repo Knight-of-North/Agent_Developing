@@ -192,9 +192,17 @@ def _extract_speak(out: dict) -> str:
     用 json.JSONDecoder().raw_decode() 从 raw 中扫描第一个合法 JSON 对象——
     它天然处理转义引号（\\"）、Unicode 转义（\\uXXXX）等情况，比正则健壮。
     扫描不到再退回正则兜底。
+
+    R3：speak 必须是字符串——json.loads / raw_decode 解析出的 speak 可以是
+    任意 JSON 值（dict/list/None/数字），原样返回会在下游 speak.strip() /
+    `词 in speak` 处抛 TypeError 炸穿节点（绕过 F1"异常不出节点"兜底）。
+    非字符串一律返回空串，走上层"解析失败重试"通道。
     """
+    def _coerce(v) -> str:
+        return v if isinstance(v, str) else ""
+
     if "speak" in out:
-        return out["speak"]
+        return _coerce(out["speak"])
     raw = out.get("raw", "")
 
     # 用 JSONDecoder 从 raw 中扫描第一个合法 JSON 对象（天然处理转义）
@@ -207,11 +215,16 @@ def _extract_speak(out: dict) -> str:
         try:
             obj, end = decoder.raw_decode(raw, start)
             if isinstance(obj, dict) and "speak" in obj:
-                return str(obj["speak"])
+                speak = _coerce(obj["speak"])
+                if speak:
+                    return speak
+                idx = end   # speak 字段非字符串，继续向后扫描
+                continue
             idx = end
         except json.JSONDecodeError:
             idx = start + 1   # 这个 { 不是合法 JSON 起点，往后找
 
     # 兜底：正则（处理 speak 值不含转义引号的极端格式）
     m = re.search(r'"speak"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
-    return m.group(1) if m else "……（这个角色欲言又止）"
+    # L1：纯省略号，不夹带"（这个角色欲言又止）"这类破坏沉浸的元叙述
+    return m.group(1) if m else "……"

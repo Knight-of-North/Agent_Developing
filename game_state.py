@@ -113,3 +113,24 @@ class GameState(TypedDict, total=False):
     # 全局胜负（tally_node 判定）：平民胜利（投出真凶）/ 凶手胜利（真凶逃脱）/ 平局（平票）。
     # 剧本杀是"平民 vs 凶手"的对抗游戏，这个字段让投票有了真正的 stakes（报告风险 2）
     game_result: str
+
+    # 平票加时是否已执行过（route_after_tally 据此保证只加时一次）。
+    # C1 修复：此键必须在 schema 声明，否则 LangGraph 会静默丢弃节点返回值，
+    # 导致"只加时一次"守卫失效、连续平票陷入无界重投循环。
+    tie_break_done: bool
+
+    # 平票加时候选人名单（结构化传递，替代从"平票（A、B）"字符串反解）。
+    # 加时轮 AI/玩家投票只允许投这几人。
+    tie_candidates: list[str]
+
+    # 投票轮次（首轮 1，加时重投 2）。作为 tie_break_done 的双保险，
+    # 即便守卫逻辑再出错，vote_round>=2 也硬性封顶，杜绝无界循环。
+    vote_round: int
+
+    # 本局已用过的嫌疑人名字（L7：把 names.py 的模块级全局 _used_names 收编进状态，
+    # 名字回避以"局"为粒度——多会话共享进程时 A 局不再消耗 B 局的名字池）。
+    used_names: Annotated[list, operator.add]
+
+    # 插队回应（被点名后回应）累计次数（M11：插队不消耗 phase_round 预算，
+    # 但超过 总预算/2 后恢复计费——"插队免费 + 总量保险丝"防失控）。
+    followup_count: int

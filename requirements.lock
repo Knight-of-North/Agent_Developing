@@ -1,0 +1,15 @@
+# 精确版本锁定（M7）—— 当前开发/测试环境验证通过的版本
+# 用法：pip install -r requirements.lock
+# 注意：本文件只锁定直接依赖的精确版本；传递依赖由 pip 自动解析。
+# 若需完全可复现的完整依赖树，请在干净虚拟环境中执行：
+#   pip install -r requirements.lock && pip freeze > requirements.lock.full
+# Requires Python >= 3.10
+
+langgraph==1.2.11
+langchain-core==1.6.0
+langchain-deepseek==1.1.0
+python-dotenv==1.2.3
+streamlit==1.62.0
+httpx==0.28.1
+pyvis==0.3.2
+pytest==9.1.1
