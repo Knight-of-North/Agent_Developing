@@ -36,12 +36,13 @@ START
   → distribute_clues（线索按 holder 分发，信息差起点）
   → choose_role ← interrupt（你选角色）
   → dm_intro（DM 开场讲故事）
-  → self_intro（AI 嫌疑人自我介绍）
+  → self_intro（AI 嫌疑人自我介绍，线程池并发）
   → ↺ 讨论循环：ai_player_turn / human_turn / dm_midpoint
-        ↑ 条件边 route_speaker 路由谁发言
-  → ai_vote（AI 投票）
-  → human_vote ← interrupt（你投票）
-  → tally（确定性计票）
+        ↑ 条件边 route_speaker 路由谁发言（点名插队 / 追问 / 正常轮换）
+  → ai_vote（AI 投票，并发 + 注入不在场证明花名册）
+  → human_vote ← interrupt（你投票，可弃权）
+  → tally（确定性计票，平票走结构化 tie_candidates）
+  → tie_break（平票加时辩护，仅一次 + vote_round 硬保险丝）
   → final_statement（得票最高者陈词）
   → dm_reveal（DM 揭晓 + 复盘）
   → END
@@ -65,7 +66,7 @@ START
 | **大模型** | DeepSeek `deepseek-v4-flash` | 中文生成稳、价格便宜（每局 ¥1~3），适合学习项目预算 |
 | **Web UI** | Streamlit ≥1.32 | 5 分钟搭交互界面，专注后端逻辑 |
 | **关系图** | pyvis 0.3 + vis.js | 嫌疑人关系图直接生成 HTML，嵌在模态框里 |
-| **测试** | pytest | 纯函数单元测试，**92 passed / 4.7s**，不烧 token |
+| **测试** | pytest | 纯函数单元测试，**127 passed / 3.3s**，不烧 token |
 | **环境** | conda py10 + pip 清华镜像 | Python 3.10 隔离环境，安装快 |
 
 ---
@@ -114,11 +115,11 @@ python main.py
 2. **选角色**：从嫌疑人里挑一个你扮演（其他人都是 AI）
 3. **读个人剧本**：你的身份、秘密、与死者的关系、你手里的私密线索——**别人不知道你的秘密**
 4. **讨论环节**：轮流发言，可以：
-   - 💬 发言 / 推理 / 质问
-   - 🔍 调查隐藏线索（有限次数）
+   - 💬 发言 / 推理 / 质问（或输入「沉默」保持缄默）
+   - 🔍 调查隐藏线索（有限次数，随机发放）
    - 🗂️ 公开线索给所有人
    - ⚡ 指控某人（对方必须回应）
-5. **投票** → **DM 揭晓**（公布真相 + 复盘谁被埋没）
+5. **投票**（可投「弃权」）→ **DM 揭晓**（公布真相 + 复盘谁被埋没）
 
 一局大约 15~30 分钟。
 
@@ -132,39 +133,49 @@ Agent_Developing/
 ├── main.py              # 终端交互版入口
 ├── graph.py             # LangGraph 图编排（节点注册 + 条件边 + checkpointer）
 ├── nodes.py             # 节点函数：LLM 节点 + 确定性节点（编排层，已拆薄）
+├── rules.py             # 游戏规则引擎（纯函数：线索检测 / 点名 / 守卫 / 计票）
 ├── prompts.py           # prompt 构建（含人物关系铁律 / 信息差铁律等）
 ├── validators.py        # 解析 / 规范化 / 兜底（JSON 解析、名单过滤、线索生成）
-├── interrupt_handler.py # interrupt 中断处理（类型识别、角色/投票校验）
+├── interrupt_handler.py # interrupt 中断处理（类型识别、校验、沉默/弃权保留字）
+├── game_session.py      # 会话抽象层（图生命周期 + interrupt 提取，双端共用）
 ├── visualization.py     # 关系图可视化（pyvis → 交互 HTML）
 ├── game_state.py        # 共享状态定义（TypedDict + Annotated reducer）
 ├── names.py             # 嫌疑人名字池 + 抽样
-├── tests/               # pytest 单元测试（92 passed）
+├── logging_config.py    # 日志配置（文件轮转 + 对局 ID 上下文注入）
+├── config.py            # 集中配置（温度 / 轮数 / 限制，全量环境变量可覆盖）
+├── tests/               # pytest 单元测试（127 passed）
+├── scripts/
+│   └── test_api.py      # API 连通性测试（手动脚本，pytest 不收集）
 ├── docs/
 │   ├── screenshots/     # README 截图
-│   └── *.md             # 代码审查 / 玩法评估 / 调研报告（归档）
+│   └── deep-review-2026-08/  # 深度审查报告（27 项问题全量修复档案）
 ├── diagnose.py          # 调试脚本（看 LLM 原始 JSON 返回）
 ├── diag.py              # 网络诊断（trust_env 开/关对比，排查代理）
-├── test_api.py          # API 连通性测试
+├── pytest.ini           # 测试发现限定 tests/（防真实 API 调用被误收集）
 ├── requirements.txt
-└── .env.example
+└── .env.example         # 环境变量模板（28 项全量注释）
 ```
 
-**模块边界**：`nodes.py` 只做编排（调用 LLM + 调确定性函数），业务逻辑全在 `validators.py` / `prompts.py` / `interrupt_handler.py` 里——这是为了**让测试不依赖 LLM**，92 个测试全是纯函数。
+**模块边界**：`nodes.py` 只做编排（调用 LLM + 调确定性函数），确定性游戏规则全在 `rules.py`、业务逻辑在 `validators.py` / `prompts.py` / `interrupt_handler.py` 里——这是为了**让测试不依赖 LLM**，127 个测试全是纯函数。
 
 ---
 
 ## 🧪 测试与质量
 
 ```bash
-pytest -q     # → 92 passed in 4.7s
+pytest -q     # → 127 passed in 3.3s（pytest.ini 已限定只扫 tests/）
 ```
 
 测试覆盖（**不烧 token**）：
 - JSON 解析 / 名单过滤 / 线索兜底
 - 自洽校验（5+ 条硬检测 + 重试反馈）
-- 计票 / 投票校验 / 结局判断
+- 计票 / 投票校验 / 结局判断（含弃权单列）
 - 关系图渲染（名单外角色不崩）
 - 凶手狡辩策略池
+- 2-gram 线索检测（转述命中 / 同字异义不误报）
+- 点名→追问守卫（str/dict 协议等价性）
+- 插队不计费 + 保险丝（M11）
+- 平票结构化候选传递（L4）
 
 **故意不测**：图流程端到端 mock 冒烟——这是测试盲区，留给开学后（frozen 测试需要 mock LLM，不划算）。
 

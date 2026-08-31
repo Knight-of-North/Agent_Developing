@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import uuid
+import logging
 from typing import Any, Iterator
 
 from langgraph.types import Command
@@ -35,12 +36,34 @@ from langgraph.errors import GraphInterrupt
 
 from graph import build_graph
 
+logger = logging.getLogger(__name__)
+
+
+# ---------- M1：会话核心语义的纯函数（app.py / main.py / GameSession 共用） ----------
+# 之前 thread_id→config 的映射在 app.py（L647）和 GameSession 各写一份，
+# 修 H4 类问题 / 迁移 checkpointer 时要检查两处——语义只写一遍，单一事实源。
+
+
+def build_config(thread_id: str) -> dict:
+    """thread_id → LangGraph config（全项目唯一的构造点）。"""
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def extract_interrupt(result: dict) -> list | None:
+    """从图执行结果里提取 __interrupt__ 列表（无则 None）。"""
+    return result.get("__interrupt__") if isinstance(result, dict) else None
+
+
+def resume(graph, cmd: Command, config: dict) -> dict:
+    """用 Command(resume=...) 恢复图执行（非流式路径）。"""
+    return graph.invoke(cmd, config)
+
 
 class GameSession:
     def __init__(self, thread_id: str | None = None):
         self.graph = build_graph()
         self.thread_id = thread_id or str(uuid.uuid4())
-        self.config = {"configurable": {"thread_id": self.thread_id}}
+        self.config = build_config(self.thread_id)
 
     # ---------- 状态访问 ----------
 
@@ -92,7 +115,7 @@ class GameSession:
 
     def resume_invoke(self, payload: Any) -> dict:
         """用玩家输入恢复执行，跑到下一个 interrupt 或 END，返回 state。"""
-        self.graph.invoke(Command(resume=payload), config=self.config)
+        resume(self.graph, Command(resume=payload), self.config)
         return self.state
 
     def resume_stream(self, payload: Any, stream_mode=None) -> Iterator[Any]:
@@ -103,11 +126,16 @@ class GameSession:
     # ---------- 工具 ----------
 
     def cleanup(self) -> None:
-        """清理当前 thread 的 checkpoint（MemorySaver 下释放内存，H20）。"""
+        """清理当前 thread 的 checkpoint（MemorySaver 下释放内存，H20/C2）。
+
+        C2 修复：langgraph 1.2.x 的 InMemorySaver 没有 delete() 方法，
+        正确接口是 delete_thread(thread_id: str)；之前调 delete() 必抛
+        AttributeError 被 except 吞掉，内存清理从未生效。
+        """
         try:
-            self.graph.checkpointer.delete(self.thread_id)
-        except Exception:
-            pass
+            self.graph.checkpointer.delete_thread(self.thread_id)
+        except Exception as e:
+            logger.warning("checkpoint 清理失败 thread=%s: %s", self.thread_id, e)
 
     @staticmethod
     def build_resume(action: str, **kwargs) -> dict:

@@ -14,8 +14,13 @@ env/
 # 向量库与数据（体积大，各自本地建）
 chroma_db/
 *.db
+*.sqlite
+*.sqlite3
 data/
 docs/raw/
+
+# 运行日志（logging_config.RotatingFileHandler 产出，不提交）
+logs/
 
 # IDE / 系统
 .vscode/

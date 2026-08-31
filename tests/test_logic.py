@@ -30,10 +30,16 @@ from validators import (
 from visualization import build_relations_html, _truncate_label, _clean_pronouns
 from nodes import (
     distribute_clues_node, tally_node, route_speaker, _current_speaker,
-    _check_script_consistency, _get_murderer, _extract_clue_keywords,
+    _check_script_consistency, _get_murderer,
     _update_revealed_clues, _detect_addressed, _format_private_clues, _judge_ending,
+    route_after_tally, tie_break_node, final_statement_node, dm_midpoint_node,
+    human_turn_node, human_vote_node, ai_player_turn_node, _count_accusations_against,
+    _clue_mentioned,
 )
-from interrupt_handler import get_interrupt, validate_vote
+from rules import apply_followup_guard
+from game_state import GameState
+from prompts import build_tiebreak_prompt
+from interrupt_handler import get_interrupt, validate_vote, is_abstain, is_silence
 
 
 # ============ interrupt_handler ============
@@ -155,7 +161,8 @@ def test_extract_speak_from_raw_rescues_speak():
 
 
 def test_extract_speak_no_speak_gives_placeholder():
-    assert _extract_speak({"raw": '{"think": "我是凶手"}'}) == "……（这个角色欲言又止）"
+    # L1：兜底用纯省略号，不夹带"（这个角色欲言又止）"这类破坏沉浸的元叙述
+    assert _extract_speak({"raw": '{"think": "我是凶手"}'}) == "……"
 
 
 # ============ _fallback_clues ============
@@ -219,8 +226,10 @@ def test_tally_normal():
 
 def test_tally_tie_detected():
     out = tally_node({"votes": {"张三": "李四", "李四": "王五"}})
-    assert out["vote_winner"].startswith("平票")
-    assert "李四" in out["vote_winner"] and "王五" in out["vote_winner"]
+    # L4：vote_winner 只写"平票"纯标记，并列名单走结构化字段 tie_candidates
+    assert out["vote_winner"] == "平票"
+    assert set(out["tie_candidates"]) == {"李四", "王五"}
+    assert out["game_result"] == "平局"
 
 
 def test_tally_empty():
@@ -807,22 +816,21 @@ def test_get_murderer_from_murderer_field():
 
 
 def test_get_murderer_fallback_from_truth():
-    # 无 murderer 字段时，从 truth 里找第一个出现的嫌疑人名字
+    # 无 murderer 字段时，从 truth 里找最后出现的嫌疑人名字
+    # （truth 叙事通常先描述涉案人物、末尾才揭露真凶，第一个出现的往往是无辜者）
     script = {"truth": "张三因为债务问题杀人", "suspects": [{"name": "张三"}, {"name": "李四"}]}
     assert _get_murderer(script, ["张三", "李四"]) == "张三"
 
 
+def test_get_murderer_fallback_picks_last_in_truth():
+    # 区分用例：truth 里先出现无辜者、后出现真凶时，必须取最后出现的那个
+    script = {"truth": "张三与李四发生争执，最终李四痛下杀手",
+              "suspects": [{"name": "张三"}, {"name": "李四"}]}
+    assert _get_murderer(script, ["张三", "李四"]) == "李四"
+
+
 def test_get_murderer_empty():
     assert _get_murderer({"truth": ""}, []) == ""
-
-
-# ============ _extract_clue_keywords（8-20 审查补测） ============
-
-def test_extract_clue_keywords_splits():
-    assert _extract_clue_keywords("有人在案发前换过锁，是熟人") == ["有人在案发前换过锁", "是熟人"]
-    assert _extract_clue_keywords("") == []
-    # 长度 >= 2 的片段都保留（"短词""不保留"各 2 字）；单个字符 "a" 被过滤
-    assert _extract_clue_keywords("短词 不保留 a") == ["短词", "不保留"]
 
 
 # ============ _update_revealed_clues（8-20 审查补测） ============
@@ -959,3 +967,572 @@ def test_build_script_prompt_has_address_consistency_rule():
     assert "严禁混用" in prompt, "必须禁止混用先生/小姐"
     # 必须点出"长卿""怀瑾"等中性名猜性别的问题
     assert "中性" in prompt or "字面" in prompt, "必须提醒 LLM 中性名字面会矛盾"
+
+
+# ============ 第二轮（千问实证审查）回归测试 ============
+# 这些测试锁定第二轮修复的致命/高危问题，防止再次回归。
+# C1/C3/H1 都是"修复时没附测试"才漏掉的，本次每条修复都配断言。
+
+# ---------- C1：tie_break 状态字段必须在 GameState 声明 ----------
+
+def test_gamestate_declares_tie_break_fields():
+    """C1：tie_break_done/tie_candidates/vote_round 必须在 schema 中声明，
+    否则 LangGraph 会静默丢弃节点返回值，导致'只加时一次'守卫失效。"""
+    annotations = getattr(GameState, "__annotations__", {})
+    for field in ("tie_break_done", "tie_candidates", "vote_round"):
+        assert field in annotations, f"GameState 必须声明 {field}，否则被 LangGraph 丢弃"
+
+
+def test_route_after_tally_respects_done_flag():
+    """C1：tie_break_done=True 后，即便仍平票也走 final_statement，不再加时。"""
+    assert route_after_tally({"vote_winner": "平票（张三、李四）", "tie_break_done": True}) == "final_statement"
+
+
+def test_route_after_tally_vote_round_hard_cap():
+    """C1 保险丝：vote_round>=2 时强制结算，杜绝连续平票无界循环。"""
+    assert route_after_tally({"vote_winner": "平票（张三、李四）", "vote_round": 2}) == "final_statement"
+
+
+def test_route_after_tally_first_tie_goes_to_tie_break():
+    """首轮平票且未加时 → tie_break。"""
+    assert route_after_tally({"vote_winner": "平票（张三、李四）"}) == "tie_break"
+
+
+# ---------- C3：追问路由 off-by-one ----------
+
+def test_followup_not_limited_after_first_name_call():
+    """C3：玩家第一次点名后 consecutive=1、follow_up=1，AI 回应完应再次轮到玩家追问，
+    不能被 MAX_CONSECUTIVE_FOLLOWUPS=1 立即锁死。"""
+    state = {
+        "phase_round": 0,
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四"}]},
+        "rounds_per_player": 3,
+        "consecutive_followups": 1,
+        "follow_up": 1,
+        "pending_reply_to": "",
+        "user_role": "李四",
+    }
+    assert route_speaker(state) == "human"
+
+
+def test_followup_limited_after_second_consecutive():
+    """consecutive 超过上限（>1）时才强制回正常轮换。"""
+    state = {
+        "phase_round": 0,
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四"}]},
+        "rounds_per_player": 3,
+        "consecutive_followups": 2,
+        "follow_up": 1,
+        "pending_reply_to": "",
+        "user_role": "李四",
+    }
+    assert route_speaker(state) != "human"
+
+
+# ---------- H1：弃权票必须显式覆盖旧票 ----------
+
+def test_tally_filters_none_votes():
+    """H1：None（弃权）票不计入票数，避免弃权者残留首轮旧票。"""
+    state = {
+        "votes": {"张三": "李四", "李四": None, "王五": "李四"},
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四"}, {"name": "王五"}], "murderer": "李四"},
+    }
+    out = tally_node(state)
+    assert out["vote_counts"] == {"李四": 2}
+    assert out["vote_winner"] == "李四"
+
+
+def test_tally_all_abstain_yields_no_vote():
+    """全员弃权 → 无人投票。"""
+    state = {
+        "votes": {"张三": None, "李四": None},
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四"}], "murderer": "李四"},
+    }
+    out = tally_node(state)
+    assert out["vote_winner"] == "无人投票"
+    assert out["game_result"] == "平局"
+
+
+# ---------- H2 + M1 + L4：tie_break 候选人传递 ----------
+
+def test_tie_break_reads_structured_candidates(monkeypatch):
+    """L4：候选人直接读 state.tie_candidates（tally 写入的结构化字段），
+    不再从"平票（A、B）"字符串剥壳解析。候选人是用户本人时跳过 LLM 辩护。"""
+    state = {
+        "vote_winner": "平票",
+        "tie_candidates": ["张三", "李四"],
+        "user_role": "张三",
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四", "secret": "我暗恋王五"}],
+                   "truth": "真相"},
+    }
+    # 李四不是用户，会触发一次 LLM 调用——mock 掉
+    monkeypatch.setattr("nodes._safe_llm_text", lambda *a, **k: "我冤枉啊。")
+    out = tie_break_node(state)
+    assert out["tie_break_done"] is True
+    assert out["tie_candidates"] == ["张三", "李四"]   # 原样保留，供加时轮收窄
+    assert any(m["speaker"] == "李四" for m in out.get("messages", []))
+
+
+def test_tie_break_special_names_not_truncated(monkeypatch):
+    """L4 回归：名字含'平/票/（/）'等字不被截断——结构化字段传递，无字符串解析。"""
+    state = {
+        "vote_winner": "平票",
+        "tie_candidates": ["平平"],
+        "user_role": "张三",
+        "script": {"suspects": [{"name": "平平", "secret": "x"}, {"name": "张三"}], "truth": "x"},
+    }
+    monkeypatch.setattr("nodes._safe_llm_text", lambda *a, **k: "x")
+    out = tie_break_node(state)
+    assert out["tie_candidates"] == ["平平"]
+
+
+# ---------- M4：指控启发式 ----------
+
+def test_count_accusations_literal_word():
+    msgs = [{"speaker": "李四", "content": "我指控张三"}]
+    assert _count_accusations_against(msgs, "张三") == 1
+
+
+def test_count_accusations_heuristic_no_literal_word():
+    """M4：'凶手就是张三'虽不含'指控'二字，也应计为指控。"""
+    msgs = [{"speaker": "李四", "content": "我看凶手就是张三"}]
+    assert _count_accusations_against(msgs, "张三") == 1
+
+
+def test_count_accusations_excludes_self():
+    msgs = [{"speaker": "张三", "content": "凶手就是我张三"}]
+    assert _count_accusations_against(msgs, "张三") == 0
+
+
+def test_count_accusations_innocent_mention_not_counted():
+    """只提到名字和'凶手'但没有指认词，不算指控。"""
+    msgs = [{"speaker": "李四", "content": "张三说凶手另有其人"}]
+    assert _count_accusations_against(msgs, "张三") == 0
+
+
+# ---------- M5：midpoint 缺失 topic 不泄露线索原文 ----------
+
+def test_midpoint_missing_topic_does_not_leak_clue_text(monkeypatch):
+    """M5：线索没有 topic 标签时，兜底不能截取原文前 6 字（会直接剧透）。"""
+    captured = {}
+
+    def fake_safe(prompt, **kw):
+        captured["prompt"] = prompt
+        return "主持人引导大家继续讨论。"
+
+    monkeypatch.setattr("nodes._safe_llm_text", fake_safe)
+    secret_clue = "书房抽屉里有一把沾血的钥匙"
+    state = {
+        "revealed_clues": {},
+        "distributed_clues": {"张三": [secret_clue]},
+        "script": {"private_clues": [{"holder": "张三", "content": secret_clue}]},
+    }
+    dm_midpoint_node(state)
+    assert secret_clue not in captured["prompt"]
+    assert secret_clue[:6] not in captured["prompt"]
+    assert "尚未被讨论" in captured["prompt"]
+
+
+# ---------- L5：无人投票不穿透到最终陈词 ----------
+
+def test_final_statement_skips_when_no_vote():
+    out = final_statement_node({"vote_winner": "无人投票", "user_role": "张三",
+                                "script": {"suspects": [{"name": "张三"}]}})
+    assert out == {}
+
+
+def test_final_statement_skips_tie():
+    out = final_statement_node({"vote_winner": "平票（张三、李四）", "user_role": "王五",
+                                "script": {"suspects": [{"name": "张三"}]}})
+    assert out == {}
+
+
+# ---------- M2：调查线索私有化 ----------
+
+def test_investigate_keeps_clue_private(monkeypatch):
+    """M2：调查所得线索进入 distributed_clues[玩家]，不广播原文、不计入 revealed_clues。"""
+    monkeypatch.setattr("nodes.interrupt", lambda payload: {"action": "investigate"})
+    state = {
+        "user_role": "张三",
+        "phase_round": 0,
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四"}], "hidden_clues": ["隐藏线索A"]},
+        "distributed_clues": {"张三": [], "李四": []},
+        "investigated_clues": [],
+        "investigations_used": 0,
+        "messages": [],
+    }
+    out = human_turn_node(state)
+    # 公开消息不含线索原文
+    assert all("隐藏线索A" not in m["content"] for m in out["messages"])
+    # 线索进了玩家私有渠道
+    assert "隐藏线索A" in out["distributed_clues"]["张三"]
+    # 不应标记为已公开
+    assert "隐藏线索A" not in out.get("revealed_clues", {})
+    assert out["investigations_used"] == 1
+
+
+# ---------- M9：tie_break prompt 不向凶手注入完整 truth ----------
+
+def test_tiebreak_prompt_murderer_does_not_leak_truth():
+    """M9：凶手加时辩护 prompt 不得注入案件真相原文（防模型复述剧透）。"""
+    p = build_tiebreak_prompt("张三", "我的秘密", is_murderer=True)
+    assert "案件真相" not in p
+    assert "不能自曝" in p
+
+
+def test_tiebreak_prompt_innocent_constraint():
+    p = build_tiebreak_prompt("李四", "我的秘密", is_murderer=False)
+    assert "别说破真凶" in p
+
+
+# ============ 第三轮（系统性优化）回归测试 ============
+# 对应 deep-review-2026-08 报告修复项 H5 / M3 / M9 / M11 / L4 / L8，
+# 每条修复配断言，防止后续改动再次回归。
+
+# ---------- H5：2-gram 线索检测（误报按平方级下降） ----------
+
+def test_clue_mentioned_exact_substring():
+    """原文引用/转述：精确子串直接命中。"""
+    assert _clue_mentioned("书房抽屉里有一把沾血的钥匙", "我说书房抽屉里有一把沾血的钥匙就是证据")
+
+
+def test_clue_mentioned_paraphrase_hits():
+    """转述命中：语序不同但 2-gram 重叠率 ≥ 0.5。"""
+    assert _clue_mentioned("书房抽屉里有一把沾血的钥匙",
+                           "我记得书房抽屉里有一把钥匙，上面沾着血")
+
+
+def test_clue_mentioned_same_chars_different_meaning():
+    """H5 核心回归：单字重叠（书房/刀/血）但语义无关 → 不误报。
+    旧的单字重叠率 0.6 启发式在此类发言上会沿"中场引导 → 揭晓复盘"传导放大。"""
+    assert not _clue_mentioned("书房里有一把带血的刀",
+                               "他把书房的菜刀擦干净了，没有血迹")
+
+
+def test_clue_mentioned_short_clue_needs_substring():
+    """极短线索（<3 个 bigram）只有精确子串一条路，杜绝小集合高命中。"""
+    assert _clue_mentioned("短线索", "我说的是短线索没错")
+    assert not _clue_mentioned("短线索", "线索很短但这不是同一条")
+
+
+# ---------- M3：点名→追问守卫（str/dict 协议共用一份实现） ----------
+
+def test_followup_guard_first_call_grants_followup():
+    """首次点名（prev_follow=0）→ 给追问权，连续交锋计数 +1。"""
+    assert apply_followup_guard("李四，你案发当晚在哪", ["李四"], 0, 0) == ("李四", 1, 1)
+
+
+def test_followup_guard_consecutive_no_renewal():
+    """上一轮追问权未用（follow_up=1）时再点名 → 不续期（F5 防霸麦）。"""
+    assert apply_followup_guard("王五，你说清楚", ["王五"], 1, 1) == ("王五", 0, 0)
+
+
+def test_followup_guard_human_turn_str_dict_equivalence(monkeypatch):
+    """M3：human_turn 的 str 协议与 dict(text=...) 协议必须产生完全相同的守卫输出。
+    此前 str 分支有 F5 守卫、dict 分支没有（连续点名可无限续期），提取共用函数后
+    语义只有一份实现。"""
+    base = {
+        "user_role": "张三", "phase_round": 0,
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四"}]},
+        "distributed_clues": {}, "revealed_clues": {},
+        "follow_up": 0, "consecutive_followups": 0,
+        "messages": [],
+    }
+    text = "李四，你案发当晚到底在哪？"
+    monkeypatch.setattr("nodes.interrupt", lambda payload: text)
+    out_str = human_turn_node(dict(base))
+    monkeypatch.setattr("nodes.interrupt", lambda payload: {"action": "speak", "text": text})
+    out_dict = human_turn_node(dict(base))
+    for key in ("pending_reply_to", "follow_up", "consecutive_followups", "phase_round"):
+        assert out_str[key] == out_dict[key], f"str/dict 协议在 {key} 上语义分歧"
+
+
+# ---------- M9：沉默 / 弃权保留字（发言和投票都不是强制的） ----------
+
+def test_is_abstain_words():
+    assert is_abstain("弃权")
+    assert is_abstain("  弃权不投 ")
+    assert is_abstain("ABSTAIN")
+    assert not is_abstain("李四")
+    assert not is_abstain("")
+
+
+def test_is_silence_words():
+    assert is_silence("沉默")
+    assert is_silence("保持沉默")
+    assert is_silence("Silence")
+    assert not is_silence("沉默是金，我不想说话")   # 非保留字 → 当普通发言
+
+
+def test_human_vote_abstain_reserved_word(monkeypatch):
+    """M9：输入「弃权」→ votes 显式写 None，不再掉进"非法输入"循环纠错。"""
+    monkeypatch.setattr("nodes.interrupt", lambda payload: "弃权")
+    state = {"user_role": "张三", "script": {"suspects": [{"name": "张三"}, {"name": "李四"}]}}
+    assert human_vote_node(state) == {"votes": {"张三": None}}
+
+
+def test_human_turn_silence_reserved_word(monkeypatch):
+    """M9：输入「沉默」→ 占位消息入公开历史，不触发点名守卫，轮次照常推进。"""
+    monkeypatch.setattr("nodes.interrupt", lambda payload: "沉默")
+    state = {
+        "user_role": "张三", "phase_round": 2,
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四"}]},
+        "distributed_clues": {}, "revealed_clues": {}, "messages": [],
+    }
+    out = human_turn_node(state)
+    assert out["messages"] == [{"speaker": "张三", "content": "（环视众人，沉默不语）"}]
+    assert out["pending_reply_to"] == ""
+    assert out["follow_up"] == 0
+    assert out["phase_round"] == 3   # 沉默也占一轮，防"永远沉默"卡死循环
+
+
+# ---------- M11：插队不计费 + 总量保险丝 ----------
+
+def _ai_turn_state(**overrides):
+    state = {
+        "phase_round": 3,
+        "rounds_per_player": 3,
+        "pending_reply_to": "李四",
+        "followup_count": 0,
+        "script": {"suspects": [
+            {"name": "张三", "secret": "s1", "forbidden": []},
+            {"name": "李四", "secret": "s2", "forbidden": []},
+            {"name": "王五", "secret": "s3", "forbidden": []},
+        ], "truth": "李四杀人", "murderer": "李四"},
+        "distributed_clues": {}, "revealed_clues": {}, "agent_memory": {},
+        "messages": [],
+        "user_role": "张三",
+    }
+    state.update(overrides)
+    return state
+
+
+def test_ai_turn_followup_reply_free_round(monkeypatch):
+    """M11：插队回应（被点名后回应）不消耗 phase_round 预算。"""
+    monkeypatch.setattr("nodes._safe_llm_text",
+                        lambda *a, **k: '{"think":"t","speak":"我来解释一下。"}')
+    out = ai_player_turn_node(_ai_turn_state())
+    assert out["phase_round"] == 3        # 不 +1（插队免费）
+    assert out["followup_count"] == 1     # 但插队次数如实累计
+    assert out["pending_reply_to"] == ""  # 回应完清空待回应标记
+
+
+def test_ai_turn_followup_fuse_after_limit(monkeypatch):
+    """M11 保险丝：3 人 × 3 轮 = 9 轮预算，上限 9//2=4；第 5 次插队恢复计费。"""
+    monkeypatch.setattr("nodes._safe_llm_text",
+                        lambda *a, **k: '{"think":"t","speak":"我来解释一下。"}')
+    out = ai_player_turn_node(_ai_turn_state(followup_count=4))
+    assert out["phase_round"] == 4        # 恢复 +1（保险丝熔断）
+    assert out["followup_count"] == 5
+
+
+# ---------- L4：tie_candidates 结构化传递的补测 ----------
+
+def test_tally_clears_stale_tie_candidates():
+    """L4：非平票时显式清空 tie_candidates——加时轮决出胜者后旧名单不残留，
+    否则后续轮的 AI 投票会被误导成"只准投旧平票者"。"""
+    out = tally_node({
+        "votes": {"张三": "李四"},
+        "tie_candidates": ["李四", "王五"],
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四"}, {"name": "王五"}],
+                   "murderer": "李四"},
+    })
+    assert out["vote_winner"] == "李四"
+    assert out["tie_candidates"] == []
+
+
+# ---------- L8：弃权结局单列 ----------
+
+def test_judge_ending_abstain_outsider():
+    """L8：玩家弃权（None）单列「置身事外」——"压根没投"和"投错被误导"是两种叙事。"""
+    state = _ending_state(votes={"张三": None, "李四": "张三"}, vote_winner="张三")
+    label, _ = _judge_ending(state)
+    assert label == "置身事外"
+
+
+# ============ 第四轮优化回归测试（R1-R15，2026-08-30 深度审查报告） ============
+# 对应报告：致命/高危优先（R1 弃权票渲染 / R2 流式反馈回归 / R3 类型防线 /
+# R4 truth 硬校验），中低危（R7 归属校验 / R9 选角色重试 / R11 兜底语义）。
+# 每条修复配断言，防止后续改动再次回归。
+
+# ---------- R1：弃权票展示归一化 ----------
+
+def test_render_vote_abstain():
+    """R1：_render_vote 把 None/空归一为「（弃权）」，有效票原样通过。"""
+    from nodes import _render_vote
+    assert _render_vote(None) == "（弃权）"
+    assert _render_vote("") == "（弃权）"
+    assert _render_vote("李四") == "李四"
+
+
+def test_dm_reveal_abstain_not_none(monkeypatch):
+    """R1：弃权票进 DM 揭晓 prompt 时必须是「（弃权）」而不是 "None"。"""
+    from nodes import dm_reveal_node
+    captured = {}
+
+    def fake_llm(prompt, *args, **kwargs):
+        captured["prompt"] = prompt
+        return "揭晓台词"
+
+    monkeypatch.setattr("nodes._safe_llm_text", fake_llm)
+    state = {
+        "script": {"truth": "李四杀人", "murderer": "李四",
+                   "suspects": [{"name": "张三"}, {"name": "李四"}]},
+        "votes": {"张三": None, "李四": "张三"},   # 张三弃权（H1 的显式 None）
+        "vote_counts": {"张三": 1},
+        "vote_winner": "张三",
+        "user_role": "张三",
+        "distributed_clues": {},
+        "messages": [],
+    }
+    dm_reveal_node(state)
+    assert "投None" not in captured["prompt"]
+    assert "None" not in captured["prompt"]
+    assert "张三投（弃权）" in captured["prompt"]
+
+
+# ---------- R2：json_mode 必须走流式（反馈占位依赖 token 事件） ----------
+
+def test_safe_llm_text_json_mode_uses_stream(monkeypatch):
+    """R2：json_mode 走 stream 聚合——invoke（非流式）在 stream_mode="messages"
+    下只产生 1 个整段事件且时机在响应就绪后，app.py 的"思考中"占位失效。"""
+    import nodes as nodes_mod
+
+    class _FakeChunk:
+        def __init__(self, content):
+            self.content = content
+
+    class _FakeJSONLLM:
+        def __init__(self):
+            self.stream_called = False
+            self.invoke_called = False
+
+        def stream(self, prompt):
+            self.stream_called = True
+            return [_FakeChunk('{"think":'), _FakeChunk('"t","speak":"一句话"}')]
+
+        def invoke(self, prompt):
+            self.invoke_called = True
+            raise AssertionError("R2：json_mode 不应再走 invoke（非流式无 token 事件）")
+
+    fake = _FakeJSONLLM()
+    monkeypatch.setattr(nodes_mod, "get_llm", lambda *a, **k: fake)
+    text = nodes_mod._safe_llm_text("prompt", json_mode=True)
+    assert text == '{"think":"t","speak":"一句话"}'
+    assert fake.stream_called and not fake.invoke_called
+
+
+# ---------- R3：_extract_speak 类型防线 ----------
+
+def test_extract_speak_non_string_speak_is_empty():
+    """R3：speak 字段为 dict/None 等非字符串时返回空串（走"解析失败重试"通道），
+    而不是把 Python 对象原样返回、让 speak.strip() 炸穿节点。"""
+    assert _extract_speak({"speak": {"text": "嵌套"}}) == ""
+    assert _extract_speak({"speak": None}) == ""
+    assert _extract_speak({"speak": 123}) == ""
+    assert _extract_speak({"speak": "正常发言"}) == "正常发言"
+
+
+def test_extract_speak_raw_scan_skips_non_string_speak():
+    """R3：raw 扫描路径遇到非字符串 speak 时继续向后扫描，最终回退占位符。"""
+    assert _extract_speak({"raw": '{"think":"t","speak":{"a":1}}'}) == "……"
+    assert _extract_speak({"raw": '{"speak": null}'}) == "……"
+
+
+# ---------- R4：truth 缺失是致命校验项 ----------
+
+def test_check_script_consistency_empty_truth_reported():
+    """R4：truth 空白此前被条件短路放过，揭晓/陈词环节将无真相可揭。"""
+    script = {
+        "suspects": [{"name": "张三", "secret": "s", "personal_script": "p",
+                      "profession": "f", "relation_to_victim": "r", "alibi": "a"}],
+        "murderer": "张三",
+        "truth": "   ",
+        "private_clues": [{"holder": "张三", "content": "线索"}],
+        "relations": [{"from": "张三", "to": "死者", "rel": "我恨死者", "public": True}],
+    }
+    problems = _check_script_consistency(script)
+    assert any("truth（案件真相）缺失" in p for p in problems)
+    # 问题串含 fatal 过滤短语（generate_script_node / generate_script_stream 的
+    # 放行门槛正是按这个短语筛致命问题）——上面的断言已隐含，这里显式锚定语义
+
+
+def test_check_script_consistency_truth_without_names_not_fatal_marker():
+    """R4 边界：truth 有内容但不含嫌疑人名字仍是非致命问题，不得误标 fatal 短语。"""
+    script = {
+        "suspects": [{"name": "张三", "secret": "s", "personal_script": "p",
+                      "profession": "f", "relation_to_victim": "r", "alibi": "a"}],
+        "murderer": "张三",
+        "truth": "某年某月发生了一场命案，与名单里的人无关。",
+        "private_clues": [{"holder": "张三", "content": "线索"}],
+        "relations": [{"from": "张三", "to": "死者", "rel": "我恨死者", "public": True}],
+    }
+    problems = _check_script_consistency(script)
+    assert any("truth 未提到任何嫌疑人名字" in p for p in problems)
+    assert not any("truth（案件真相）缺失" in p for p in problems)
+
+
+# ---------- R7：reveal_clue 归属校验 ----------
+
+def test_human_turn_reveal_clue_ownership(monkeypatch):
+    """R7：reveal_clue 只能公开自己手里的线索；伪造线索降级为占位发言，
+    不进 revealed_clues 账本（防直连 resume 注入全体 AI 提示词）。"""
+    state = {
+        "user_role": "张三", "phase_round": 0,
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四"}]},
+        "distributed_clues": {"张三": ["真线索"], "李四": []},
+        "revealed_clues": {}, "messages": [], "follow_up": 0,
+        "consecutive_followups": 0,
+    }
+    monkeypatch.setattr("nodes.interrupt",
+                        lambda payload: {"action": "reveal_clue", "clue": "伪造的线索"})
+    out = human_turn_node(state)
+    assert "伪造的线索" not in out["messages"][0]["content"]
+    assert "伪造的线索" not in out.get("revealed_clues", {})
+
+    # 自己手里的线索（含调查所得，同渠道）仍然可以公开
+    monkeypatch.setattr("nodes.interrupt",
+                        lambda payload: {"action": "reveal_clue", "clue": "真线索"})
+    out2 = human_turn_node(state)
+    assert "真线索" in out2["messages"][0]["content"]
+    assert out2["revealed_clues"] == {"真线索": "张三"}
+
+
+# ---------- R9：choose_role 非法值重试而非静默回退 ----------
+
+def test_choose_role_reinterrupts_on_invalid(monkeypatch):
+    """R9：非法 resume 不再静默回退 names[0]——重新 interrupt 让调用方重试一次。"""
+    from nodes import choose_role_node
+    calls = []
+
+    def fake_interrupt(payload):
+        calls.append(payload)
+        return "王五" if len(calls) == 1 else "李四"   # 第一次非法，第二次合法
+
+    monkeypatch.setattr("nodes.interrupt", fake_interrupt)
+    out = choose_role_node({"script": {"suspects": [{"name": "张三"}, {"name": "李四"}]}})
+    assert len(calls) == 2
+    assert out["user_role"] == "李四"
+
+
+def test_choose_role_falls_back_after_retry(monkeypatch):
+    """R9：重试仍非法才保底 names[0]，协议层不可能无限 interrupt 循环。"""
+    from nodes import choose_role_node
+    monkeypatch.setattr("nodes.interrupt", lambda payload: "王五")
+    out = choose_role_node({"script": {"suspects": [{"name": "张三"}, {"name": "李四"}]}})
+    assert out["user_role"] == "张三"
+
+
+# ---------- R11：get_murderer 兜底按 truth 实际位置取最后出现者 ----------
+
+def test_get_murderer_fallback_picks_positional_last():
+    """R11：旧实现按名单序取"最后"，注释却声称"truth 中最后出现"——现按位置取。"""
+    # 张三在名单里排前、李四排后，但 truth 文本中张三更晚出现 → 取张三（名单序无关）
+    script = {"truth": "李四先行凶，张三事后协助", "suspects": [{"name": "张三"}, {"name": "李四"}]}
+    assert _get_murderer(script, ["张三", "李四"]) == "张三"
+
+
+def test_get_murderer_fallback_longer_name_wins_on_tie():
+    """R11：子串重叠名（"江叙" ⊂ "江叙白"）位置相同时，长名优先不被短名抢走。"""
+    script = {"truth": "最终江叙白认罪伏法", "suspects": [{"name": "江叙"}, {"name": "江叙白"}]}
+    assert _get_murderer(script, ["江叙", "江叙白"]) == "江叙白"

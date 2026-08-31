@@ -40,6 +40,7 @@
     被模态框边缘截断一半（飞哥截图：左下/右下的绿色圆按钮各被挡一半）。
     改 interaction.navigationButtons = false，模态框干净、按钮不再生成。
 """
+import html
 import re
 
 from pyvis.network import Network
@@ -109,12 +110,14 @@ def build_relations_html(relations: list, suspect_names: list[str]) -> str:
         height="680px",
         width="100%",
         directed=True,           # 有向图：边从 from 指向 to（8-18 第二轮优化）
-        bgcolor="#ffffff",
-        font_color="#1f1f1f",
+        bgcolor="#1a1612",       # L3：暗色底，与 app.py 暗色档案风主题协调
+        font_color="#e8dcc8",
         heading="",
     )
 
     # 节点：嫌疑人用 box 矩形
+    # R10：title 是 vis.js 按 HTML 渲染的悬浮层——name/rel 可能携带 LLM 复读
+    # 用户素材的文本，必须 html.escape，防注入任意标签（label 是纯文本无需转义）
     for name in suspect_names:
         net.add_node(
             name,
@@ -124,7 +127,7 @@ def build_relations_html(relations: list, suspect_names: list[str]) -> str:
             height=48,
             color={"background": "#5b8ff9", "border": "#3a6fd4", "highlight": {"background": "#3a6fd4", "border": "#1f4ea8"}},
             font={"color": "#ffffff", "size": 20, "face": "Microsoft YaHei", "strokeWidth": 0},
-            title=f"<b>{name}</b><br/>嫌疑人",
+            title=f"<b>{html.escape(name)}</b><br/>嫌疑人",
             borderWidth=2,
             margin=8,
         )
@@ -161,13 +164,13 @@ def build_relations_html(relations: list, suspect_names: list[str]) -> str:
         net.add_edge(
             r["from"], r["to"],
             label=display,
-            title=f"<b>{r['from']}</b> → <b>{r['to']}</b><br/>{rel}",
-            color={"color": "#999999", "highlight": "#f5222d"},
+            title=f"<b>{html.escape(r['from'])}</b> → <b>{html.escape(r['to'])}</b><br/>{html.escape(rel)}",
+            color={"color": "#8a7e6e", "highlight": "#f5222d"},
             width=2,
-            font={"size": 16, "color": "#1f1f1f", "face": "Microsoft YaHei",
+            font={"size": 16, "color": "#e8dcc8", "face": "Microsoft YaHei",
                   "align": "horizontal",
-                  "background": "rgba(255,255,255,0.92)",
-                  "strokeWidth": 4, "strokeColor": "#ffffff"},
+                  "background": "rgba(26,22,18,0.92)",
+                  "strokeWidth": 4, "strokeColor": "#1a1612"},
             smooth={"enabled": True, "type": smooth_type, "roundness": roundness},
         )
 
