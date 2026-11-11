@@ -27,12 +27,11 @@
 """
 from __future__ import annotations
 
-import uuid
 import logging
+import uuid
 from typing import Any, Iterator
 
 from langgraph.types import Command
-from langgraph.errors import GraphInterrupt
 
 from graph import build_graph
 
@@ -47,11 +46,6 @@ logger = logging.getLogger(__name__)
 def build_config(thread_id: str) -> dict:
     """thread_id → LangGraph config（全项目唯一的构造点）。"""
     return {"configurable": {"thread_id": thread_id}}
-
-
-def extract_interrupt(result: dict) -> list | None:
-    """从图执行结果里提取 __interrupt__ 列表（无则 None）。"""
-    return result.get("__interrupt__") if isinstance(result, dict) else None
 
 
 def resume(graph, cmd: Command, config: dict) -> dict:

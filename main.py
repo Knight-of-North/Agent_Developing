@@ -3,17 +3,21 @@ AI 剧本杀主持人 · 入口（Phase 5：用户选择角色，interrupt 人�
 
 运行方式：python main.py
 """
-import uuid
-from nodes import _parse_names
-from interrupt_handler import validate_vote, is_abstain
-from game_session import GameSession
-from logging_config import setup_logging, set_game_id
-from config import (
-    MAX_THEME_LEN, MAX_STORY_TIME_LEN, MAX_STORY_LOCATION_LEN,
-    MAX_BG_STORY_LEN, MAX_CHAT_LEN, INVESTIGATE_LIMIT,
-)
-
 import logging
+import uuid
+
+from config import (
+    INVESTIGATE_LIMIT,
+    MAX_BG_STORY_LEN,
+    MAX_CHAT_LEN,
+    MAX_STORY_LOCATION_LEN,
+    MAX_STORY_TIME_LEN,
+    MAX_THEME_LEN,
+)
+from game_session import GameSession
+from interrupt_handler import is_abstain, validate_vote
+from logging_config import set_game_id, setup_logging
+from names import _parse_names, sanitize_custom_names
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -50,7 +54,7 @@ def print_role_card(result):
             print(f"    · {c}")
     else:
         print("    · （你没有任何私密线索，只能靠盘问别人）")
-    print(f"  目标：隐瞒秘密，同时从别人嘴里套线索、找出真凶")
+    print("  目标：隐瞒秘密，同时从别人嘴里套线索、找出真凶")
     print("=" * 46)
 
 
@@ -68,9 +72,8 @@ if __name__ == "__main__":
     story_time = input("故事发生时间（回车跳过，如：1935年深秋 / 宋代江南）：").strip()[:MAX_STORY_TIME_LEN]
     story_location = input("故事发生地点（回车跳过，如：上海滩租界 / 湖南师大图书馆）：").strip()[:MAX_STORY_LOCATION_LEN]
     custom_names = _parse_names(input("自定义嫌疑人名字（回车跳过用随机；填写如：张三,李四,王五）："))
-    # F2：名字白名单校验，过滤含特殊字符的名字
-    import re as _re
-    custom_names = [n for n in custom_names if _re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9·]{2,10}", n or "")]
+    # F2：名字白名单校验，过滤含特殊字符的名字（与 Web 端共用 names.sanitize_custom_names）
+    custom_names = sanitize_custom_names(custom_names)
     # 讨论节奏（8-20 审查修复：与 Web 版对齐，终端版也可调快/标准/深入 → 每人 2/3/4 轮）
     pace = input("讨论节奏（回车标准；快=每人2轮 / 标准=每人3轮 / 深入=每人4轮）：").strip()
     rounds_per_player = {"快": 2, "深入": 4}.get(pace, 3)
@@ -90,7 +93,7 @@ if __name__ == "__main__":
                 choice = input("输入 r 重试，其他键退出：").strip().lower()
                 if choice != "r":
                     print("已退出当前对局。")
-                    raise SystemExit(1)
+                    raise SystemExit(1) from None
 
     # 第一次调用：跑到第一个 interrupt（选角色）时暂停
     try:
@@ -104,7 +107,7 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error("剧本生成失败：%s", e, exc_info=True)
         print(f"\n⚠️ 剧本生成失败（{type(e).__name__}）：{e}")
-        raise SystemExit(1)
+        raise SystemExit(1) from None
 
     # ---- 边玩边打印：只打印"新增"的消息 ----
     printed = 0
@@ -226,7 +229,13 @@ if __name__ == "__main__":
     print("【投票结果】")
     for voter, target in result.get("votes", {}).items():
         print(f"  · {voter} → {target or '（弃权）'}")
-    print(f"\n得票最多：{result.get('vote_winner', '无人')}")
+    outcome = result.get("vote_outcome", "")
+    if outcome == "tie":
+        print(f"\n得票最多：平票（{'、'.join(result.get('tie_candidates') or [])}）")
+    elif outcome == "no_votes":
+        print("\n得票最多：无人投票（全员弃权）")
+    else:
+        print(f"\n得票最多：{result.get('vote_winner') or '无人'}")
     print(f"票数分布：{result.get('vote_counts', {})}")
     print("=" * 46)
     sess.cleanup()

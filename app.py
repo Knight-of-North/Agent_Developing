@@ -16,22 +16,29 @@ AI 剧本杀主持人 · 图形界面版（Streamlit）
 4. 阶段幕布 key = thread_id + phase，跨局重玩不串动画
 """
 import json
+import logging
 import re
 import uuid
-import html
-import logging
+
 import streamlit as st
 from langgraph.types import Command
-from graph import build_graph
-from nodes import generate_script_stream, _parse_names, ScriptGenerationError
-from interrupt_handler import get_interrupt, get_interrupt_type, validate_vote, is_abstain, is_silence
-from game_session import build_config
-from visualization import build_relations_html
-from logging_config import setup_logging, set_game_id
+
 from config import (
-    MAX_THEME_LEN, MAX_STORY_TIME_LEN, MAX_STORY_LOCATION_LEN, MAX_BG_STORY_LEN,
-    MAX_CHAT_LEN, DEV_MODE, INVESTIGATE_LIMIT,
+    DEV_MODE,
+    INVESTIGATE_LIMIT,
+    MAX_BG_STORY_LEN,
+    MAX_CHAT_LEN,
+    MAX_STORY_LOCATION_LEN,
+    MAX_STORY_TIME_LEN,
+    MAX_THEME_LEN,
 )
+from game_session import build_config
+from graph import build_graph
+from interrupt_handler import get_interrupt, get_interrupt_type, is_abstain, is_silence, validate_vote
+from logging_config import set_game_id, setup_logging
+from names import _parse_names, sanitize_custom_names
+from nodes import ScriptGenerationError, generate_script_stream
+from visualization import build_relations_html
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -632,7 +639,7 @@ def _run_stream(graph, cmd, config):
                 # 节点完成：先清掉"思考中"占位，再把新产生的公开消息逐条封存显示
                 thinking_ph.empty()
                 thinking = False
-                for node, update in d.items():
+                for _node, update in d.items():
                     if isinstance(update, dict):
                         for m in update.get("messages", []):
                             # L5：发言内容按字面量渲染（防 markdown 注入聊天流）
@@ -739,9 +746,7 @@ if not st.session_state.started:
         location_val = story_location.strip()[:MAX_STORY_LOCATION_LEN]
 
         # F2：自定义名字白名单校验（只允许中英数字和间隔号，2-10 字，防名字里塞 prompt）
-        def _valid_name(n: str) -> bool:
-            return bool(re.fullmatch(r"[\u4e00-\u9fa5A-Za-z0-9·]{2,10}", n or ""))
-        custom_names = [n for n in custom_names if _valid_name(n)]
+        custom_names = sanitize_custom_names(custom_names)
 
         # 真流式生成剧本：边生成边显示，而不是盯着 spinner 干等。
         # generate_script_stream 是生成器，逐 token yield；手动 next() 迭代，
@@ -885,7 +890,8 @@ else:
                     sprof = s.get("profession", "")
                     mark = " ←（你）" if sname == user_role else ""
                     # markdown 渲染（比 st.write 在 sidebar 长内容里更稳定，不丢字符）
-                    st.markdown(f"· **{sname}**{mark}  _{sprof or '（未提供职业）'}_")
+                    # L5 收口：剧本字段全部来自 LLM，按字面量渲染，防被当成排版指令
+                    st.markdown(f"· **{_sanitize_md(sname)}**{mark}  _{_sanitize_md(sprof) or '（未提供职业）'}_")
         st.divider()
         # 玩家是凶手时给特殊提示（否则会陷入"知道自己是凶手却无事可做"的断裂）
         if result.get("user_is_murderer"):
@@ -893,24 +899,24 @@ else:
         # 结构化角色信息：让玩家一眼锚定"我是谁、我和死者什么关系、我要干嘛"
         if user_profession:
             st.caption("💼 职业")
-            st.markdown(user_profession)
+            st.markdown(_sanitize_md(user_profession))
         if user_relation:
             st.caption("🔗 与死者的关系")
-            st.markdown(user_relation)
+            st.markdown(_sanitize_md(user_relation))
         if user_alibi:
             st.caption("🕐 你的不在场证明")
-            st.markdown(user_alibi)
+            st.markdown(_sanitize_md(user_alibi))
         if user_task:
             st.caption("🎯 你的任务")
-            st.markdown(user_task)
+            st.markdown(_sanitize_md(user_task))
         st.divider()
         st.caption("你的秘密（别主动暴露）")
-        st.info(user_secret)
+        st.info(_sanitize_md(user_secret))
         st.divider()
         st.caption("🔍 你掌握的私密线索（只有你知道）")
         if user_clues:
             for c in user_clues:
-                st.markdown(f"· {c}")
+                st.markdown(f"· {_sanitize_md(c)}")
         else:
             st.markdown("· （你没有任何私密线索，只能靠盘问别人）")
         # 注：原"嫌疑人名单"区域已移除（已合并到顶部 expander，避免重复 + 被裁）
@@ -941,7 +947,7 @@ else:
     # 否则凶手开局就暴露。关系清单也只提取「涉及玩家自己」的边（自己知情，无论是否公开）。
     if user_script:
         with st.expander("📖 你的个人剧本（开局先读，发言和推理都靠它）", expanded=True):
-            st.markdown(user_script)
+            st.markdown(_sanitize_md(user_script))
             my_relations = [
                 r for r in script.get("relations", [])
                 if r.get("from") == user_role or r.get("to") == user_role
@@ -954,7 +960,7 @@ else:
                     if r.get("from") == user_role:
                         # 玩家是 from：rel 已经是"我..."第一人称，直接展示
                         other = r.get("to", "?")
-                        st.markdown(f"· **{other}**：{rel_text}")
+                        st.markdown(f"· **{_sanitize_md(other)}**：{_sanitize_md(rel_text)}")
                     else:
                         # 玩家是 to：rel 是 from 视角的"我..."，把"我"替换成 from 名字。
                         # 飞哥 8-19 反馈：括号里"X视角"暗示第一人称，改成"X·第三人称"
@@ -962,7 +968,7 @@ else:
                         other = r.get("from", "?")
                         # 占位符保住"我们"里的"我"不被误替换（"我们互相看不惯" → 不能变"张三们互相看不惯"）
                         rel_translated = rel_text.replace("我们", "⌈W⌉").replace("我", other).replace("⌈W⌉", "我们")
-                        st.markdown(f"· **{other}**（{other}·第三人称）：{rel_translated}")
+                        st.markdown(f"· **{_sanitize_md(other)}**（{_sanitize_md(other)}·第三人称）：{_sanitize_md(rel_translated)}")
 
     # 对话历史（主区域）：直接渲染。
     # 真流式已经在"等待时"实时显示过了，这里无需再打字机回放。
@@ -1072,8 +1078,15 @@ else:
             # M9 配套：弃权票（None）显示为「（弃权）」而非 Python 的 None
             for voter, target in result.get("votes", {}).items():
                 st.write(f"· {voter} → {target or '（弃权）'}")
-            st.write(f"**得票最多：{result.get('vote_winner', '无人')}**")
-            # L4 配套：平票时并列名单来自结构化字段 tie_candidates，不再反解字符串
+            # 2026-11：vote_winner 只存真实人名，平票/无人投票由 vote_outcome 表达
+            outcome = result.get("vote_outcome", "")
+            winner = result.get("vote_winner", "")
+            if outcome == "tie":
+                st.write(f"**得票最多：平票（{'、'.join(result.get('tie_candidates') or [])}）**")
+            elif outcome == "no_votes":
+                st.write("**得票最多：无人投票（全员弃权）**")
+            else:
+                st.write(f"**得票最多：{winner or '无人'}**")
             if result.get("tie_candidates"):
                 st.write(f"平票并列：{'、'.join(result['tie_candidates'])}")
             st.write(f"票数分布：{result.get('vote_counts', {})}")

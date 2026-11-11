@@ -1,0 +1,45 @@
+name: CI
+
+# 为什么要有 CI：这个仓库的核心资产是 158 个"不烧 token"的纯函数测试。
+# 没有 CI 时，这些测试只有在自己记得跑的时候才存在；有了 CI，任何一次
+# 改 prompt / 改规则的提交都会被自动验证，回归在合并前就暴露。
+# 全程不发真实 LLM 请求（pytest.ini 的 testpaths 已隔离手动联网脚本）。
+
+on:
+  push:
+    branches: [main, ShuFei]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 = README 推荐环境；3.12 = 向上兼容性探针
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装依赖（按 lock，保证可复现）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install "ruff>=0.6"
+
+      - name: 静态检查（未用导入 / 未定义名 / import 排序）
+        run: ruff check . --output-format=github
+
+      - name: 单元测试（纯函数，不调 LLM）
+        run: pytest -q
+        env:
+          # 测试不构造 LLM、不发请求；占位 key 只为防止任何意外初始化读到 None
+          DEEPSEEK_API_KEY: ci-dummy-key

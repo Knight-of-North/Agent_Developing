@@ -25,45 +25,76 @@
 - config.py     集中配置（温度 / 轮数 / 限制）
 - 本文件        纯节点编排 + llm 配置
 """
-import os
-import time
+import contextvars
 import logging
+import os
 import random
 import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dotenv import load_dotenv
+
+import httpx
 from langchain_deepseek import ChatDeepSeek
 from langgraph.types import interrupt
-import httpx
 
-from game_state import GameState
 from config import (
-    LLM_CONFIG, LLM_TIMEOUT, LLM_MAX_RETRIES, TRUST_ENV, LLM_REASONING_EFFORT,
-    ROUNDS_PER_PLAYER, INVESTIGATE_LIMIT, MAX_CONSECUTIVE_FOLLOWUPS,
-    MAX_CHAT_LEN, VOTE_CONCURRENT, VOTE_MAX_WORKERS, SCRIPT_MAX_ATTEMPTS,
+    INVESTIGATE_LIMIT,
+    LLM_CONFIG,
+    LLM_MAX_RETRIES,
+    LLM_REASONING_EFFORT,
+    LLM_TIMEOUT,
+    MAX_CHAT_LEN,
+    MAX_CONSECUTIVE_FOLLOWUPS,
+    ROUNDS_PER_PLAYER,
+    SCRIPT_MAX_ATTEMPTS,
+    TRUST_ENV,
+    TURN_BUDGET_SECONDS,
+    VOTE_CONCURRENT,
+    VOTE_MAX_WORKERS,
 )
-from names import _parse_names, _pick_suspect_names
-from validators import _parse_json, _enforce_names, _normalize_secrets, _fallback_clues, _filter_relations, _ensure_clues, _extract_speak
-from interrupt_handler import SILENCE_WORDS, ABSTAIN_WORDS
+from game_state import GameState
+from interrupt_handler import ABSTAIN_WORDS, SILENCE_WORDS
+from names import _pick_suspect_names
+from prompts import (
+    _build_script_prompt,
+    build_ai_turn_prompt,
+    build_dm_intro_prompt,
+    build_final_statement_prompt,
+    build_midpoint_prompt,
+    build_reveal_prompt,
+    build_self_intro_prompt,
+    build_tiebreak_prompt,
+    build_vote_prompt,
+    murderer_defense_pool_text,
+)
+
+# 兼容转发（拆分 rules.py 时留下的公开导入路径）：
+# 本文件内部已不直接调用这两个函数，但 tests / 外部脚本仍按 `nodes._clue_mentioned`
+# 的老路径导入。保留转发并显式 noqa，避免"删未用导入"把兼容层一起删掉。
 from rules import (
-    clue_mentioned as _clue_mentioned,
-    update_revealed_clues as _update_revealed_clues,
-    detect_addressed as _detect_addressed,
+    apply_followup_guard as _apply_followup_guard,
+    clue_mentioned as _clue_mentioned,  # noqa: F401
     clue_topic_map as _clue_topic_map,
     count_accusations_against as _count_accusations_against,
-    judge_ending as _judge_ending,
+    detect_addressed as _detect_addressed,  # noqa: F401
     get_murderer as _get_murderer,
-    apply_followup_guard as _apply_followup_guard,
+    judge_ending as _judge_ending,
+    update_revealed_clues as _update_revealed_clues,
 )
-from prompts import (
-    _build_script_prompt, murderer_defense_pool_text,
-    build_dm_intro_prompt, build_self_intro_prompt, build_midpoint_prompt,
-    build_ai_turn_prompt, build_vote_prompt, build_final_statement_prompt,
-    build_reveal_prompt, build_tiebreak_prompt,
+from validators import (
+    _coerce_text,
+    _enforce_names,
+    _ensure_clues,
+    _extract_speak,
+    _fallback_clues,
+    _filter_relations,
+    _normalize_secrets,
+    _parse_json,
 )
 
-load_dotenv()
+# `.env` 由 config.py 在 import 时加载（必须先于任何 os.getenv）；
+# 这里不再调用 load_dotenv，避免"两处加载、时序仍错"的假象。
 
 logger = logging.getLogger(__name__)
 
@@ -161,52 +192,148 @@ class ScriptGenerationError(RuntimeError):
     """剧本生成致命问题（凶手无效等），重试耗尽后抛出，让前端提示重开。"""
 
 
-def _postprocess_script(raw_text: str, names: list[str]) -> tuple[dict, list[str]]:
+def _run_concurrently(fn, items: list, *, label: str) -> list:
+    """并发执行 fn(item)（保序），单条失败只重跑该条，不重跑全量。
+
+    三个节点（自我介绍 / AI 投票 / 平票辩护）此前各抄一份"线程池 + 异常回退串行"：
+    回退时把**已成功的条目**也全部重跑，等于重复烧 token。这里统一实现，
+    并把回退粒度收窄到真正失败的那几条。
+
+    contextvars：ThreadPoolExecutor 的 worker 不继承提交线程的上下文，
+    直接 submit 会让日志里的对局 ID（gid）变成 "-"。每个任务用一份
+    copy_context()（互不复用，避免同一 Context 并发 enter 抛 RuntimeError），
+    worker 内的日志就能正确带上对局标识。
+    """
+    if not items:
+        return []
+    if not (VOTE_CONCURRENT and len(items) > 1):
+        return [fn(item) for item in items]
+
+    results: list = [None] * len(items)
+    failed: list[int] = []
+    with ThreadPoolExecutor(max_workers=min(VOTE_MAX_WORKERS, len(items))) as ex:
+        futures = {
+            ex.submit(contextvars.copy_context().run, fn, item): i
+            for i, item in enumerate(items)
+        }
+        for future, idx in futures.items():
+            try:
+                results[idx] = future.result()
+            except Exception as e:   # noqa: BLE001 - 单条失败降级为串行重试
+                logger.warning("%s 第 %d 条并发失败（%s），单独重试", label, idx, type(e).__name__)
+                failed.append(idx)
+    for idx in sorted(failed):
+        results[idx] = fn(items[idx])
+    return results
+
+
+class ScriptProblem(str):
+    """一条剧本自洽问题：**既是字符串，又携带 fatal 标记**。
+
+    为什么继承 str 而不是用 dataclass：
+    1. 问题文本此前是纯字符串，被 `"; ".join(problems)`、`"xxx" in problems`、
+       拼进重试 prompt 等 6 处直接消费；换成 dataclass 会连锁改一大片。
+    2. 旧实现用 `"murderer" in p or "没有任何线索" in p` 反推"是否致命"——
+       改一句文案就静默失效，且 generate_script_node / generate_script_stream
+       各抄了一份判定。现在 fatal 是数据，不是从文案里猜出来的。
+    3. str 子类让所有既有字符串用法零改动，测试也无须重写。
+    """
+
+    fatal: bool
+
+    def __new__(cls, message: str, fatal: bool = False):
+        obj = super().__new__(cls, message)
+        obj.fatal = fatal
+        return obj
+
+
+def _is_fatal(problem) -> bool:
+    """兼容裸字符串（外部/测试构造）——没有 fatal 标记一律按非致命处理。"""
+    return bool(getattr(problem, "fatal", False))
+
+
+def _drain(generator) -> dict:
+    """把生成器跑到 StopIteration，返回它的 return 值。
+
+    generate_script_node（图节点，不展示 token）与 generate_script_stream
+    （Web 端，逐 token 展示）共用同一份重试实现：节点把 token 丢掉即可，
+    不必再维护第二套"invoke 版"生成循环（两份 fatal 判定曾各写一遍）。
+    """
+    while True:
+        try:
+            next(generator)
+        except StopIteration as stop:
+            return stop.value
+
+
+def _postprocess_script(raw_text: str, names: list[str]) -> tuple[dict, list[ScriptProblem]]:
     """剧本后处理流水线（解析 + 兜底 + 自洽校验），node 和 stream 共用（L5）。
 
     返回 (script, problems)。
+
+    防御：整条流水线包在 try 里——LLM 返回的 JSON 结构可能荒唐（suspects 是 dict、
+    secret 是数字……），任何一处漏掉的属性访问都会让整局生成直接失败。
+    兜底策略是"记一条致命问题让上层重试"，而不是带病放行。
     """
-    script = _parse_json(raw_text)
-    script = _fallback_clues(script)
-    script = _enforce_names(script, names)
-    script = _normalize_secrets(script)
-    script = _filter_relations(script)
-    script = _ensure_clues(script)
-    problems = _check_script_consistency(script)
+    try:
+        script = _parse_json(raw_text)
+        script = _fallback_clues(script)
+        script = _enforce_names(script, names)
+        script = _normalize_secrets(script)
+        script = _filter_relations(script)
+        script = _ensure_clues(script)
+        problems = _check_script_consistency(script)
+    except Exception as e:   # noqa: BLE001 - 任何解析/结构异常都要转成可重试的问题
+        logger.warning("剧本后处理异常（%s）：%s", type(e).__name__, e, exc_info=True)
+        return {}, [ScriptProblem(
+            f"剧本结构异常（{type(e).__name__}），无法解析为标准格式，请严格按 JSON schema 重出",
+            fatal=True,
+        )]
     return script, problems
 
 
-def _check_script_consistency(script: dict) -> list[str]:
-    """剧本自洽性确定性检查，返回问题列表（空列表 = 通过）。"""
-    problems = []
+def _check_script_consistency(script: dict) -> list[ScriptProblem]:
+    """剧本自洽性确定性检查，返回问题列表（空列表 = 通过）。
+
+    致命项（fatal=True）交给上层决定"重试耗尽就报错"：
+    murderer 无效 / 没有任何线索 / truth 缺失——这三项放行会让游戏逻辑全错。
+    """
+    problems: list[ScriptProblem] = []
     suspects = script.get("suspects") or []
+    if not isinstance(suspects, list):
+        suspects = []
     names = [s.get("name", "") for s in suspects if isinstance(s, dict) and s.get("name")]
     truth = script.get("truth", "")
 
     # R4：truth 缺失/空白的剧本此前能带病通过校验（条件短路跳过），
     # 揭晓与最终陈词环节将无真相可揭——与 murderer 同级，硬性必填。
     if not (isinstance(truth, str) and truth.strip()):
-        problems.append("truth（案件真相）缺失或为空，必须写明作案动机与完整手法")
+        problems.append(ScriptProblem(
+            "truth（案件真相）缺失或为空，必须写明作案动机与完整手法", fatal=True))
         truth = ""
 
     if truth and names and not any(n and n in truth for n in names):
-        problems.append("truth 未提到任何嫌疑人名字")
+        problems.append(ScriptProblem("truth 未提到任何嫌疑人名字"))
 
     # F4：murderer 字段必填且必须在名单内（之前漏检，导致 truth 子串兜底误判凶手）
     murderer = script.get("murderer", "")
     if not murderer or murderer not in names:
-        problems.append(f"murderer 字段缺失或不在嫌疑人名单内（当前：{murderer!r}），必须精确等于某个嫌疑人 name")
+        problems.append(ScriptProblem(
+            f"murderer 字段缺失或不在嫌疑人名单内（当前：{murderer!r}），必须精确等于某个嫌疑人 name",
+            fatal=True,
+        ))
 
     for s in suspects:
         if not isinstance(s, dict):
             continue
-        secret = s.get("secret", "")
+        secret = _coerce_text(s.get("secret", ""))
         forbidden = s.get("forbidden", []) or []
-        if secret and forbidden and not any(w and w in secret for w in forbidden):
-            problems.append(f"{s.get('name', '?')} 的 forbidden 词未出现在 secret 里")
+        if secret and isinstance(forbidden, list) and forbidden \
+                and not any(isinstance(w, str) and w and w in secret for w in forbidden):
+            problems.append(ScriptProblem(f"{s.get('name', '?')} 的 forbidden 词未出现在 secret 里"))
 
     if not (script.get("private_clues") or script.get("public_clues")):
-        problems.append("没有任何线索")
+        problems.append(ScriptProblem("没有任何线索", fatal=True))
 
     # 结构化字段非空检查
     empty_field_suspects = []
@@ -222,15 +349,16 @@ def _check_script_consistency(script: dict) -> list[str]:
         if missing:
             empty_field_suspects.append(f"{name} 缺 {', '.join(missing)}")
     if empty_field_suspects:
-        problems.append(
+        problems.append(ScriptProblem(
             "以下嫌疑人的结构化字段仍为空/占位符，必须独立写齐（不能用『待补充』占位）："
             + "; ".join(empty_field_suspects)
-        )
+        ))
 
     relations = script.get("relations") or []
     public_relations = [r for r in relations if isinstance(r, dict) and r.get("public")]
     if not public_relations and len(names) >= 2:
-        problems.append("relations 数组没有公开边（人物关系图会显示『剧本未生成公开关系』，必须至少 1 条公开关系）")
+        problems.append(ScriptProblem(
+            "relations 数组没有公开边（人物关系图会显示『剧本未生成公开关系』，必须至少 1 条公开关系）"))
 
     # 公开边里至少 2 条涉及死者
     victim_edges = [
@@ -238,10 +366,10 @@ def _check_script_consistency(script: dict) -> list[str]:
         if isinstance(r, dict) and (r.get("from") == "死者" or r.get("to") == "死者")
     ]
     if public_relations and len(victim_edges) < 2:
-        problems.append(
+        problems.append(ScriptProblem(
             "relations 的公开边里直接涉及「死者」的不足 2 条（关系图里死者会被边缘化，"
             "必须至少 2 条公开边的一端是「死者」）"
-        )
+        ))
 
     # 嫌疑人之间也要有公开边
     if public_relations and len(names) >= 4:
@@ -255,10 +383,10 @@ def _check_script_consistency(script: dict) -> list[str]:
         ]
         threshold = max(2, (len(names) + 1) // 2)
         if len(suspect_pair_edges) < threshold:
-            problems.append(
+            problems.append(ScriptProblem(
                 f"嫌疑人之间的公开边不足 {threshold} 条（嫌疑人之间也要互相连线，"
                 f"不能全靠嫌疑人→死者。当前 {len(suspect_pair_edges)} 条，阈值 {threshold} 条）"
-            )
+            ))
 
     return problems
 
@@ -269,6 +397,7 @@ def _summarize_personal_script(text: str, limit: int = 120) -> str:
     不调 LLM，避免额外开销；注入发言 prompt 时用摘要替代 150-250 字全文，
     降低 token 占用和"复述原文泄露秘密"的风险。
     """
+    text = _coerce_text(text)   # LLM 可能把 personal_script 写成数字/对象，先归一
     if not text:
         return "（未提供）"
     if len(text) <= limit:
@@ -286,6 +415,10 @@ def generate_script_node(state: GameState) -> dict:
 
     两个入口：已有 script（前端预生成）则跳过；否则 LLM 生成。
     生成后自洽校验，不过则重试；致命问题（murderer 无效）重试耗尽抛 ScriptGenerationError（H1）。
+
+    实现复用 generate_script_stream：图节点不需要逐 token 展示，把生成器跑干
+    并丢掉 token 即可——重试循环与致命判定只保留一份实现（此前 invoke/stream
+    两个版本各抄一遍 fatal 判定，改一处文案另一处就静默失效）。
     """
     if state.get("script"):
         return {"current_phase": "intro"}
@@ -301,31 +434,49 @@ def generate_script_node(state: GameState) -> dict:
     # 多会话共享进程时 A 局不再消耗 B 局的名字池。返回值经 operator.add 累积进状态。
     prior_used = set(state.get("used_names", []))
     names = _pick_suspect_names(background, custom_names, used=prior_used)
+
+    script = _drain(_iter_script_attempts(
+        theme, background, names, background_story, story_time, story_location,
+    ))
+    # L7：本局抽用的名字写回状态（operator.add 累积），下局在同一 thread 内自动回避
+    return {"script": script, "current_phase": "intro", "used_names": names}
+
+
+def _iter_script_attempts(theme: str, background: str, names: list[str], background_story: str,
+                          story_time: str, story_location: str):
+    """剧本生成的重试循环（唯一实现）。yield token/retry 事件，return 最终 script。
+
+    调用方：generate_script_stream 直接转发事件；generate_script_node 用 _drain 丢弃事件。
+    """
     prompt = _build_script_prompt(theme, background, names, background_story, story_time, story_location)
 
-    script = None
-    problems = []
+    script: dict = {}
+    problems: list[ScriptProblem] = []
     for attempt in range(SCRIPT_MAX_ATTEMPTS):
         current_prompt = prompt if attempt == 0 else _build_script_prompt(
             theme, background, names, background_story, story_time, story_location,
-            previous_problems=problems)
-        # 剧本生成用 script 用途（高温度）
-        resp = get_llm("script").invoke(current_prompt)
-        script, problems = _postprocess_script(resp.content, names)
+            previous_problems=[str(p) for p in problems])
+        parts = []
+        for chunk in get_llm("script").stream(current_prompt):
+            token = chunk.content or ""
+            if token:
+                parts.append(token)
+                yield ("token", token)
+
+        script, problems = _postprocess_script("".join(parts), names)
         if not problems:
             break
-        logger.warning("剧本自洽校验未通过（第 %d 次）：%s", attempt + 1, problems)
+        logger.warning("剧本自洽校验未通过（第 %d 次）：%s", attempt + 1, list(problems))
+        yield ("retry", "剧本校验未通过，正在重新生成……")
 
     # 致命问题不放行：murderer 无效 / 无线索 / truth 缺失，游戏逻辑会全错
     # （R4：只拦"truth 缺失"，"truth 未提到名字"仍是非致命问题）
-    fatal = [p for p in problems
-             if ("murderer" in p or "没有任何线索" in p or "truth（案件真相）缺失" in p)]
+    fatal = [p for p in problems if _is_fatal(p)]
     if fatal:
-        raise ScriptGenerationError("; ".join(fatal))
+        raise ScriptGenerationError("; ".join(str(p) for p in fatal))
     if problems:
-        logger.warning("剧本存在非致命问题，放行：%s", problems)
-    # L7：本局抽用的名字写回状态（operator.add 累积），下局在同一 thread 内自动回避
-    return {"script": script, "current_phase": "intro", "used_names": names}
+        logger.warning("剧本存在非致命问题，放行：%s", list(problems))
+    return script
 
 
 def generate_script_stream(theme: str, background: str, background_story: str = "", custom_names: list[str] | None = None, story_time: str = "", story_location: str = "", used: set[str] | None = None):
@@ -340,32 +491,13 @@ def generate_script_stream(theme: str, background: str, background_story: str = 
     传入的集合会被 _pick_suspect_names 原地 update（本次抽用的名字写回集合）。
     """
     names = _pick_suspect_names(background, custom_names, used=used)
-    prompt = _build_script_prompt(theme, background, names, background_story, story_time, story_location)
-
-    script = None
-    problems = []
-    for attempt in range(SCRIPT_MAX_ATTEMPTS):
-        current_prompt = prompt if attempt == 0 else _build_script_prompt(
-            theme, background, names, background_story, story_time, story_location,
-            previous_problems=problems)
-        parts = []
-        for chunk in get_llm("script").stream(current_prompt):
-            token = chunk.content or ""
-            if token:
-                parts.append(token)
-                yield ("token", token)
-
-        script, problems = _postprocess_script("".join(parts), names)
-        if not problems:
-            break
-        logger.warning("剧本自洽校验未通过（第 %d 次）：%s", attempt + 1, problems)
-        yield ("retry", "剧本校验未通过，正在重新生成……")
-
-    fatal = [p for p in problems
-             if ("murderer" in p or "没有任何线索" in p or "truth（案件真相）缺失" in p)]
-    if fatal:
-        raise ScriptGenerationError("; ".join(fatal))
-    return script
+    inner = _iter_script_attempts(theme, background, names, background_story, story_time, story_location)
+    while True:
+        try:
+            event = next(inner)
+        except StopIteration as stop:
+            return stop.value
+        yield event
 
 
 def distribute_clues_node(state: GameState) -> dict:
@@ -485,15 +617,7 @@ def self_intro_node(state: GameState) -> dict:
         return {"speaker": name, "content": f"（自我介绍）{resp}"}
 
     targets = [s for s in suspects if s.get("name", "") != user_role]
-    if VOTE_CONCURRENT and len(targets) > 1:
-        try:
-            with ThreadPoolExecutor(max_workers=min(VOTE_MAX_WORKERS, len(targets))) as ex:
-                intro_messages = list(ex.map(_intro, targets))   # map 保序：并发执行、按 suspects 顺序输出
-        except Exception as e:
-            logger.warning("并发自我介绍失败（%s），回退串行", type(e).__name__)
-            intro_messages = [_intro(s) for s in targets]
-    else:
-        intro_messages = [_intro(s) for s in targets]
+    intro_messages = _run_concurrently(_intro, targets, label="自我介绍")
 
     return {"messages": intro_messages}
 
@@ -558,7 +682,12 @@ def ai_player_turn_node(state: GameState) -> dict:
     free_followup = is_followup_reply and followup_count < fuse_limit
     name = speaker.get("name", "嫌疑人")
     secret = speaker.get("secret", "无")
-    forbidden = speaker.get("forbidden", [])
+    # R3 加强：forbidden 若被 LLM 写成字符串，`for w in forbidden` 会退化成
+    # **逐字检测**（"秘密"→ 检查"秘""密"两个字），正常台词极易误判泄密。
+    # 这里统一收窄成 str 列表，下游只需按词判断。
+    _raw_forbidden = speaker.get("forbidden", [])
+    forbidden = ([w for w in _raw_forbidden if isinstance(w, str) and w]
+                 if isinstance(_raw_forbidden, list) else [])
     personality = speaker.get("personality", "")
     speech_style = speaker.get("speech_style", "")
     profession = speaker.get("profession", "")
@@ -618,9 +747,18 @@ def ai_player_turn_node(state: GameState) -> dict:
     think, speak = "", "……"
     feedback = ""
     attempts = 3
+    # 时间预算：重试层数会相乘（3 次尝试 × json_mode 的"JSON 失败→普通模式"回退
+    # × SDK max_retries=3），最坏一个回合能发出 24 次请求、把页面挂住十几分钟。
+    # 超预算就停止重试、走确定性兜底——宁可一句过场，也不冻结 UI。
+    deadline = time.time() + TURN_BUDGET_SECONDS
     for attempt in range(attempts):
-        # M7：json_mode 走 DeepSeek JSON 输出模式（失败自动回退普通模式）
-        out = _parse_json(_safe_llm_text(prompt + feedback, fallback="", json_mode=True))
+        if time.time() > deadline:
+            logger.warning("AI 发言超出时间预算（%ds），停止重试 speaker=%s", TURN_BUDGET_SECONDS, name)
+            break
+        # M7：json_mode 只在第 1 次尝试启用（它自带一次普通模式回退）；
+        # 后续重试直接走普通流式，把最坏请求数从 24 压到 8 以内。
+        out = _parse_json(_safe_llm_text(prompt + feedback, fallback="",
+                                        json_mode=(attempt == 0)))
         think = out.get("think", "")
         speak = _extract_speak(out)
         # R3：forbidden 元素同样可能是 LLM 输出的任意 JSON 值，非字符串直接
@@ -638,10 +776,11 @@ def ai_player_turn_node(state: GameState) -> dict:
                         "3. 语气保持自然：刻意回避本身会露馅，要让「不提」看起来像「不在意」。")
         else:
             feedback = "\n\n⚠️ 输出格式有误，请严格输出包含 think 和 speak 两个字段的 JSON。"
-    else:
-        # 重试耗尽：确定性脱敏（F8 改进：整句替换为回避话术，而非 □ 欲盖弥彰）
-        if any(isinstance(w, str) and w and w in speak for w in forbidden):
-            speak = "此事我不想多谈，你们与其盯着我，不如去问问别人。"
+
+    # 确定性脱敏（F8 改进：整句替换为回避话术，而非 □ 欲盖弥彰）。
+    # 放在循环外而不是 for-else：超预算 break 时也要兜底，不能漏掉最后一句。
+    if any(isinstance(w, str) and w and w in speak for w in forbidden):
+        speak = "此事我不想多谈，你们与其盯着我，不如去问问别人。"
 
     revealed = _update_revealed_clues(speak, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
     new_memory = (state.get("agent_memory", {}).get(name, []) + [speak])[-3:]
@@ -748,7 +887,10 @@ def human_turn_node(state: GameState) -> dict:
                 text, targets, state.get("follow_up", 0), state.get("consecutive_followups", 0))
     else:
         # str = 普通发言（F2：截断超长输入）。守卫逻辑与 dict 分支共用一份实现（M3）。
-        text = str(action)[:MAX_CHAT_LEN]
+        # action 可能为 None（协议误用/空 resume）——直接 str(None) 会把 "None"
+        # 当成台词广播给所有人，这里归一为空输入再降级成沉默占位。
+        raw_text = "" if action is None else str(action)
+        text = raw_text.strip()[:MAX_CHAT_LEN] or "（环视众人，沉默不语）"
         revealed = _update_revealed_clues(text, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
         addressed, follow_up, consecutive = _apply_followup_guard(
             text, targets, state.get("follow_up", 0), state.get("consecutive_followups", 0))
@@ -764,10 +906,12 @@ def human_turn_node(state: GameState) -> dict:
     if investigated_new:
         result["investigated_clues"] = investigated_new
         result["investigations_used"] = investigations_used + 1
-        # M2：把调查线索并入玩家私有线索（distributed_clues 无 reducer，需整体返回）
-        new_distributed = dict(state.get("distributed_clues", {}))
-        new_distributed[user_role] = list(new_distributed.get(user_role, [])) + investigated_new
-        result["distributed_clues"] = new_distributed
+        # M2：把调查线索并入玩家私有线索。distributed_clues 现在有合并 reducer
+        # （game_state._merge_dict），只需返回"这一个角色"的增量，不必整字典替换——
+        # 整字典替换在并行 superstep 下会把别人同时写入的线索覆盖掉。
+        result["distributed_clues"] = {
+            user_role: list(state.get("distributed_clues", {}).get(user_role, [])) + investigated_new
+        }
     return result
 
 
@@ -847,18 +991,10 @@ def ai_vote_node(state: GameState) -> dict:
                                 suspect_names, name == murderer, task, candidates=candidates,
                                 alibi_roster=alibi_roster, revealed_text=revealed_text)
 
+    results = _run_concurrently(_vote, ai_names, label="AI 投票")
+
     votes = {}
     thoughts = []
-    if VOTE_CONCURRENT and len(ai_names) > 1:
-        try:
-            with ThreadPoolExecutor(max_workers=min(VOTE_MAX_WORKERS, len(ai_names))) as ex:
-                results = list(ex.map(_vote, ai_names))
-        except Exception as e:
-            logger.warning("并发投票失败（%s），回退串行", type(e).__name__)
-            results = [_vote(n) for n in ai_names]
-    else:
-        results = [_vote(n) for n in ai_names]
-
     for voter, target, think in results:
         # H1：无论投出还是弃权都显式写入，None 覆盖上一轮旧票
         votes[voter] = target
@@ -887,11 +1023,17 @@ def human_vote_node(state: GameState) -> dict:
     H2：加时重投时只允许投 tie_candidates 中的平票者。
     M9：保留字（弃权/弃权不投/abstain）显式转 None——"沉默观察、弃权自保"
     是剧本杀的真实策略，规则层有 None 通道，此处把它接通到输入协议。
+    2026-11：候选人剔除玩家自己——AI 侧 prompt 明确"不能投自己"且
+    _vote_one_player 有 `vote != name` 校验，玩家侧却能把票投给自己，
+    同一套规则两副面孔（自投会让"平民胜利/凶手胜利"判定失真）。
     """
     user_role = state.get("user_role", "你")
     script = state.get("script", {})
     suspect_names = [s.get("name", "?") for s in script.get("suspects", [])]
     candidates = state.get("tie_candidates") or suspect_names
+    # 剔除自己；极端情况（只剩 1 名嫌疑人）回退原名单，保证投票环节不会无选项可用
+    others = [n for n in candidates if n != user_role]
+    candidates = others or candidates
 
     user_vote = interrupt({"type": "human_vote", "suspects": candidates})
 
@@ -909,16 +1051,18 @@ def tally_node(state: GameState) -> dict:
     """节点 7：统计票数（确定性节点，纯 Python 逻辑）。
 
     H1：过滤 None（弃权票），只统计有效票。
-    L4：平票信息收编为结构化字段——vote_winner 只写"平票"纯标记，
-    并列名单写入 tie_candidates（此前用"平票（A、B）"字符串当数据载体，
-    4 处消费点各自解析，任何一处改格式就全链路炸）。非平票时显式清空
-    tie_candidates，防止加时轮重投决出胜者后旧名单残留、误导后续判断。
+    L4：平票信息收编为结构化字段——并列名单写入 tie_candidates。
+    2026-11：vote_winner 不再兼任"平票"/"无人投票"哨兵字符串，改由
+    vote_outcome（winner / tie / no_votes）表达结果类型，vote_winner 只存
+    真实人名或空串。此前 4 处消费点靠 `startswith("平票")` / `== "无人投票"`
+    嗅探语义，任何一处改文案就静默失配。
     """
     votes = {k: v for k, v in state.get("votes", {}).items() if v}
     counter = Counter(votes.values())
     vote_counts = dict(counter)
     if not counter:
-        return {"vote_counts": {}, "vote_winner": "无人投票", "tie_candidates": [], "game_result": "平局"}
+        return {"vote_counts": {}, "vote_winner": "", "vote_outcome": "no_votes",
+                "tie_candidates": [], "game_result": "平局"}
 
     top = counter.most_common()
     max_n = top[0][1]
@@ -927,12 +1071,12 @@ def tally_node(state: GameState) -> dict:
     script = state.get("script", {})
     murderer = _get_murderer(script, [s.get("name", "") for s in script.get("suspects", [])])
     if len(winners) > 1:
-        return {"vote_counts": vote_counts, "vote_winner": "平票",
+        return {"vote_counts": vote_counts, "vote_winner": "", "vote_outcome": "tie",
                 "tie_candidates": winners, "game_result": "平局"}
     vote_winner = winners[0]
     game_result = "平民胜利" if vote_winner == murderer else "凶手胜利"
 
-    return {"vote_counts": vote_counts, "vote_winner": vote_winner,
+    return {"vote_counts": vote_counts, "vote_winner": vote_winner, "vote_outcome": "winner",
             "tie_candidates": [], "game_result": game_result}
 
 
@@ -963,15 +1107,7 @@ def tie_break_node(state: GameState) -> dict:
 
     # 真人玩家自己辩护不替它生成；并发执行、按 tied_names 顺序输出（map 保序）
     targets = [n for n in tied_names if n != user_role and n in suspect_map]
-    if VOTE_CONCURRENT and len(targets) > 1:
-        try:
-            with ThreadPoolExecutor(max_workers=min(VOTE_MAX_WORKERS, len(targets))) as ex:
-                messages = list(ex.map(_defense, targets))
-        except Exception as e:
-            logger.warning("并发平票辩护失败（%s），回退串行", type(e).__name__)
-            messages = [_defense(n) for n in targets]
-    else:
-        messages = [_defense(n) for n in targets]
+    messages = _run_concurrently(_defense, targets, label="平票辩护")
 
     # C1：tie_break_done + tie_candidates 均已在 GameState 声明，
     # 后者供 ai_vote/human_vote 收窄加时轮投票名单（H2）。
@@ -984,12 +1120,13 @@ def tie_break_node(state: GameState) -> dict:
 def final_statement_node(state: GameState) -> dict:
     """节点 7.5：被投最高者的最终陈词。"""
     vote_winner = state.get("vote_winner", "")
+    vote_outcome = state.get("vote_outcome", "winner")
     user_role = state.get("user_role", "")
     script = state.get("script", {})
 
-    # L5：平票/无人投票/玩家自己被投时都不生成陈词，避免"无人投票"穿透到 LLM
-    if (not vote_winner or str(vote_winner).startswith("平票")
-            or vote_winner == "无人投票" or vote_winner == user_role):
+    # L5：平票/无人投票/玩家自己被投时都不生成陈词。
+    # 2026-11：判定改用 vote_outcome，不再对 vote_winner 做 startswith("平票") 嗅探。
+    if vote_outcome != "winner" or not vote_winner or vote_winner == user_role:
         return {}
 
     suspects = script.get("suspects", [])
@@ -1037,9 +1174,18 @@ def dm_reveal_node(state: GameState) -> dict:
     truth = script.get("truth", "")
     votes = state.get("votes", {})
     vote_counts = state.get("vote_counts", {})
-    vote_winner = state.get("vote_winner", "无人")
+    vote_outcome = state.get("vote_outcome", "")
+    vote_winner = state.get("vote_winner", "")
 
-    winner_note = "（注意：这是平票，务必如实说明「多票并列」，不要假装有单一赢家）" if str(vote_winner).startswith("平票") else ""
+    if vote_outcome == "tie":
+        winner_note = "（注意：这是平票，务必如实说明「多票并列」，不要假装有单一赢家）"
+        winner_display = "（平票，无单一最高票）"
+    elif vote_outcome == "no_votes":
+        winner_note = "（注意：本局无人投出有效票，请如实说明「全员弃权」）"
+        winner_display = "（无人投票）"
+    else:
+        winner_note = ""
+        winner_display = vote_winner
     # R1：弃权票（None）归一为「（弃权）」，此前会渲染成 "投None" 进入 DM 台词
     votes_text = "、".join(f"{k}投{_render_vote(v)}" for k, v in votes.items()) or "无人投票"
 
@@ -1064,7 +1210,7 @@ def dm_reveal_node(state: GameState) -> dict:
 
     prompt = build_reveal_prompt(
         truth=truth, votes_text=votes_text, vote_counts=vote_counts,
-        vote_winner=vote_winner, winner_note=winner_note, user_role=user_role,
+        vote_winner=winner_display, winner_note=winner_note, user_role=user_role,
         user_vote=user_vote, result_note=result_note, clues_text=clues_text,
         history=history, ending_label=ending_label, ending_note=ending_note,
     )
@@ -1139,9 +1285,9 @@ def route_after_tally(state: GameState) -> str:
     C1 修复：tie_break_done 已在 GameState 声明（否则被 LangGraph 静默丢弃）；
     再加 vote_round 硬保险丝——即便守卫逻辑出错，第二轮投票后也强制结算，
     杜绝连续平票的无界重投循环。
+    2026-11：平票判定读结构化 vote_outcome，不再 `startswith("平票")`。
     """
-    vote_winner = str(state.get("vote_winner", ""))
     already = state.get("tie_break_done", False) or state.get("vote_round", 1) >= 2
-    if vote_winner.startswith("平票") and not already:
+    if state.get("vote_outcome") == "tie" and not already:
         return "tie_break"
     return "final_statement"

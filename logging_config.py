@@ -10,10 +10,10 @@ logs/game.log 里两局的消息交错无法归属——排查"第 3 局的 AI �
 提交时刻的 context（并发投票/自我介绍线程内的日志 gid 为 "-"），
 主线程（图执行、节点函数）日志全部带 gid。
 """
+import contextvars
+import logging
 import os
 import sys
-import logging
-import contextvars
 from logging.handlers import RotatingFileHandler
 
 _CONFIGURED = False

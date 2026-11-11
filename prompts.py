@@ -306,8 +306,13 @@ def build_self_intro_prompt(name: str, personality: str, speech_style: str,
 
 
 def build_midpoint_prompt(revealed: dict, hidden_topics: list) -> str:
-    """DM 中场引导 prompt。H13：只给未公开线索的方向标签，不给原文。"""
-    revealed_text = list(revealed.keys()) if revealed else "（还没有线索被公开讨论）"
+    """DM 中场引导 prompt。H13：只给未公开线索的方向标签，不给原文。
+
+    2026-11：已公开线索列表此前直接 f-string 一个 list，prompt 里出现
+    `['书房有血迹']` 这种 Python repr——与 M4/M8「绝不注入 list repr」的
+    约定自相矛盾（机器语法会诱导模型模仿）。统一改成顿号连接。
+    """
+    revealed_text = "、".join(str(k) for k in revealed.keys()) if revealed else "（还没有线索被公开讨论）"
     hidden_text = "、".join(hidden_topics) if hidden_topics else "（线索基本都浮出水面了）"
     return f"""你是剧本杀主持人（DM），当前处于【中场引导】阶段。讨论已经过半，现在做一次中场引导。
 
@@ -449,7 +454,12 @@ def build_reveal_prompt(*, truth: str, votes_text: str, vote_counts: dict,
                         vote_winner: str, winner_note: str, user_role: str,
                         user_vote: str, result_note: str, clues_text: str,
                         history: str, ending_label: str, ending_note: str) -> str:
-    """DM 揭晓真相 prompt。"""
+    """DM 揭晓真相 prompt。
+
+    2026-11：vote_counts 此前直接 f-string 成 `{'乙': 2}`（Python dict repr），
+    和 midpoint 的 list repr 同源问题——统一格式化成人类可读的「乙 2 票」。
+    """
+    counts_text = "、".join(f"{name} {count} 票" for name, count in vote_counts.items()) or "（无有效票）"
     return f"""你是一位剧本杀主持人（DM），当前处于【揭晓真相】阶段。讨论和投票都结束了，现在揭晓真相。
 
 【本阶段职责边界】
@@ -459,7 +469,7 @@ def build_reveal_prompt(*, truth: str, votes_text: str, vote_counts: dict,
 
 案件真相：{truth}
 投票明细（谁投了谁，务必照实公布，禁止编造）：{votes_text}
-票数统计：{vote_counts}（得票最多的是：{vote_winner}）{winner_note}
+票数统计：{counts_text}（得票最多的是：{vote_winner}）{winner_note}
 真人玩家（{user_role}）投给了：{user_vote}
 {result_note}
 
@@ -480,6 +490,7 @@ def build_reveal_prompt(*, truth: str, votes_text: str, vote_counts: dict,
 4. 【线索复盘】对照私密线索总账和公开讨论记录，指出哪些私密线索从头到尾没被任何人在讨论中提及（被埋没了），并简要说明这些线索若被挖出，对破案有什么帮助
 5. 【结局演绎】真人玩家（{user_role}）本局的结局是「{ending_label}」{ending_note}
 6. 为整场游戏收尾"""
+
 
 def build_tiebreak_prompt(name: str, secret: str, is_murderer: bool) -> str:
     """平票加时辩护 prompt（M9：从 nodes.py 内联提取；凶手分支不注入完整 truth）。
