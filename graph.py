@@ -23,15 +23,28 @@ LangGraph 图定义 —— 把节点和边组装成完整的剧本杀状态机�
     → END
 """
 import os
-from langgraph.graph import StateGraph, START, END
+
 from langgraph.checkpoint.memory import InMemorySaver as MemorySaver
+from langgraph.graph import END, START, StateGraph
+
 from game_state import GameState
 from nodes import (
-    generate_script_node, distribute_clues_node, choose_role_node,
-    dm_intro_node, self_intro_node, ai_player_turn_node, human_turn_node,
-    dm_midpoint_node, ai_vote_node, human_vote_node, tally_node,
-    tie_break_node, final_statement_node, dm_reveal_node,
-    route_speaker, route_after_tally,
+    ai_player_turn_node,
+    ai_vote_node,
+    choose_role_node,
+    distribute_clues_node,
+    dm_intro_node,
+    dm_midpoint_node,
+    dm_reveal_node,
+    final_statement_node,
+    generate_script_node,
+    human_turn_node,
+    human_vote_node,
+    route_after_tally,
+    route_speaker,
+    self_intro_node,
+    tally_node,
+    tie_break_node,
 )
 
 

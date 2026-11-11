@@ -63,10 +63,11 @@ START
 | 类别 | 选型 | 为什么 |
 |---|---|---|
 | **智能体编排** | LangGraph ≥1.0 | 图结构天然契合剧本杀的"阶段推进"，condition edge 处理"轮到谁" |
-| **大模型** | DeepSeek `deepseek-v4-flash` | 中文生成稳、价格便宜（每局 ¥1~3），适合学习项目预算 |
+| **大模型** | DeepSeek `deepseek-v4-flash` | 中文生成稳、价格便宜（每局约 ¥0.1~0.3），适合学习项目预算 |
 | **Web UI** | Streamlit ≥1.32 | 5 分钟搭交互界面，专注后端逻辑 |
 | **关系图** | pyvis 0.3 + vis.js | 嫌疑人关系图直接生成 HTML，嵌在模态框里 |
-| **测试** | pytest | 纯函数单元测试，**127 passed / 3.3s**，不烧 token |
+| **测试** | pytest | 纯函数单元测试，**158 passed / 3.1s**，不烧 token |
+| **工程化** | ruff + GitHub Actions | 静态检查 + 双版本 CI；PR 上自动跑，不花一分钱 API 费用 |
 | **环境** | conda py10 + pip 清华镜像 | Python 3.10 隔离环境，安装快 |
 
 ---
@@ -85,7 +86,13 @@ conda activate py10
 
 ```bash
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 想要严格复现我的环境（推荐）：
+# pip install -r requirements.lock -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
+
+> 注意：`requirements.txt` 是兼容区间，`requirements.lock` 是从实装环境读出的精确版本。
+> 下限不是随便写的——`streamlit>=1.61` 是 `_THEME_CSS` 校准过的 DOM 版本，
+> `langchain-deepseek>=1.1` 是 `reasoning_effort` 参数存在的版本。
 
 ### 第 3 步：填 API Key
 
@@ -143,7 +150,7 @@ Agent_Developing/
 ├── names.py             # 嫌疑人名字池 + 抽样
 ├── logging_config.py    # 日志配置（文件轮转 + 对局 ID 上下文注入）
 ├── config.py            # 集中配置（温度 / 轮数 / 限制，全量环境变量可覆盖）
-├── tests/               # pytest 单元测试（127 passed）
+├── tests/               # pytest 单元测试（158 passed，含 2026-11 回归集）
 ├── scripts/
 │   └── test_api.py      # API 连通性测试（手动脚本，pytest 不收集）
 ├── docs/
@@ -152,19 +159,29 @@ Agent_Developing/
 ├── diagnose.py          # 调试脚本（看 LLM 原始 JSON 返回）
 ├── diag.py              # 网络诊断（trust_env 开/关对比，排查代理）
 ├── pytest.ini           # 测试发现限定 tests/（防真实 API 调用被误收集）
-├── requirements.txt
-└── .env.example         # 环境变量模板（28 项全量注释）
+├── pyproject.toml       # ruff 静态检查配置（E/W/F/I/B 规则集）
+├── requirements.txt     # 兼容区间（下限与代码实际 API 对齐）
+├── requirements.lock    # 精确版本（由实装环境读出，保证可复现）
+├── .github/workflows/   # CI：ruff + pytest，2 个 Python 版本
+├── LICENSE              # MIT
+└── .env.example         # 环境变量模板（29 项全量注释）
 ```
 
-**模块边界**：`nodes.py` 只做编排（调用 LLM + 调确定性函数），确定性游戏规则全在 `rules.py`、业务逻辑在 `validators.py` / `prompts.py` / `interrupt_handler.py` 里——这是为了**让测试不依赖 LLM**，127 个测试全是纯函数。
+**模块边界**：`nodes.py` 只做编排（调用 LLM + 调确定性函数），确定性游戏规则全在 `rules.py`、业务逻辑在 `validators.py` / `prompts.py` / `interrupt_handler.py` 里——这是为了**让测试不依赖 LLM**，158 个测试全是纯函数。
+
+**配置生效链路（2026-11 修复）**：`.env` 由 `config.py` 在 **import 时**加载，先于任何 `os.getenv`。此前 `load_dotenv()` 写在 `nodes.py` 且排在 `from config import ...` 之后，导致 `.env` 里 24 项配置静默失效（只有调用期才读的 `DEEPSEEK_*` 生效）。改完 `.env` 需重启进程。
 
 ---
 
 ## 🧪 测试与质量
 
 ```bash
-pytest -q     # → 127 passed in 3.3s（pytest.ini 已限定只扫 tests/）
+pytest -q              # → 158 passed in 3.1s（pytest.ini 已限定只扫 tests/）
+ruff check .           # → All checks passed（未用导入 / 未定义名 / import 排序）
 ```
+
+CI（`.github/workflows/ci.yml`）在每次 push/PR 上跑 Python 3.10 + 3.12 两个版本，
+**全程不发真实 LLM 请求**——纯函数测试是零成本的，这正是不把业务逻辑塞进节点的回报。
 
 测试覆盖（**不烧 token**）：
 - JSON 解析 / 名单过滤 / 线索兜底
@@ -176,6 +193,9 @@ pytest -q     # → 127 passed in 3.3s（pytest.ini 已限定只扫 tests/）
 - 点名→追问守卫（str/dict 协议等价性）
 - 插队不计费 + 保险丝（M11）
 - 平票结构化候选传递（L4）
+- **2026-11 回归集**（`tests/test_hardening.py`，11 类）：`.env` 生效时序、forbidden 停用词清洗、
+  指控计数认目标、非字符串 secret 不炸流程、prompt 无 Python repr、玩家不可自投、
+  并发助手只重跑失败项、`distributed_clues` 增量合并
 
 **故意不测**：图流程端到端 mock 冒烟——这是测试盲区，留给开学后（frozen 测试需要 mock LLM，不划算）。
 
@@ -195,6 +215,9 @@ pytest -q     # → 127 passed in 3.3s（pytest.ini 已限定只扫 tests/）
 | **`deepseek-chat` 模型 404** | 2026-07 已退役 | `.env` 改用 `DEEPSEEK_MODEL=deepseek-v4-flash` |
 | **`relations` 方向反** | LLM 写的 from/to 跟 rel 语义主语反了（"我恨 A" 写成 A→我） | prompt 铁律 + 校验兜底：from 是主语，to 是宾语 |
 | **vis.js mass/fixed 不生效** | 以为设了死者 `mass=3` 让它居中，结果还是被挤走 | pyvis 0.3.2 的 `mass/x/y/fixed` 都能序列化，但**要先确认字段真的进了 HTML**（我之前看错过一次） |
+| **`.env` 改了完全没反应** | 调 `ROUNDS_PER_PLAYER` / `LLM_TEMP_*` 全部无效，只有 `DEEPSEEK_*` 生效 | **import 顺序问题**：`config.py` 的常量在 import 时求值，而 `load_dotenv()` 写在 `nodes.py` 且排在 `from config import` 之后 → 24 项配置读到的是默认值。修法：`load_dotenv()` 挪到 `config.py` 最顶部。教训：**模块级常量 + 环境变量 = 必须保证加载顺序** |
+| **`forbidden` 混进「我」** | AI 每句台词都被判"泄露秘密"，3 次重试后整局都在说同一句兜底话 | forbidden 是泄密检测的词表，本身必须有区分度：入库前剔停用词/角色名，并去重截断（`validators._sanitize_forbidden`） |
+| **"致命问题"靠字符串子串判定** | 改一句校验文案，`fatal` 分类静默失效；两处副本还会各自漂移 | 把"是否致命"变成数据（`ScriptProblem.fatal`），而不是 `"murderer" in p` 这种文本嗅探 |
 
 ---
 

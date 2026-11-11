@@ -11,7 +11,6 @@
 nodes.py 通过 `from rules import X as _X` 保持旧名转发，
 外部 import 路径（nodes._clue_mentioned 等）不变，测试无需改动。
 """
-from collections import Counter
 
 
 def _ngrams(s: str, n: int = 2) -> set[str]:
@@ -97,7 +96,8 @@ def count_accusations_against(messages: list[dict], name: str) -> int:
     """统计其他发言者对 name 的指控次数（M4：不依赖"指控"二字的启发式）。
 
     命中任一即计一次：
-    1. 发言含"指控"（原有规则）；
+    1. 发言含"指控"**且提到 name**（2026-11 修复：此前只判"指控"二字，
+       甲指控乙时也给丙计数，凶手的狡辩策略池被无谓消耗、轮换节奏错乱）；
     2. name 与"凶手/真凶/杀人犯/杀人凶手"共现，且含"就是/肯定是/一定是/才是/是你/是他"等指认词。
     """
     culprit_words = ("凶手", "真凶", "杀人犯", "杀人凶手")
@@ -107,7 +107,9 @@ def count_accusations_against(messages: list[dict], name: str) -> int:
         if m.get("speaker") == name:
             continue
         content = m.get("content") or ""
-        if "指控" in content:
+        if not isinstance(content, str):
+            continue
+        if "指控" in content and name in content:
             count += 1
             continue
         if name in content and any(w in content for w in culprit_words) \
@@ -170,15 +172,3 @@ def get_murderer(script: dict, suspect_names: list[str]) -> str:
             best_pos = pos
             found = n
     return found
-
-
-def tally_votes(votes: dict) -> tuple[Counter, list[str]]:
-    """统计有效票（过滤弃权 None），返回 (计数器, 最高票名单)。供 tally_node 复用。"""
-    valid = {k: v for k, v in votes.items() if v}
-    counter = Counter(valid.values())
-    if not counter:
-        return counter, []
-    top = counter.most_common()
-    max_n = top[0][1]
-    winners = [k for k, v in top if v == max_n]
-    return counter, winners

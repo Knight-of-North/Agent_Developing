@@ -1,15 +1,22 @@
-# 精确版本锁定（M7）—— 当前开发/测试环境验证通过的版本
+# 精确版本锁定 —— 由**实装环境**读出（2026-11 重新生成）
+#
 # 用法：pip install -r requirements.lock
-# 注意：本文件只锁定直接依赖的精确版本；传递依赖由 pip 自动解析。
-# 若需完全可复现的完整依赖树，请在干净虚拟环境中执行：
-#   pip install -r requirements.lock && pip freeze > requirements.lock.full
+# 注意：
+# 1. 本文件只锁定直接依赖的精确版本；传递依赖由 pip 自动解析。
+# 2. 生成方式必须是"在验证过的环境里读实际版本"，不能手抄——
+#    上一版把 langchain-core 写成 1.6.0、streamlit 写成 1.62.0，
+#    而实装是 1.5.4 / 1.61.1，lock 反而成了不可复现的假承诺。
+#    复现命令：
+#      python -c "import importlib.metadata as m; ..."   # 或 pip freeze
+# 3. 需要完全可复现的完整依赖树时：pip freeze > requirements.lock.full
+#
 # Requires Python >= 3.10
 
 langgraph==1.2.11
-langchain-core==1.6.0
+langchain-core==1.5.4
 langchain-deepseek==1.1.0
-python-dotenv==1.2.3
-streamlit==1.62.0
+python-dotenv==1.2.2
+streamlit==1.61.1
 httpx==0.28.1
 pyvis==0.3.2
 pytest==9.1.1

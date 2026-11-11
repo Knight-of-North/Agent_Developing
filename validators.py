@@ -8,6 +8,56 @@
 import json
 import re
 
+# forbidden 词的停用词表：LLM 偶尔把代词/虚词当成"违禁词"（最坏情况是「我」）。
+# 一旦命中，ai_player_turn_node 会把**每一句正常台词**都判定成泄密，3 次重试
+# 耗尽后整局 AI 发言都退化成固定兜底句。这些词对"泄密检测"没有任何区分度，
+# 必须在入库前剔掉（R3 只处理了类型，没处理语义）。
+_FORBIDDEN_STOPWORDS = frozenset({
+    "我", "你", "他", "她", "它", "我们", "你们", "他们", "她们",
+    "的", "了", "是", "在", "不", "有", "和", "就", "都", "也", "很",
+    "说", "人", "这", "那", "一个", "什么", "怎么",
+})
+
+# 每个角色最多保留的违禁词数量（prompt 里要求 2~4 个，超出的截断）
+MAX_FORBIDDEN_WORDS = 4
+
+
+def _coerce_text(value) -> str:
+    """把 LLM 输出的"本该是字符串"的字段安全转成 str。
+
+    R3 只给 _extract_speak 补了类型防御；secret / personal_script 等字段仍是裸的——
+    LLM 返回 `"secret": 123` 时 _normalize_secret_first_person 的 .startswith
+    直接抛 AttributeError，绕过 F1「异常不出节点」的兜底，整局剧本生成失败。
+    数字转成字符串（信息不丢），其余容器类型一律当缺失（交给自洽校验打回重试）。
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
+def _sanitize_forbidden(forbidden, name: str = "", suspect_names: list[str] | None = None) -> list[str]:
+    """清洗 forbidden 词表：剔停用词 / 剔角色名 / 去重 / 截断。
+
+    为什么必须做：forbidden 是 AI 发言的"泄密检测器"，检测器本身必须比对
+    秘密更有区分度。若表里混进「我」这类高频词，正常发言也会被判泄露；
+    若混进别的角色名（"张三"），AI 每次称呼对方都会触发误报。
+    """
+    if not isinstance(forbidden, list):
+        return []
+    others = {n for n in (suspect_names or []) if n and n != name}
+    cleaned: list[str] = []
+    for word in forbidden:
+        w = _coerce_text(word).strip()
+        if len(w) < 2 or w in _FORBIDDEN_STOPWORDS or w in others or w == name:
+            continue
+        if w not in cleaned:
+            cleaned.append(w)
+        if len(cleaned) >= MAX_FORBIDDEN_WORDS:
+            break
+    return cleaned
+
 
 def _parse_json(text: str) -> dict:
     """从模型输出里安全提取 JSON。
@@ -55,8 +105,13 @@ def _enforce_names(script: dict, names: list[str]) -> dict:
     名字是后续 choose_role / route_speaker / distribute_clues 的"主键"，
     LLM 可能不听话改了名字，必须改回来，否则选角色、轮流发言全乱。
     策略：尽量保留 LLM 给每个位置编的 secret / forbidden，只替换 name。
+
+    同时清洗 forbidden（_sanitize_forbidden）——它是发言泄密检测器的词表，
+    混进代词/角色名会让每一句正常台词都被判泄露。
     """
     suspects = script.get("suspects") or []
+    if not isinstance(suspects, list):
+        suspects = []
     fixed = []
     for i, name in enumerate(names):
         if i < len(suspects) and isinstance(suspects[i], dict):
@@ -65,6 +120,7 @@ def _enforce_names(script: dict, names: list[str]) -> dict:
         else:
             # LLM 少给了嫌疑人，补一个空壳
             s = {"name": name, "secret": "待补充", "forbidden": []}
+        s["forbidden"] = _sanitize_forbidden(s.get("forbidden"), name, names)
         fixed.append(s)
     script["suspects"] = fixed
     return script
@@ -75,7 +131,10 @@ def _normalize_secret_first_person(secret: str) -> str:
 
     LLM 偶尔偷懒用「他/她」写自己的秘密（应该是第一人称「我」），破坏代入感。
     只替换 secret 开头的代词（其余地方的代词可能指别人，不动）。
+    非字符串输入（LLM 返回数字/对象）先经 _coerce_text 归一，避免
+    `.startswith` 抛 AttributeError 炸穿整局生成（R3 同类问题）。
     """
+    secret = _coerce_text(secret)
     if not secret:
         return secret
     # 按长度从长到短匹配，避免「她的」被先匹配成「她」+「的」
@@ -86,7 +145,7 @@ def _normalize_secret_first_person(secret: str) -> str:
 
 
 def _normalize_secrets(script: dict) -> dict:
-    """把所有 suspect 的 secret 规范化为第一人称开头。"""
+    """把所有 suspect 的 secret 规范化为第一人称开头（非字符串先归一）。"""
     for s in script.get("suspects") or []:
         if isinstance(s, dict) and "secret" in s:
             s["secret"] = _normalize_secret_first_person(s["secret"])

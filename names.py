@@ -5,9 +5,8 @@
 nodes.py 原本 700+ 行混了名字池数据、prompt、解析、节点，这里把"名字"这一
 职责独立出来，让每个模块各司其职。
 """
-import re
 import random
-
+import re
 
 # ---- 嫌疑人名字池（按背景风格分组）----
 # 每组 16 个名字（男女混合），random.sample 从里面无放回抽样，
@@ -38,6 +37,19 @@ _NAME_POOLS = {
 # "自由发挥"（以及任何没匹配上的背景）用所有池合并去重，名字风格最杂、随机性最大。
 # dict.fromkeys 保序去重：O(k)，替代之前 `if x not in list` 的 O(k²) 线性扫描。
 _MIXED_POOL = list(dict.fromkeys(n for pool in _NAME_POOLS.values() for n in pool))
+
+# F2：自定义名字白名单——只允许中文/字母/数字/间隔号，2~10 字。
+# 名字会直接进 prompt 与 st.markdown，长度和字符集必须卡死（防注入 + 防超长）。
+_NAME_RE = re.compile(r"[\u4e00-\u9fa5A-Za-z0-9·]{2,10}")
+
+
+def sanitize_custom_names(names: list[str] | None) -> list[str]:
+    """过滤用户自定义名字：白名单校验（app.py / main.py 共用一份实现）。
+
+    此前这条正则分别硬编码在两个入口里——改一处忘另一处就会出现
+    "Web 端挡住了、终端版还能注进 prompt"的不一致。
+    """
+    return [n for n in (names or []) if _NAME_RE.fullmatch(n or "")]
 
 # 本会话已用过的名字集合：避免重玩撞脸。
 # 名字池每风格仅 16 个、混合池约 80 个，同一风格玩 4~5 局后重复概率显著上升，

@@ -8,39 +8,45 @@
 - _extract_speak 的 think 泄露（曾 raw 当 speak 公开发布）
 
 运行：在项目根目录执行 `pytest tests/ -v`
+（项目根目录已由 pytest.ini 的 pythonpath 加入 sys.path，无需手工 sys.path.insert）
 """
-import sys
-from pathlib import Path
-
-# 把项目根目录加入 sys.path，让测试能 import names / validators / nodes 等模块
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+from game_state import GameState
+from interrupt_handler import get_interrupt, is_abstain, is_silence, validate_vote
 from names import _parse_names, _pick_suspect_names
-from prompts import _build_script_prompt, murderer_defense_pool_text
+from nodes import (
+    _check_script_consistency,
+    _clue_mentioned,
+    _count_accusations_against,
+    _current_speaker,
+    _detect_addressed,
+    _format_private_clues,
+    _get_murderer,
+    _judge_ending,
+    _update_revealed_clues,
+    ai_player_turn_node,
+    distribute_clues_node,
+    dm_midpoint_node,
+    final_statement_node,
+    human_turn_node,
+    human_vote_node,
+    route_after_tally,
+    route_speaker,
+    tally_node,
+    tie_break_node,
+)
+from prompts import _build_script_prompt, build_tiebreak_prompt, murderer_defense_pool_text
+from rules import apply_followup_guard
 from validators import (
     _enforce_names,
-    _normalize_secret_first_person,
-    _normalize_secrets,
-    _fallback_clues,
-    _filter_relations,
     _ensure_clues,
     _extract_speak,
+    _fallback_clues,
+    _filter_relations,
+    _normalize_secret_first_person,
+    _normalize_secrets,
     _parse_json,
 )
-from visualization import build_relations_html, _truncate_label, _clean_pronouns
-from nodes import (
-    distribute_clues_node, tally_node, route_speaker, _current_speaker,
-    _check_script_consistency, _get_murderer,
-    _update_revealed_clues, _detect_addressed, _format_private_clues, _judge_ending,
-    route_after_tally, tie_break_node, final_statement_node, dm_midpoint_node,
-    human_turn_node, human_vote_node, ai_player_turn_node, _count_accusations_against,
-    _clue_mentioned,
-)
-from rules import apply_followup_guard
-from game_state import GameState
-from prompts import build_tiebreak_prompt
-from interrupt_handler import get_interrupt, validate_vote, is_abstain, is_silence
-
+from visualization import _clean_pronouns, _truncate_label, build_relations_html
 
 # ============ interrupt_handler ============
 
@@ -226,15 +232,17 @@ def test_tally_normal():
 
 def test_tally_tie_detected():
     out = tally_node({"votes": {"张三": "李四", "李四": "王五"}})
-    # L4：vote_winner 只写"平票"纯标记，并列名单走结构化字段 tie_candidates
-    assert out["vote_winner"] == "平票"
+    # L4 + 2026-11：结果类型走 vote_outcome，vote_winner 不再兼任"平票"哨兵
+    assert out["vote_outcome"] == "tie"
+    assert out["vote_winner"] == ""
     assert set(out["tie_candidates"]) == {"李四", "王五"}
     assert out["game_result"] == "平局"
 
 
 def test_tally_empty():
     out = tally_node({"votes": {}})
-    assert out["vote_winner"] == "无人投票"
+    assert out["vote_outcome"] == "no_votes"
+    assert out["vote_winner"] == ""
 
 
 # ============ _current_speaker / route_speaker ============
@@ -985,17 +993,17 @@ def test_gamestate_declares_tie_break_fields():
 
 def test_route_after_tally_respects_done_flag():
     """C1：tie_break_done=True 后，即便仍平票也走 final_statement，不再加时。"""
-    assert route_after_tally({"vote_winner": "平票（张三、李四）", "tie_break_done": True}) == "final_statement"
+    assert route_after_tally({"vote_outcome": "tie", "tie_break_done": True}) == "final_statement"
 
 
 def test_route_after_tally_vote_round_hard_cap():
     """C1 保险丝：vote_round>=2 时强制结算，杜绝连续平票无界循环。"""
-    assert route_after_tally({"vote_winner": "平票（张三、李四）", "vote_round": 2}) == "final_statement"
+    assert route_after_tally({"vote_outcome": "tie", "vote_round": 2}) == "final_statement"
 
 
 def test_route_after_tally_first_tie_goes_to_tie_break():
     """首轮平票且未加时 → tie_break。"""
-    assert route_after_tally({"vote_winner": "平票（张三、李四）"}) == "tie_break"
+    assert route_after_tally({"vote_outcome": "tie"}) == "tie_break"
 
 
 # ---------- C3：追问路由 off-by-one ----------
@@ -1049,7 +1057,7 @@ def test_tally_all_abstain_yields_no_vote():
         "script": {"suspects": [{"name": "张三"}, {"name": "李四"}], "murderer": "李四"},
     }
     out = tally_node(state)
-    assert out["vote_winner"] == "无人投票"
+    assert out["vote_outcome"] == "no_votes"
     assert out["game_result"] == "平局"
 
 
@@ -1136,13 +1144,14 @@ def test_midpoint_missing_topic_does_not_leak_clue_text(monkeypatch):
 # ---------- L5：无人投票不穿透到最终陈词 ----------
 
 def test_final_statement_skips_when_no_vote():
-    out = final_statement_node({"vote_winner": "无人投票", "user_role": "张三",
+    out = final_statement_node({"vote_outcome": "no_votes", "vote_winner": "", "user_role": "张三",
                                 "script": {"suspects": [{"name": "张三"}]}})
     assert out == {}
 
 
 def test_final_statement_skips_tie():
-    out = final_statement_node({"vote_winner": "平票（张三、李四）", "user_role": "王五",
+    out = final_statement_node({"vote_outcome": "tie", "vote_winner": "", "user_role": "王五",
+                                "tie_candidates": ["张三", "李四"],
                                 "script": {"suspects": [{"name": "张三"}]}})
     assert out == {}
 

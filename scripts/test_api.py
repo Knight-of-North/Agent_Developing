@@ -9,11 +9,12 @@ H2：此脚本原来在项目根目录且顶层直接执行 llm.invoke —— py
 只有显式 `python scripts/test_api.py` 才发请求。
 """
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from langchain_deepseek import ChatDeepSeek
+from langchain_deepseek import ChatDeepSeek  # noqa: E402  必须先 load_dotenv 再导入（脚本语义）
 
 
 def main():

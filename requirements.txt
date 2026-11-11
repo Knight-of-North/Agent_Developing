@@ -1,14 +1,25 @@
+# 运行依赖（2026-11 校准：下限与实际用到的 API 对齐）
+#
 # Requires Python >= 3.10（使用了 str | None 联合类型和 list[str] 小写泛型）
-langgraph>=1.0,<2
-langchain-core>=1.2,<2
-langchain-deepseek>=0.1
+#
+# 为什么下限必须收紧（此前写的 streamlit>=1.32 是错的）：
+# - app.py 用了 @st.dialog（Streamlit 1.37 才有），1.32 会在 import 阶段直接崩；
+# - _THEME_CSS 的整段选择器是按 1.61 的 DOM 校准的（stSelectboxVirtualDropdown 等），
+#   低版本不报错，但暗色主题会静默错版——"看起来能跑"的错更难排查。
+# - langchain-deepseek 用到了 reasoning_effort（1.1 才有），0.1.x 不认这个参数。
+# 精确版本以 requirements.lock 为准；本文件只表达兼容区间。
+langgraph>=1.2,<2
+langchain-core>=1.5,<2
+langchain-deepseek>=1.1,<2
 python-dotenv>=1.0
-streamlit>=1.32
-httpx>=0.27
-pyvis>=0.3
-pytest>=7
+streamlit>=1.61,<2
+httpx>=0.27,<1
+pyvis>=0.3,<1
 
-# L3：PERSISTENT_CHECKPOINT=1 时 graph.py 用 SqliteSaver 做跨进程持久化。
-# 未安装时代码会自动回退 MemorySaver（仅日志提示），故为可选依赖；
-# 但 requirements 里不声明的话，用户按 README 开持久化必踩 ImportError。
-langgraph-checkpoint-sqlite>=2.0
+# 测试（纯函数、不调 LLM，CI 可直接跑）
+pytest>=8
+
+# 可选：PERSISTENT_CHECKPOINT=1 时需要（未安装时 graph.py 自动回退 MemorySaver）
+#   pip install "langgraph-checkpoint-sqlite>=2.0"
+# 不放进本文件：它是可选增强，缺了也能正常玩，不该阻塞主安装流程。
+# （此前写在这里、lock 里却没有，导致"按 lock 装完开持久化必踩 ImportError"。）

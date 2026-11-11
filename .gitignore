@@ -30,3 +30,11 @@ Thumbs.db
 
 # 模型缓存
 .cache/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+
+# 分享包 / 报告压缩包（与 docs/ 下已解压的 HTML 完全重复，1.1MB）
+.trae-html-share-packages/
+docs/**/*.zip

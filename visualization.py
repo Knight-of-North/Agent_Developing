@@ -45,7 +45,6 @@ import re
 
 from pyvis.network import Network
 
-
 # 边标签最大字符数（中文按 1 字符计）。超过则截断加省略号，
 # 完整内容放 title 悬浮显示——短边上能展示关键动作词，详情 hover 看。
 EDGE_LABEL_MAX = 8

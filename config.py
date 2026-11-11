@@ -3,8 +3,19 @@
 
 之前这些值散落在 nodes.py 里硬编码（temperature=0.8 所有节点共用、
 ROUNDS_PER_PLAYER=3 等），现在按节点用途区分，并支持环境变量覆盖。
+
+⚠️ 加载时序（2026-11 修复）：本模块的常量在 **import 时**就求值完毕，
+而 nodes.py 的 `load_dotenv()` 发生在 `from config import ...` 之后——
+导致 `.env` 里的 24 项配置全部被静默忽略（只有调用期才读的 DEEPSEEK_* 生效）。
+修法：把 load_dotenv 放到本模块最顶部，先加载 .env 再读 os.getenv；
+任何入口只要 import config，就能拿到 .env 的值，不依赖调用方的 import 顺序。
 """
 import os
+
+from dotenv import load_dotenv
+
+# 必须在任何 os.getenv 之前执行；重复调用是幂等的，不覆盖已存在的真实环境变量。
+load_dotenv()
 
 
 def _get_int(key: str, default: int) -> int:
@@ -77,3 +88,9 @@ DEV_MODE = _get_bool("DEV_MODE", False)
 
 # ---- 剧本生成 ----
 SCRIPT_MAX_ATTEMPTS = _get_int("SCRIPT_MAX_ATTEMPTS", 2)
+
+# 单次 AI 发言的总时间预算（秒）。重试层数会相乘
+# （节点 3 次尝试 × json_mode 的"JSON 失败→普通模式"回退 × SDK max_retries），
+# 极端情况下一个回合可以发出十几次请求、把页面挂住十几分钟。
+# 超过预算就停止重试、直接走确定性兜底文案——宁可一句过场，也不冻结 UI。
+TURN_BUDGET_SECONDS = _get_int("TURN_BUDGET_SECONDS", 180)

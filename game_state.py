@@ -3,8 +3,8 @@
 
 Phase 3.5 变化：新增 user_role 字段（用户扮演的角色）。
 """
-from typing import TypedDict, Annotated
 import operator
+from typing import Annotated, TypedDict
 
 
 def _merge_dict(a: dict, b: dict) -> dict:
@@ -86,7 +86,9 @@ class GameState(TypedDict, total=False):
     thoughts: Annotated[list, operator.add]
 
     # 已分配的线索 {玩家名: [线索...]}
-    distributed_clues: dict[str, list[str]]
+    # 用合并 reducer：玩家「调查」时只需返回自己那一份增量，不必整字典替换
+    # （整字典替换在并行 superstep 下会覆盖其他写入方）。
+    distributed_clues: Annotated[dict[str, list[str]], _merge_dict]
 
     # 线索公开状态 {线索内容: 首次提及的发言人}，讨论中逐条追踪哪些线索已被公开。
     # 供 DM 中场引导、AI 发言提示"未公开线索"、复盘数据化使用（报告⑨）。
@@ -104,8 +106,14 @@ class GameState(TypedDict, total=False):
     # 用合并 reducer：ai_vote_node 和 human_vote_node 各自返回自己的票，框架自动合并
     votes: Annotated[dict, _merge_dict]
 
-    # 得票最多的嫌疑人（tally_node 统计得出）
+    # 得票最多的嫌疑人（tally_node 统计得出）。只存真实人名：
+    # 平票 / 无人投票时为空串，具体结果类型看 vote_outcome——
+    # 不给同一个字段塞"平票""无人投票"这类哨兵字符串（4 处消费点靠 startswith 嗅探，
+    # 改一句文案就静默失配）。
     vote_winner: str
+
+    # 投票结果类型："winner"（决出唯一最高票）/ "tie"（并列）/ "no_votes"（全员弃权）。
+    vote_outcome: str
 
     # 各嫌疑人得票数 {嫌疑人: 票数}（tally_node 统计得出）
     vote_counts: dict

@@ -1,0 +1,37 @@
+# 工程配置（2026-11 加入）
+#
+# 为什么放 pyproject.toml：ruff / pytest / 覆盖率工具都认这一个文件，
+# 不必再维护 setup.cfg + .flake8 + tox.ini 三份。pytest.ini 暂留原处
+# （testpaths 是"防误收集真实 API 脚本"的关键守卫，单独一个文件更醒目）。
+#
+# 本地检查：
+#   ruff check .          # 静态检查
+#   ruff check --fix .    # 自动修可修项（排序 import / 删未用变量）
+#   ruff format .         # 统一格式（会重排全仓库，建议单独一个 commit）
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+exclude = [".venv", "venv", "docs", "logs", "__pycache__"]
+
+[tool.ruff.lint]
+# E/W：pycodestyle；F：pyflakes（未用导入/未定义名）；I：import 排序；B：bugbear
+select = ["E", "W", "F", "I", "B"]
+ignore = [
+    "E501",   # 行宽：prompt 文本天然超长，由 formatter 处理，不做硬性门禁
+    "B008",   # 函数默认值里调用函数（本项目未使用该模式）
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里允许私有名导入（_parse_json 等）与 assert 中的赋值
+"tests/*" = ["B011"]
+
+[tool.ruff.lint.isort]
+# 别名导入合并回一条语句：`from rules import x as _x, y as _y`
+# 否则 isort 会把每个 `as` 拆成一条，nodes.py 的转发区会被撑成十几行。
+combine-as-imports = true
+# 不因为"结尾有逗号"就强制一行一个名字——保持原有多行紧凑写法，减少无意义的 diff 噪音。
+split-on-trailing-comma = false
+
+[tool.ruff.format]
+quote-style = "preserve"
