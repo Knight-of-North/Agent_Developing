@@ -125,12 +125,21 @@ if __name__ == "__main__":
             break
 
         if info["type"] == "choose_role":
-            # 开局选角色：打印名单让用户挑
+            # 开局选角色：打印公开身份信息让用户挑（不打印 secret / personal_script）
             suspects_list = info["suspects"]
+            profiles = {
+                p.get("name"): p for p in info.get("profiles", [])
+                if isinstance(p, dict) and p.get("name")
+            }
             print("\n" + "=" * 46)
             print("【选择角色】你想扮演哪个嫌疑人？")
             for i, n in enumerate(suspects_list, 1):
-                print(f"  {i}. {n}")
+                p = profiles.get(n, {})
+                detail = " · ".join(
+                    str(p.get(key)).strip() for key in ("profession", "relation_to_victim")
+                    if p.get(key)
+                )
+                print(f"  {i}. {n}" + (f"（{detail}）" if detail else ""))
             print("=" * 46)
 
             # R9：非法输入（错别字/名单外名字/空输入）循环重问，直到合法——
@@ -209,6 +218,13 @@ if __name__ == "__main__":
                     break
 
             result = safe_resume(resume)
+            printed = show_new(result.get("messages", []), printed)
+
+        elif info["type"] == "human_tiebreak":
+            # 平票加时：AI 候选人已辩护，玩家若在平票名单中也要有最后陈述机会
+            print(f"\n【平票加时】你与 {'、'.join(info.get('suspects', []))} 进入平票。")
+            user_input = input("你的最后陈述（输入「沉默」跳过）：").strip()[:MAX_CHAT_LEN]
+            result = safe_resume(user_input)
             printed = show_new(result.get("messages", []), printed)
 
         elif info["type"] == "human_vote":

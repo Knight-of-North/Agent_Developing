@@ -1,7 +1,7 @@
 """
 节点函数 —— LangGraph 里的"演员"
 
-节点清单（14 个，与 graph.py 的 add_node 一致）：
+节点清单（15 个，与 graph.py 的 add_node 一致）：
 1. generate_script_node ：生成剧本 + 线索（LLM）
 1.5 distribute_clues_node：线索分发，信息差（确定性节点，不调 LLM）
 1.6 choose_role_node    ：用户选择扮演的角色（interrupt 暂停等选择）
@@ -14,7 +14,8 @@
 6. human_vote_node     ：用户投票（interrupt 暂停等输入）
 7. tally_node          ：统计票数 + 全局胜负（确定性节点，不调 LLM）
 7.4 tie_break_node     ：平票加时辩护（LLM，H15）
-7.5 final_statement_node：被投最高者的最终陈词（LLM）
+7.5 human_tiebreak_node：玩家在平票名单时的最后陈述（interrupt）
+7.6 final_statement_node：被投最高者的最终陈词（LLM）
 8. dm_reveal_node      ：DM 揭晓真相 + 对比投票 + 线索复盘（LLM）
 9. route_speaker       ：条件边路由（判断下一个发言者是谁）
 
@@ -55,6 +56,7 @@ from config import (
 )
 from game_state import GameState
 from interrupt_handler import ABSTAIN_WORDS, SILENCE_WORDS
+from locations import clues_at_location, location_status
 from names import _pick_suspect_names
 from prompts import (
     _build_script_prompt,
@@ -358,7 +360,7 @@ def _check_script_consistency(script: dict) -> list[ScriptProblem]:
     public_relations = [r for r in relations if isinstance(r, dict) and r.get("public")]
     if not public_relations and len(names) >= 2:
         problems.append(ScriptProblem(
-            "relations 数组没有公开边（人物关系图会显示『剧本未生成公开关系』，必须至少 1 条公开关系）"))
+            "relations 数组没有公开边（至少需要 1 条公开关系，供玩家和 AI 了解人物关系）"))
 
     # 公开边里至少 2 条涉及死者
     victim_edges = [
@@ -367,8 +369,8 @@ def _check_script_consistency(script: dict) -> list[ScriptProblem]:
     ]
     if public_relations and len(victim_edges) < 2:
         problems.append(ScriptProblem(
-            "relations 的公开边里直接涉及「死者」的不足 2 条（关系图里死者会被边缘化，"
-            "必须至少 2 条公开边的一端是「死者」）"
+            "relations 的公开边里直接涉及「死者」的不足 2 条（死者需要至少 2 条公开关系，"
+            "否则人物关系会显得边缘化）"
         ))
 
     # 嫌疑人之间也要有公开边
@@ -541,17 +543,27 @@ def choose_role_node(state: GameState) -> dict:
     script = state.get("script", {})
     suspects = script.get("suspects") or []
     names = [s.get("name", "?") for s in suspects]
+    # 选角页只展示公开身份信息（职业/与死者关系），不泄露 secret/personal_script。
+    profiles = [
+        {
+            "name": s.get("name", "?"),
+            "profession": s.get("profession", ""),
+            "relation_to_victim": s.get("relation_to_victim", ""),
+        }
+        for s in suspects if isinstance(s, dict)
+    ]
 
     if not names:
         return {"user_role": "玩家"}
 
-    chosen = interrupt({"type": "choose_role", "suspects": names})
+    payload = {"type": "choose_role", "suspects": names, "profiles": profiles}
+    chosen = interrupt(payload)
 
     # R9：非法 resume 值不再静默回退 names[0]（终端手滑/协议误用会让玩家
     # 扮演完全陌生的角色）——重新 interrupt 让调用方重试一次；
     # 重试仍非法才保底 names[0]，协议层不可能无限 interrupt 循环。
     if chosen not in names:
-        chosen = interrupt({"type": "choose_role", "suspects": names, "invalid": str(chosen)})
+        chosen = interrupt({**payload, "invalid": str(chosen)})
         if chosen not in names:
             chosen = names[0]
     murderer = _get_murderer(script, names)
@@ -805,11 +817,11 @@ def human_turn_node(state: GameState) -> dict:
     user_role = state.get("user_role", "你")
     round_num = state.get("phase_round", 0)
     script = state.get("script", {})
-    suspect_names = [s.get("name", "") for s in script.get("suspects", [])]
+    suspect_names = [s.get("name", "") for s in (script.get("suspects") or [])]
     targets = [n for n in suspect_names if n != user_role]
     own_clues = state.get("distributed_clues", {}).get(user_role, [])
-    hidden = script.get("hidden_clues", [])
-    investigated = state.get("investigated_clues", [])
+    hidden = script.get("hidden_clues") or []
+    investigated = state.get("investigated_clues") or []
     available_hidden = [c for c in hidden if c not in investigated]
     investigations_used = state.get("investigations_used", 0)
     can_investigate = bool(available_hidden) and investigations_used < INVESTIGATE_LIMIT
@@ -821,6 +833,7 @@ def human_turn_node(state: GameState) -> dict:
         "targets": targets,
         "can_investigate": can_investigate,
         "investigations_remaining": max(0, INVESTIGATE_LIMIT - investigations_used),
+        "locations": location_status(hidden, investigated),
     })
 
     # M9：沉默保留字归一化为 action dict（str 协议与 dict 协议在这里汇合，
@@ -862,18 +875,25 @@ def human_turn_node(state: GameState) -> dict:
             consecutive = state.get("consecutive_followups", 0) + 1 if addressed else 0
             revealed = _update_revealed_clues(text, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
         elif kind == "investigate":
-            if can_investigate and available_hidden:
+            location = str(action.get("location") or "").strip()
+            # 如果 UI 指定了地点，只在该地点未发现的线索里选；旧协议不带 location 则回退全局随机。
+            candidates = (
+                clues_at_location(hidden, investigated, location)
+                if location else available_hidden
+            )
+            if can_investigate and candidates:
                 # M5：随机发放而非恒取 [0]——确定性顺序两局即背板，且 _ensure_clues
                 # 的兜底线索恒在尾部，[0] 会让"保底线索"永远轮不到被调查。
-                clue = random.choice(available_hidden)
+                clue = random.choice(candidates)
                 # M2：调查所得线索进入玩家私有渠道（distributed_clues[user_role]），
                 # 公开频道只广播"去调查了"的动作，不广播原文——玩家自行决定何时公开、
                 # 公开多少，保留藏牌博弈空间。线索也不计入 revealed_clues。
-                text = "🔍 我去调查了一番，发现了一些端倪……（线索已记入你的角色卡，可选择时机公开）"
+                where = f"在{location}" if location else "在现场"
+                text = f"🔍 我去{where}调查了一番，发现了一些端倪……（线索已记入你的角色卡，可选择时机公开）"
                 investigated_new = [clue]
                 revealed = {}
             else:
-                text = "我调查了一番，但没有新发现。"
+                text = "我调查了一番，但没有新发现。" if not location else f"我在{location}仔细搜了一遍，但没有新发现。"
                 revealed = {}
             addressed = ""
             follow_up = 0
@@ -1117,6 +1137,29 @@ def tie_break_node(state: GameState) -> dict:
     return out
 
 
+def human_tiebreak_node(state: GameState) -> dict:
+    """平票加时：如果玩家是候选人，给玩家一次最后陈述机会。
+
+    此前 tie_break_node 只给 AI 候选人辩护，玩家被平票时只能直接重投——
+    但玩家本局可能一直被怀疑，最后却没有“自辩”机会，体验和规则都不公平。
+    """
+    user_role = state.get("user_role", "")
+    tied = state.get("tie_candidates") or []
+    if user_role not in tied:
+        return {}
+    statement = interrupt({
+        "type": "human_tiebreak",
+        "speaker": user_role,
+        "suspects": tied,
+    })
+    if isinstance(statement, str) and statement.strip().lower() in SILENCE_WORDS:
+        text = "（环视众人，沉默不语）"
+    else:
+        raw = "" if statement is None else str(statement)
+        text = raw.strip()[:MAX_CHAT_LEN] or "（张了张嘴，最终没有说出什么）"
+    return {"messages": [{"speaker": user_role, "content": text}]}
+
+
 def final_statement_node(state: GameState) -> dict:
     """节点 7.5：被投最高者的最终陈词。"""
     vote_winner = state.get("vote_winner", "")
@@ -1204,8 +1247,11 @@ def dm_reveal_node(state: GameState) -> dict:
 
     ending_label, ending_note = _judge_ending(state)
     clues_text = _format_private_clues(state.get("distributed_clues", {}))
+    # DM 揭晓只需要最近一段讨论来复盘；完整历史在长局里会白白烧 token。
+    # 保留最后 40 条（约 2–3 轮），truth / 线索 / 投票账本单独传给 prompt。
+    recent_messages = state.get("messages", [])[-40:]
     history = "\n".join(
-        f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])
+        f"{m['speaker']}: {m['content']}" for m in recent_messages
     )
 
     prompt = build_reveal_prompt(
@@ -1277,6 +1323,12 @@ def route_speaker(state: GameState) -> str:
     if speaker.get("name") == state.get("user_role", ""):
         return "human"
     return "ai"
+
+
+def route_after_tie_break(state: GameState) -> str:
+    """tie_break 后的条件边：玩家在平票名单里才进入 human_tiebreak，否则直接 AI 重投。"""
+    user_role = state.get("user_role", "")
+    return "human_tiebreak" if user_role in (state.get("tie_candidates") or []) else "ai_vote"
 
 
 def route_after_tally(state: GameState) -> str:

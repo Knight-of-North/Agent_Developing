@@ -45,6 +45,7 @@ LLM_CONFIG = {
     "dm":     {"temperature": _get_float("LLM_TEMP_DM", 0.7),      "max_tokens": _get_int("LLM_MAXTOK_DM", 2048)},
     "player": {"temperature": _get_float("LLM_TEMP_PLAYER", 0.85), "max_tokens": _get_int("LLM_MAXTOK_PLAYER", 1024)},
     "vote":   {"temperature": _get_float("LLM_TEMP_VOTE", 0.3),    "max_tokens": _get_int("LLM_MAXTOK_VOTE", 512)},
+    "assistant": {"temperature": _get_float("LLM_TEMP_ASSISTANT", 0.4), "max_tokens": _get_int("LLM_MAXTOK_ASSISTANT", 512)},
 }
 
 LLM_TIMEOUT = _get_int("LLM_TIMEOUT", 120)

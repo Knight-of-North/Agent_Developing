@@ -129,8 +129,18 @@ def judge_ending(state: dict) -> tuple[str, str]:
     votes = state.get("votes", {})
     user_vote = votes.get(user_role, "未投")
     vote_winner = str(state.get("vote_winner", ""))
+    vote_outcome = state.get("vote_outcome", "winner")
     script = state.get("script", {})
     murderer = get_murderer(script, [s.get("name", "") for s in script.get("suspects", [])])
+
+    # 平票/无人有效票时 game_result 是「平局」，不能在这里把凶手写成「完美犯罪」——
+    # 两段文案会同时进入 dm_reveal prompt，DM 会一边说平局、一边说真凶脱罪。
+    if vote_outcome != "winner":
+        if user_is_murderer:
+            return "平局", f"（真人玩家 {user_role} 是真凶，但本局投票未决出唯一最高票，请如实演绎平局，不要假装凶手被投出或完美犯罪）"
+        if user_vote in (None, "", "未投"):
+            return "置身事外", f"（真人玩家 {user_role} 弃权未投票，本局未决出结果，请演绎他置身事外的疏离感）"
+        return "平局", f"（真人玩家 {user_role} 投了票，但本局平票/无人有效票，未能决出真凶，请演绎平局收场）"
 
     if user_is_murderer:
         if vote_winner != user_role:

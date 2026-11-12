@@ -6,18 +6,31 @@ AI 剧本杀主持人 · 图形界面版（Streamlit）
 8-20 沉浸 UI 层（飞哥反馈"界面太简洁无剧本杀紧张感"）：
 - G0 暗色档案风主题（全局 CSS：暗色背景 + 红/金点缀 + 衬线字体 + 按钮文案换戏）
 - C-1 开场动画（案件标题打字机 + 红章盖下 + 幕布，仅开局播一次）
-- C-2 氛围音乐控制条（Web Audio 纯代码合成雨声+悬疑 drone，▶/⏸ 暂停 + 音量滑杆）
-- C-3/C-4 阶段过渡幕布 + 事件音效（讨论开始/烛光投票/真相大白，钟响/鼓点）
+- C-2 声音系统（ui_audio.py：默认 Minecraft 风格原创钢琴 BGM，可在面板切换悬疑档案；音乐/音效独立开关 + 音量记忆）
+- C-3/C-4 阶段过渡幕布 + 事件音效（讨论开始/烛光投票/真相大白，钟声/鼓点/法槌）
+
+2026-11 开始页重构：
+- 开始页改为「卷宗封面 + 案件设定卡 + 玩法/本局档案侧栏」，首屏只留核心决策；
+- 生成期只显示阶段进度，不渲染 LLM 原始 token；原始剧本 JSON 仅 DEV_MODE 可见。
+
+2026-11 启动封面（ui_launch.py）：
+- 首次打开不再直接露出案件设定表单，先播「深夜档案室」启动动画；
+- 单光源 + 夜雨 + 尘埃 + 火漆印章，点击「开始游戏」后才进入开始页。
+
+2026-11 角色视觉（ui_characters.py）：
+- 选角页使用「首字头像 + 身份关系」嫌疑人卡，侧栏角色卡 / 嫌疑人总览 / 聊天头像统一；
+- 头像颜色按姓名哈希稳定生成，不接外部图片服务。
 
 沉浸层设计原则：
 1. 纯 UI 层——不碰 graph / nodes / validators，业务逻辑零改动
-2. 组件用 st.components.v1.html 内嵌 CSS/JS，颜色全部内联（iframe 是沙箱，不吃全局 CSS）
-3. 音乐/动画状态由 iframe 内部 JS 持有，不经过 Streamlit rerun（防闪断）
+2. 组件用 st.iframe 内嵌 CSS/JS，颜色全部内联（iframe 是沙箱，不吃全局 CSS）
+3. 音乐/动画状态由页面顶层 JS 持有，不经过 Streamlit rerun（防闪断；音频引擎在 ui_audio.py）
 4. 阶段幕布 key = thread_id + phase，跨局重玩不串动画
 """
 import json
 import logging
 import re
+import time
 import uuid
 
 import streamlit as st
@@ -32,448 +45,54 @@ from config import (
     MAX_STORY_TIME_LEN,
     MAX_THEME_LEN,
 )
+from detective_assistant import analyze_case
 from game_session import build_config
 from graph import build_graph
 from interrupt_handler import get_interrupt, get_interrupt_type, is_abstain, is_silence, validate_vote
 from logging_config import set_game_id, setup_logging
 from names import _parse_names, sanitize_custom_names
 from nodes import ScriptGenerationError, generate_script_stream
-from visualization import build_relations_html
+from ui_audio import init_audio_engine, play_audio_cue, render_audio_panel, set_audio_scene
+from ui_characters import (
+    avatar_data_uri,
+    character_card_html,
+    render_character_styles,
+    role_header_html,
+    suspect_roster_html,
+)
+from ui_components import (
+    _GEN_STAGES,
+    _preserve_scroll_position,
+    _render_generation_progress,
+    _render_intro_animation,
+    _render_phase_banner,
+    _resolve_case_title,
+    render_result_effect,
+)
+from ui_launch import render_launch_screen
+from ui_start import (
+    _PACE_HELP,
+    _PACE_OPTIONS,
+    _START_STYLES,
+    render_recent_history,
+    render_start_hero,
+    render_start_side,
+)
+from ui_theme import _THEME_CSS
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
 
-# ==================== G0：暗色档案风主题（全局 CSS） ====================
-# Streamlit 1.61 的选择器：主容器 / 侧边栏 / 按钮 / 输入 / chat 消息 / expander / alert
-_THEME_CSS = """
-<style>
-:root {
-  --murder-bg: #141110;
-  --murder-card: #1d1916;
-  --murder-input: #221c18;
-  --murder-text: #E8DCC8;
-  --murder-muted: #D4C4A0;   /* 8-20 飞哥反馈"开始页小字看不清"，从 #a2947a 提亮 */
-  --murder-gold: #C9A227;
-  --murder-red: #C0392B;
-  --murder-border: #6b4f2a;
-  --murder-serif: 'STKaiti', 'KaiTi', '楷体', 'STSong', serif;   /* 标题/按钮保留衬线感（沉浸感） */
-  --murder-sans: 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', 'Noto Sans CJK SC', 'Source Han Sans SC', sans-serif;   /* 8-20 新增：正文/输入/caption 用无衬线，楷体小字号笔画细太糊 */
-}
-html, body, [data-testid="stAppViewContainer"] {
-  background: var(--murder-bg) !important;
-}
-[data-testid="stHeader"] {
-  background: transparent !important;
-}
-[data-testid="stSidebar"] {
-  background: var(--murder-card) !important;
-  border-right: 1px solid var(--murder-border) !important;
-}
-.block-container {
-  padding-top: 2rem;
-}
-[data-testid="stMarkdownContainer"] p,
-[data-testid="stMarkdownContainer"] li,
-[data-testid="stMarkdownContainer"] {
-  color: var(--murder-text);
-  font-family: var(--murder-sans);
-}
-h1, h2, h3, h4 {
-  color: var(--murder-text) !important;
-  font-family: var(--murder-serif);
-  letter-spacing: 2px;
-}
-div.stButton > button {
-  background: var(--murder-input);
-  color: var(--murder-gold);
-  border: 1px solid var(--murder-border);
-  border-radius: 8px;
-  font-family: var(--murder-serif);
-  transition: border-color 0.2s ease;
-}
-div.stButton > button:hover {
-  border-color: var(--murder-gold);
-  color: #E8DCC8;
-}
-div.stButton > button[kind="primary"] {
-  background: var(--murder-red);
-  border-color: #8a2020;
-  color: #F5E6D8;
-  font-weight: 500;
-}
-[data-testid="stTextInput"] input,
-[data-testid="stTextArea"] textarea {
-  background: var(--murder-input) !important;
-  color: var(--murder-text) !important;
-  border: 1px solid var(--murder-border) !important;
-  border-radius: 8px !important;
-  font-family: var(--murder-sans);
-}
-[data-testid="stTextInput"] input::placeholder,
-[data-testid="stTextArea"] textarea::placeholder {
-  color: #9a8e75 !important;   /* 8-20 提亮：#6f6550 → #9a8e75 */
-  font-family: var(--murder-sans);
-}
-/* Selectbox 暗色化（飞哥 8-20 反馈"填入栏还是白底"——下拉打开态已 OK，但收起态触发器漏了）：
-   Streamlit 1.61 baseweb Select 触发器可能用 background-image 或 box-shadow 模拟白底，
-   或者有更高优先级的 specificity 元素盖在前面。必须：
-   ① 列尽所有可能的元素类型（div/span/input/button + role=button/combobox）
-   ③ background-image: none + box-shadow: none 兜底（baseweb 常用这两种方式做白底）
-   ④ 给整个 selectbox 容器加 padding 让深色背景延伸覆盖触发器边框 */
-[data-testid="stSelectbox"] div,
-[data-testid="stSelectbox"] span,
-[data-testid="stSelectbox"] input,
-[data-testid="stSelectbox"] button,
-[data-testid="stSelectbox"] [role="button"],
-[data-testid="stSelectbox"] [role="combobox"],
-[data-testid="stSelectbox"] [data-baseweb="select"],
-[data-testid="stSelectbox"] [data-baseweb="select"] * {
-  background-color: var(--murder-input) !important;
-  background-image: none !important;   /* 兜底：baseweb 可能用 image 模拟白底 */
-  box-shadow: none !important;         /* 兜底：baseweb 可能用 shadow 模拟白底光晕 */
-  color: var(--murder-text) !important;
-}
-[data-testid="stSelectbox"] [data-baseweb="select"] {
-  border: 1px solid var(--murder-border) !important;
-  border-radius: 8px;
-}
-[data-testid="stSelectbox"] [data-baseweb="select"]:hover {
-  border-color: var(--murder-gold) !important;
-}
-[data-testid="stRadio"] label {
-  color: var(--murder-text);
-}
-/* 下拉打开后的虚拟 dropdown（baseweb Menu/Listbox，DOM 在 stSelectbox 之外的 portal）：
-   同样用 * 通配穿透所有子元素 + image/shadow 兜底；hover/选中态给金色高亮提示。 */
-[data-testid="stSelectboxVirtualDropdown"] * {
-  background-color: var(--murder-input) !important;
-  background-image: none !important;
-  box-shadow: none !important;
-  color: var(--murder-text) !important;
-}
-[data-testid="stSelectboxVirtualDropdown"] [role="option"]:hover,
-[data-testid="stSelectboxVirtualDropdown"] [aria-selected="true"] {
-  background-color: var(--murder-card) !important;
-  background-image: none !important;
-  color: var(--murder-gold) !important;
-}
-[data-testid="stChatMessage"] {
-  background: var(--murder-card);
-  border: 1px solid var(--murder-border);
-  border-radius: 10px;
-  padding: 10px 14px;
-}
-[data-testid="stChatMessage"] [data-testid="stMarkdownContainer"] {
-  color: var(--murder-text);
-}
-[data-testid="stChatInput"] {
-  background: var(--murder-input) !important;
-  border: 1px solid var(--murder-border) !important;
-  border-radius: 10px !important;
-  color: var(--murder-text) !important;
-}
-[data-testid="stChatInput"] > div,
-[data-testid="stChatInput"] > div > div,
-[data-testid="stChatInputContainer"],
-[data-testid="stChatInputTextArea"],
-[data-testid="stChatInput"] textarea,
-[data-testid="stChatInput"] input {
-  background: var(--murder-input) !important;
-  background-color: var(--murder-input) !important;
-  color: var(--murder-text) !important;
-  border-color: var(--murder-border) !important;
-  box-shadow: none !important;
-  font-family: var(--murder-sans) !important;   /* 8-20：聊天输入框改无衬线，楷体小字糊 */
-}
-[data-testid="stChatInput"] textarea::placeholder,
-[data-testid="stChatInputTextArea"]::placeholder {
-  color: #6f6550 !important;
-}
-/* chat_input 发送按钮：金色高亮，保持圆形 */
-[data-testid="stChatInput"] button,
-[data-testid="stChatInputSubmitButton"] {
-  background: var(--murder-gold) !important;
-  color: #141110 !important;
-  border: none !important;
-}
-[data-testid="stChatInput"] button:hover,
-[data-testid="stChatInputSubmitButton"]:hover {
-  background: #E8DCC8 !important;
-  color: #141110 !important;
-}
-/* Expander 暗色化（飞哥 8-20 反馈"展开后内容区是白底"——和 selectbox 同类问题）：
-   Streamlit 1.61 expander 用 baseweb Accordion，details 内容区有自己的白底样式覆盖在前面。
-   必须用和 selectbox 同款的「* 通配 + image/shadow 兜底」穿透所有子元素。
-   标题栏保留 serif 衬线感（沉浸感），内容区用 sans-serif（清晰可读）。
-   8-20 飞哥再次反馈"expander header 还是白的"：之前漏了 <summary>（原生 HTML
-   的折叠头）和 .streamlit-expanderHeader 的 background 选择器，浏览器默认
-   summary 是白底，必须显式压住。 */
-[data-testid="stExpander"],
-[data-testid="stExpander"] details,
-[data-testid="stExpander"] details > div,
-[data-testid="stExpander"] details > summary,
-[data-testid="stExpander"] summary,
-[data-testid="stExpander"] [data-baseweb="accordion"],
-[data-testid="stExpander"] [data-baseweb="accordion"] *,
-[data-testid="stExpander"] [data-baseweb="accordion"] summary,
-[data-testid="stExpander"] .streamlit-expanderHeader {
-  background-color: var(--murder-card) !important;
-  background-image: none !important;   /* 兜底：baseweb 可能用 image 模拟白底 */
-  box-shadow: none !important;         /* 兜底：baseweb 可能用 shadow 模拟白底光晕 */
-}
-[data-testid="stExpander"] {
-  border: 1px solid var(--murder-border) !important;
-  border-radius: 10px;
-}
-.streamlit-expanderHeader {
-  color: var(--murder-text) !important;
-  font-family: var(--murder-serif);
-  background-color: var(--murder-card) !important;
-  background-image: none !important;
-}
-/* 内容区文字色强制米色（默认 baseweb 强制黑底白字会变白底黑字，必须显式覆盖） */
-[data-testid="stExpander"] [data-testid="stMarkdownContainer"],
-[data-testid="stExpander"] [data-testid="stMarkdownContainer"] p,
-[data-testid="stExpander"] [data-testid="stMarkdownContainer"] li {
-  color: var(--murder-text) !important;
-  background-color: transparent !important;   /* 让 expander 容器背景透出，避免嵌套白底 */
-}
-[data-testid="stCaptionContainer"] {
-  color: var(--murder-muted);
-  font-family: var(--murder-sans);   /* 8-20：caption 改无衬线，避免楷体小字号笔画糊 */
-  font-size: 14px;   /* 强制不小于 14px，避免太小的字 */
-  font-weight: 500;   /* 略加粗，提升可读性 */
-}
-[data-testid="stInfo"], [data-testid="stSuccess"], [data-testid="stWarning"], [data-testid="stError"] {
-  border-radius: 8px;
-}
-[data-testid="stInfo"] { background: #221c18; color: var(--murder-text); border: 1px solid var(--murder-border); }
-[data-testid="stWarning"] { background: #2a0f0c; color: #F09595; border: 1px solid #8a2020; }
-[data-testid="stSuccess"] { background: #1a2416; color: #C0DD97; border: 1px solid #3B6D11; }
-hr {
-  border-color: var(--murder-border) !important;
-}
-/* 底部 toolbar / footer 暗色化（飞哥 8-20 反馈"输入框下方大片白色与暗色主题不符"）
-   Streamlit 把 chat_input 放在底部 stBottom 容器里，这个容器默认是白底，
-   之前只覆盖了 stChatInput 自身，父容器 + footer 漏掉了——补刀。 */
-[data-testid="stBottom"],
-[data-testid="stBottomContainer"],
-footer,
-[data-testid="stDecoration"] {
-  background: var(--murder-bg) !important;
-  background-color: var(--murder-bg) !important;
-  color: var(--murder-text) !important;
-}
-[data-testid="stBottom"] > * {
-  background: var(--murder-bg) !important;
-  background-color: var(--murder-bg) !important;
-}
-</style>
-"""
-
-
-# ==================== C-2：氛围音乐控制条（Web Audio 合成雨声 + 悬疑 drone） ====================
-# 常量 HTML：不依赖任何 Python state。key 固定，Streamlit rerun 时同 key 同 props
-# 的组件复用 iframe → 音乐不闪断。播放/音量状态由 iframe 内部 JS 持有。
-_AMBIENT_AUDIO_HTML = """
-<div style="font-family:'KaiTi','楷体','SimSun',serif; background:#141110; border:1px solid #6b4f2a; border-radius:10px; padding:10px 12px; color:#E8DCC8;">
-  <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
-    <span style="font-size:12px; color:#C9A227; letter-spacing:2px;">⛈ 雷雨氛围</span>
-    <button id="ambient-btn" onclick="toggleAmbient()" style="background:#221c18; color:#C9A227; border:1px solid #6b4f2a; border-radius:6px; padding:4px 10px; font-size:12px; cursor:pointer; font-family:inherit;">▶ 开启雷雨</button>
-  </div>
-  <div style="display:flex; align-items:center; gap:8px;">
-    <span style="font-size:11px; color:#8a7a5f;">小</span>
-    <input id="ambient-vol" type="range" min="0" max="1" step="0.05" value="0.4" oninput="setVolume(this.value)" style="flex:1; accent-color:#C9A227;">
-    <span style="font-size:11px; color:#8a7a5f;">大</span>
-  </div>
-</div>
-<script>
-var ctx = null, masterGain = null, playing = false, volume = 0.4, thunderTimer = null;
-function makeNoise(size) {
-  var buf = ctx.createBuffer(1, size, ctx.sampleRate);
-  var d = buf.getChannelData(0);
-  for (var i = 0; i < size; i++) d[i] = Math.random() * 2 - 1;
-  return buf;
-}
-function initAudio() {
-  if (ctx) return;
-  ctx = new (window.AudioContext || window.webkitAudioContext)();
-  masterGain = ctx.createGain(); masterGain.gain.value = 0; masterGain.connect(ctx.destination);
-  var size = 2 * ctx.sampleRate;
-  // 雨势主体：白噪声 + 带通 1000Hz（中频沙沙声，主体）
-  var bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1000; bp.Q.value = 0.5;
-  var bodyGain = ctx.createGain(); bodyGain.gain.value = 0.30;
-  var noiseBody = ctx.createBufferSource(); noiseBody.buffer = makeNoise(size); noiseBody.loop = true;
-  noiseBody.connect(bp); bp.connect(bodyGain); bodyGain.connect(masterGain); noiseBody.start();
-  // 雨滴细节：白噪声 + 高通 2200Hz（高频噼啪感，像雨点打窗）
-  var hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 2200;
-  var detailGain = ctx.createGain(); detailGain.gain.value = 0.16;
-  var noiseDetail = ctx.createBufferSource(); noiseDetail.buffer = makeNoise(size); noiseDetail.loop = true;
-  noiseDetail.connect(hp); hp.connect(detailGain); detailGain.connect(masterGain); noiseDetail.start();
-  // 远景 drone：低频 55Hz 失谐（阴沉持续底色）
-  var droneGain = ctx.createGain(); droneGain.gain.value = 0.10;
-  var o1 = ctx.createOscillator(); o1.type = 'sine'; o1.frequency.value = 55;
-  var o2 = ctx.createOscillator(); o2.type = 'sine'; o2.frequency.value = 55.7;
-  o1.connect(droneGain); o2.connect(droneGain); droneGain.connect(masterGain);
-  o1.start(); o2.start();
-}
-function playThunder() {
-  if (!ctx) return;
-  // 雷声：60Hz 振荡 + 0.05s 攻击 + 1.5s 衰减，像远处闷雷
-  var g = ctx.createGain();
-  g.gain.setValueAtTime(0, ctx.currentTime);
-  g.gain.linearRampToValueAtTime(0.35 * volume, ctx.currentTime + 0.05);
-  g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 1.5);
-  g.connect(ctx.destination);
-  var o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = 60;
-  // LFO 给低频加微抖动，让雷声"颤抖"更真实
-  var lfo = ctx.createOscillator(); lfo.type = 'sine'; lfo.frequency.value = 0.7;
-  var lfoGain = ctx.createGain(); lfoGain.gain.value = 6;
-  lfo.connect(lfoGain); lfoGain.connect(o.frequency);
-  o.connect(g); o.start(); lfo.start();
-  o.stop(ctx.currentTime + 1.5); lfo.stop(ctx.currentTime + 1.5);
-}
-function scheduleThunder() {
-  if (thunderTimer) clearTimeout(thunderTimer);
-  // 8-15 秒随机间隔，暂停时不再触发
-  var delay = 8000 + Math.random() * 7000;
-  thunderTimer = setTimeout(function() {
-    if (playing) playThunder();
-    scheduleThunder();
-  }, delay);
-}
-function toggleAmbient() {
-  var btn = document.getElementById('ambient-btn');
-  if (!ctx) initAudio();
-  if (ctx.state === 'suspended') ctx.resume();
-  playing = !playing;
-  if (playing) {
-    masterGain.gain.setTargetAtTime(volume, ctx.currentTime, 0.2);
-    btn.textContent = '⏸ 暂停雷雨';
-    btn.style.borderColor = '#C0392B'; btn.style.color = '#F09595';
-    scheduleThunder();
-  } else {
-    masterGain.gain.setTargetAtTime(0, ctx.currentTime, 0.2);
-    btn.textContent = '▶ 开启雷雨';
-    btn.style.borderColor = '#6b4f2a'; btn.style.color = '#C9A227';
-    if (thunderTimer) { clearTimeout(thunderTimer); thunderTimer = null; }
-  }
-}
-function setVolume(v) {
-  volume = parseFloat(v);
-  if (playing && ctx) masterGain.gain.setTargetAtTime(volume, ctx.currentTime, 0.05);
-}
-</script>
-"""
-
-
-# ==================== C-1：开场动画（打字机 + 红章 + 幕布，仅开局一次） ====================
-# __TITLE__ 占位符由 _render_intro_animation 用 json.dumps 转义后替换（防引号注入）
-_INTRO_HTML = """
-<div data-tid="__TID__" style="font-family:'KaiTi','楷体',serif; text-align:center; padding:26px 18px; background:#141110; border:1px solid #6b4f2a; border-radius:12px; color:#E8DCC8; min-height:250px; display:flex; flex-direction:column; align-items:center; justify-content:center; position:relative; overflow:hidden;">
-  <div id="intro-curtain" style="position:absolute; inset:0; background:#0d0b0a; z-index:3;"></div>
-  <div id="intro-body" style="opacity:0; z-index:2;">
-    <div style="font-size:12px; color:#8a7a5f; letter-spacing:4px; margin-bottom:14px;">案件卷宗 · 编号 7-0313</div>
-    <div id="intro-title" style="font-size:25px; color:#C9A227; letter-spacing:8px; margin:0; font-weight:500; min-height:36px;"></div>
-    <div id="intro-sub" style="font-size:12px; color:#a2947a; margin-top:14px; opacity:0; letter-spacing:2px;">真相散落在每个人手里，只有互相盘问才能拼出全貌</div>
-  </div>
-  <div id="intro-stamp" style="position:absolute; z-index:2; font-size:30px; color:#C0392B; border:3px solid #C0392B; padding:2px 14px; border-radius:6px; transform:rotate(-14deg) scale(2.4); opacity:0; letter-spacing:6px; font-weight:500;">机密</div>
-</div>
-<script>
-(function(){
-  var title = __TITLE__;
-  var i = 0;
-  var titleEl = document.getElementById('intro-title');
-  var curtain = document.getElementById('intro-curtain');
-  var body = document.getElementById('intro-body');
-  var stamp = document.getElementById('intro-stamp');
-  var sub = document.getElementById('intro-sub');
-  var t = setInterval(function(){
-    if (i <= title.length) {
-      titleEl.textContent = title.slice(0, i);
-      i++;
-    } else {
-      clearInterval(t);
-      stamp.style.transition = 'transform 0.3s ease, opacity 0.15s ease';
-      stamp.style.transform = 'rotate(-14deg) scale(1)';
-      stamp.style.opacity = '1';
-      setTimeout(function(){
-        stamp.style.transition = 'opacity 0.5s ease';
-        stamp.style.opacity = '0';
-        body.style.opacity = '1';
-        sub.style.transition = 'opacity 0.8s ease 0.3s';
-        sub.style.opacity = '1';
-        curtain.style.transition = 'opacity 0.9s ease';
-        curtain.style.opacity = '0';
-      }, 650);
-    }
-  }, 90);
-})();
-</script>
-"""
-
-
-# ==================== C-3/C-4：阶段过渡幕布 + 事件音效 ====================
-# __BANNER__（大字标题）和 __SFX__（讨论/投票/揭晓 音效种类）占位符，渲染时替换。
-# key = thread_id + phase：阶段切换才重挂载 → 动画 + 音效播一次；跨局重玩 key 变不串。
-_PHASE_BANNER_HTML = """
-<div data-tid="__TID__" style="text-align:center; padding:10px 0; font-family:'KaiTi','楷体',serif;">
-  <div id="phase-banner" style="display:inline-block; background:#1d1916; border:1px solid #C9A227; border-radius:10px; padding:10px 30px; color:#C9A227; font-size:18px; letter-spacing:6px; opacity:0;">
-    __BANNER__
-  </div>
-</div>
-<style>
-@keyframes bannerIn { from { opacity:0; transform:scale(0.85);} to { opacity:1; transform:scale(1);} }
-</style>
-<script>
-(function(){
-  var el = document.getElementById('phase-banner');
-  el.style.animation = 'bannerIn 0.8s ease forwards';
-  var c = new (window.AudioContext || window.webkitAudioContext)();
-  var g = c.createGain(); g.connect(c.destination);
-  var kind = '__SFX__';
-  if (kind === 'bell') {
-    var o = c.createOscillator(); o.type = 'sine'; o.frequency.value = 392;
-    g.gain.setValueAtTime(0.22, c.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 1.8);
-    o.connect(g); o.start(); o.stop(c.currentTime + 1.9);
-  } else if (kind === 'drum') {
-    var o = c.createOscillator(); o.type = 'sine'; o.frequency.value = 110;
-    g.gain.setValueAtTime(0.3, c.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 0.5);
-    o.connect(g); o.start(); o.stop(c.currentTime + 0.6);
-  } else {
-    var o = c.createOscillator(); o.type = 'triangle'; o.frequency.value = 520;
-    g.gain.setValueAtTime(0.1, c.currentTime);
-    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + 0.2);
-    o.connect(g); o.start(); o.stop(c.currentTime + 0.25);
-  }
-})();
-</script>
-"""
+# ==================== UI 资源与组件 ====================
+# 主题 CSS / 内嵌 HTML 在 ui_theme.py、ui_assets.py；开始页在 ui_start.py；
+# 游戏页渲染组件在 ui_components.py。app.py 只保留页面编排和会话状态。
 
 
 # 缓存图对象：这样 MemorySaver 的状态在 Streamlit 会话内不会丢
 @st.cache_resource
 def get_graph():
     return build_graph()
-
-
-@st.cache_data
-def _cached_relations_html(relations_tuple, names_tuple):
-    """L9：relations 不变时复用 pyvis HTML，避免每次 rerun 重新生成。"""
-    return build_relations_html(list(relations_tuple), list(names_tuple))
-
-
-@st.dialog("🕸️ 人物关系图（仅公开关系）", width="large")
-def _relations_dialog(relations_html):
-    """屏幕中央弹出的人物关系图（模态框，右上角自带 X 可关闭）。
-
-    侧边栏空间小，关系图挤在 380px 高的框里看不清；改成点按钮后在大弹窗里看。
-    st.dialog 是 Streamlit 的模态框：调用即弹出、点右上角 X 或点弹窗外区域关闭。
-    """
-    st.components.v1.html(relations_html, height=700)   # L7 修复：与 visualization.py 的 canvas 680px 对齐，避免滚动条
 
 
 # ==================== 沉浸 UI 渲染函数 ====================
@@ -492,72 +111,52 @@ def _sanitize_md(text: str) -> str:
     return escaped.replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _render_ambient_audio():
-    """侧边栏底部：氛围音乐控制条（常驻，rerun 不闪断）。
 
-    音频状态（播放/音量）由 iframe 内部 JS 持有，不经过 Streamlit——
-    组件 HTML 是常量 + 调用位置固定，Streamlit rerun 时 React 复用 iframe，
-    音乐不中断（注意：st.components.v1.html 不支持 key 参数，
-    复用靠"位置稳定 + HTML 不变"，跨局重玩时音乐回到暂停态是合理的）。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _format_chat_message(speaker: str, content: str) -> str:
+    """聊天消息格式化：DM 台词按 Markdown 渲染，其他角色按字面量渲染。
+
+    修复：DM 的揭晓/复盘文本包含 ## 标题、**加粗**、列表等 Markdown，
+    之前统一走 _sanitize_md 导致页面上显示成原始 # / ** 符号。
+    DM 是受控的系统提示输出，不开放 unsafe HTML；玩家/AI 发言仍逐字转义，
+    防止聊天流被 Markdown 排版指令污染。
     """
-    with st.sidebar:
-        st.components.v1.html(_AMBIENT_AUDIO_HTML, height=84)
+    speaker_text = _sanitize_md(str(speaker))
+    body = "" if content is None else str(content)
+    if str(speaker) in {"主持人", "DM"}:
+        return f"**{speaker_text}**：\n\n{body}"
+    return f"**{speaker_text}**：{_sanitize_md(body)}"
 
 
-def _resolve_case_title(result: dict) -> str:
-    """从 result 提取案件卷宗标题：优先 script.background 前段（具体有画面感），
-    兜底 theme（不能是"自由发挥"），最后"未命名卷宗"。
-
-    8-20 飞哥反馈：选"自由发挥"时卷宗标题直接显示"自由发挥"——没信息量且破坏神秘感。
-    修复：用脚本生成的具体案件描述前段做标题，"自由发挥"兜底成"未命名卷宗"。
-    """
-    script = result.get("script", {}) or {}
-    bg = (script.get("background", "") or "").strip()
-    if bg:
-        # 取前 28 字作为卷宗标题，保留"……"暗示有完整 background
-        if len(bg) > 28:
-            return bg[:28] + "……"
-        return bg
-    theme = (result.get("theme") or "").strip()
-    if theme and theme != "自由发挥":
-        return theme
-    return "未命名卷宗"
-
-
-def _render_intro_animation(result: dict):
-    """开局一次性：案件封面动画（打字机 + 红章 + 幕布）。
-
-    session_state["intro_played"] 控制只播一次；title 经 json.dumps 转义防注入。
-    thread_id 拼进 HTML（data 属性）——跨局重玩时 HTML 变化触发 iframe 重挂载，
-    动画才能重播（st.components.v1.html 不支持 key 参数，用此法替代）。
-    """
-    case_title = _resolve_case_title(result)
-    safe_title = json.dumps(case_title, ensure_ascii=False)
-    html = (_INTRO_HTML
-            .replace("__TITLE__", safe_title)
-            .replace("__TID__", st.session_state.thread_id))
-    st.components.v1.html(html, height=310)
-
-
-def _render_phase_banner(result: dict):
-    """阶段过渡幕布 + 事件音效（HTML 含 thread_id + phase，阶段变或跨局重玩才重挂载）。
-
-    phase: discuss →「自由讨论开始」/ vote →「烛光投票」/ reveal →「真相大白」。
-    """
-    phase = result.get("current_phase", "")
-    labels = {
-        "discuss": ("自由讨论开始", "tick"),
-        "vote": ("烛光投票", "bell"),
-        "reveal": ("真相大白", "drum"),
-    }
-    if phase not in labels:
-        return
-    banner, sfx = labels[phase]
-    html = (_PHASE_BANNER_HTML
-            .replace("__BANNER__", banner)
-            .replace("__SFX__", sfx)
-            .replace("__TID__", st.session_state.thread_id))
-    st.components.v1.html(html, height=58)
+@st.cache_data(show_spinner=False, ttl=300)
+def _cached_assistant_analysis(
+    suspects: tuple[str, ...],
+    public_clues: tuple[str, ...],
+    relations: tuple[str, ...],
+    notes: str,
+    round_num: int,
+) -> str:
+    """缓存侦探助手结果：相同公开信息/笔记/轮次不重复烧 token。"""
+    return analyze_case(
+        suspects=list(suspects),
+        public_clues=list(public_clues),
+        relations=list(relations),
+        notes=notes,
+        round_num=round_num,
+    )
 
 
 def _reset_game_state() -> None:
@@ -574,8 +173,15 @@ def _reset_game_state() -> None:
             graph.checkpointer.delete_thread(tid)
         except Exception as e:
             logger.warning("checkpoint 清理失败 thread=%s: %s", tid, e)
-    for key in ["started", "result", "thread_id", "intro_played", "last_error"]:
+    for key in [
+        "started", "result", "thread_id", "intro_played", "personal_script_seen", "last_error",
+        "role_loading", "pending_role",
+    ]:
         st.session_state.pop(key, None)
+    # 清理非 widget 的大对象缓存（复盘 JSON / 助手建议），避免多局累积。
+    for key in list(st.session_state):
+        if key.startswith("review_json_") or key.startswith("assistant_advice_"):
+            st.session_state.pop(key, None)
 
 
 def _run_stream(graph, cmd, config):
@@ -642,8 +248,8 @@ def _run_stream(graph, cmd, config):
                 for _node, update in d.items():
                     if isinstance(update, dict):
                         for m in update.get("messages", []):
-                            # L5：发言内容按字面量渲染（防 markdown 注入聊天流）
-                            segments.append(f"**{_sanitize_md(m['speaker'])}**：{_sanitize_md(m['content'])}")
+                            # DM 台词渲染 Markdown；其他角色仍按字面量渲染。
+                            segments.append(_format_chat_message(m["speaker"], m["content"]))
                 current_parts = []   # 节点结束，清空当前 token 累积
                 pending = 0
                 render()
@@ -664,6 +270,8 @@ def _run_stream(graph, cmd, config):
 
 st.set_page_config(page_title="AI 剧本杀主持人", page_icon="🕯", layout="wide")
 st.markdown(_THEME_CSS, unsafe_allow_html=True)
+render_character_styles()
+init_audio_engine()
 graph = get_graph()
 
 # ---- 跨 rerun 持久化的错误提示 ----
@@ -692,133 +300,242 @@ if "result" not in st.session_state:
     st.session_state.result = None
 if "intro_played" not in st.session_state:
     st.session_state.intro_played = False   # 开场动画只播一次
+if "personal_script_seen" not in st.session_state:
+    st.session_state.personal_script_seen = False   # 个人剧本只在开局默认展开一次
+if "launched" not in st.session_state:
+    # 启动封面只在本会话第一次打开时出现；点「开始游戏」后才进入案件设定页。
+    st.session_state.launched = False
+if "game_history" not in st.session_state:
+    # 本会话最近战绩（最多保留 10 局）：不落库，刷新即清空。
+    st.session_state.game_history = []
 
 # M1：thread_id → config 全项目唯一构造点（与 GameSession/终端版同一语义）
 config = build_config(st.session_state.thread_id)
 # M12：对局 ID 注入日志上下文（rerun 时重复 set 无害，contextvars 是本协程私有）
 set_game_id(st.session_state.thread_id)
 
-st.title("🕯 剧本杀 · 推理之夜")
-st.caption("卷宗已开启——你扮演其中一个嫌疑人，找出真凶。")
-
-# ---- 未开始：输入主题 + 选背景风格 + 可选自定义剧情背景 ----
-if not st.session_state.started:
-    st.markdown("输入一个主题、选一个背景风格，AI 会生成剧本、分配角色，你扮演其中一个嫌疑人参与破案。")
-    theme = st.text_input("剧本杀主题（可留空，AI 自动发挥）", placeholder="例如：民国豪门恩怨 / 湖南师大规则怪谈")
-    background = st.selectbox(
-        "背景风格",
-        ["自由发挥", "民国豪门", "校园怪谈", "古风仙侠", "现代都市", "科幻末世"],
-    )
-    # 可选：自定义剧情背景，优先级高于上面的主题 + 风格
-    background_story = st.text_area(
-        "自定义剧情背景（可选，写下具体背景剧情，AI 会理解后融入创作）",
-        placeholder="例如：1935 年上海滩，顾家老爷在寿宴上离奇身亡，三个姨太与管家各怀鬼胎……\n留空则由 AI 根据主题和风格自由发挥",
-    )
-    # 可选：自定义故事时间 / 地点，作为"素材种子"引导 LLM 理解后融入，而不是照抄
-    story_time = st.text_input(
-        "故事发生时间（可选）",
-        placeholder="例如：1935 年深秋 / 宋代江南 / 未来废土纪元",
-    )
-    story_location = st.text_input(
-        "故事发生地点（可选）",
-        placeholder="例如：上海滩租界 / 湖南师大图书馆 / 深山古宅",
-    )
-    # 嫌疑人名字模式：随机 or 自定义（自定义更有代入感，可用朋友/同学名）
-    name_mode = st.radio("嫌疑人名字", ["随机生成", "自定义"], horizontal=True)
-    custom_names = []
-    if name_mode == "自定义":
-        custom_names_text = st.text_input(
-            "输入嫌疑人名字（3~6 个，用逗号或空格分隔）",
-            placeholder="例如：张三, 李四, 王五, 赵六",
-        )
-        custom_names = _parse_names(custom_names_text)
-        if custom_names and len(custom_names) < 3:
-            st.caption("⚠️ 至少 3 个名字，否则会自动退回随机生成")
-    # 讨论节奏：快/标准/深入 → 每人发言 2/3/4 轮（报告⑫：轮数可调，避免垃圾时间/意犹未尽）
-    pace = st.radio("讨论节奏", ["快（每人2轮）", "标准（每人3轮）", "深入（每人4轮）"], horizontal=True)
-    rounds_per_player = {"快（每人2轮）": 2, "标准（每人3轮）": 3, "深入（每人4轮）": 4}[pace]
-    if st.button("🔍 立案侦查", type="primary"):
-        st.session_state.started = True
-        # F2：输入长度限制，防超长输入烧 token + 降低注入攻击面
-        theme_val = (theme.strip() or "自由发挥")[:MAX_THEME_LEN]
-        story_val = background_story.strip()[:MAX_BG_STORY_LEN]
-        time_val = story_time.strip()[:MAX_STORY_TIME_LEN]
-        location_val = story_location.strip()[:MAX_STORY_LOCATION_LEN]
-
-        # F2：自定义名字白名单校验（只允许中英数字和间隔号，2-10 字，防名字里塞 prompt）
-        custom_names = sanitize_custom_names(custom_names)
-
-        # 真流式生成剧本：边生成边显示，而不是盯着 spinner 干等。
-        # generate_script_stream 是生成器，逐 token yield；手动 next() 迭代，
-        # 从 StopIteration.value 拿到它 return 的最终 script。
-        # R8：传跨局已用名字集合（生成器内部原地 update，抽用自动写回）。
-        st.markdown("### 🎬 正在生成剧本...")
-        gen = generate_script_stream(theme_val, background, story_val, custom_names,
-                                     time_val, location_val, used=st.session_state.used_names)
-        placeholder = st.empty()
-        parts = []   # 用 list 累积 token（O(n)），避免 full_text += token 的 O(n²)
-        pending = 0  # 距上次刷新累计的字符数，用于节流显示
-        script = None
-        try:
-            while True:
-                item = next(gen)
-                # H17：生成器 yield ("token", 文本) 或 ("retry", 提示)；
-                # 自洽校验重试时清空已显示的半截 JSON，避免两段拼接混乱
-                if isinstance(item, tuple) and item[0] == "retry":
-                    parts = []
-                    pending = 0
-                    placeholder.code(item[1], language=None)
-                    continue
-                token = item[1] if isinstance(item, tuple) else item
-                parts.append(token)
-                pending += len(token)
-                if pending >= 48:   # 攒够 48 字符才刷新，避免每个 token 全量重写 DOM
-                    placeholder.code("".join(parts), language=None)
-                    pending = 0
-        except StopIteration as e:
-            script = e.value   # 生成器 return 的最终 script
-        except ScriptGenerationError as e:
-            # H1：剧本致命问题（凶手无效/无线索）重试耗尽，提示重开而非带病启动
-            st.error(f"剧本生成质量不达标：{e}")
-            st.info("请调整主题或背景后重新立案侦查。")
-            st.session_state.started = False
-            st.stop()
-        except Exception as e:
-            # LLM 网络异常 / 限流 / 超时会在这里抛出，不能让页面直接崩溃
-            st.error(f"剧本生成失败：{type(e).__name__}：{e}")
-            st.info("可能是网络波动或 DeepSeek 临时限流，请稍后点击「立案侦查」重试。")
-            st.session_state.started = False   # 回到输入页，允许重试
-            st.stop()
-        placeholder.code("".join(parts), language=None)   # 收尾：显示完整原始 JSON
-        # 8-20 审查优化：完整剧本 JSON 改折叠展示（默认收起）——新手不用直面一坨 JSON，
-        # 排查问题时仍可展开查看原始生成结果（演示时也保留"真流式生成"的过程感）
-        # M3 修复：dict 直接给 st.code 会被 str() 转义成 \uXXXX，用 json.dumps(ensure_ascii=False) 还原中文
-        with st.expander("📄 查看生成剧本（开发者/排查用）", expanded=False):
-            st.code(json.dumps(script, ensure_ascii=False, indent=2), language="json")
-        st.success("剧本生成完成！")
-
-        # 把预生成好的 script 传给图（generate_script_node 检测到已有 script 会跳过）
-        # R8：used_names 一并写入状态，GameState.used_names 不再是死字段
-        st.session_state.result = graph.invoke(
-            {
-                "script": script,
-                "theme": theme_val,
-                "background_style": background,
-                "background_story": story_val,
-                "story_time": time_val,
-                "story_location": location_val,
-                "custom_names": custom_names,
-                "rounds_per_player": rounds_per_player,
-                "used_names": sorted(st.session_state.used_names),
-                "messages": [],
-                "thoughts": [],
-            },
-            config,
-        )
+# ---- 启动封面：首次打开项目的沉浸式入口（不直接露出设定表单） ----
+if not st.session_state.launched:
+    set_audio_scene("menu")
+    if render_launch_screen():
+        # 封口印章音效放在 rerun 后的开始页播放，避免 st.rerun 丢弃刚注入的脚本
+        st.session_state.launch_seal = True
+        st.session_state.launched = True
         st.rerun()
+    st.stop()
+
+# ---- 未开始：开始页（卷宗封面 + 表单 + 玩法说明卡） ----
+if not st.session_state.started:
+    set_audio_scene("menu")
+    if st.session_state.pop("launch_seal", False):
+        play_audio_cue("seal", token=f"{st.session_state.thread_id}:launch")
+    with st.container(key="start_page"):
+        render_start_hero()
+
+        col_form, col_side = st.columns([1.85, 1], gap="large")
+        with col_form:
+            # 进度占位放在表单卡上方：点击后用户不用滚动就能看到“正在生成”。
+            progress = st.empty()
+            with st.container(key="start_form_card"):
+                st.markdown('<div class="start-section">① 案件设定</div>', unsafe_allow_html=True)
+                theme = st.text_input(
+                    "剧本杀主题",
+                    placeholder="例如：民国豪门恩怨 / 湖南师大规则怪谈",
+                    help="留空则由 AI 自动发挥；最多 50 字。",
+                    max_chars=MAX_THEME_LEN,
+                )
+                st.caption("留空则由 AI 自动发挥。")
+
+                background = st.pills(
+                    "背景风格",
+                    list(_START_STYLES.keys()),
+                    selection_mode="single",
+                    default="自由发挥",
+                    required=True,
+                    help="选择世界观的底色；它也会影响嫌疑人名字池与整体语气。",
+                    width="stretch",
+                )
+                if not background:
+                    background = "自由发挥"
+                st.caption(f"{_START_STYLES[background][0]} · {_START_STYLES[background][1]}")
+
+                st.markdown('<div class="start-section">② 对局节奏</div>', unsafe_allow_html=True)
+                pace = st.segmented_control(
+                    "讨论节奏",
+                    list(_PACE_OPTIONS.keys()),
+                    selection_mode="single",
+                    default="标准 · 15–22 分钟",
+                    required=True,
+                    help=_PACE_HELP,
+                    width="stretch",
+                )
+                if not pace:
+                    pace = "标准 · 15–22 分钟"
+                rounds_per_player = _PACE_OPTIONS[pace]
+                st.caption("快 = 每人 2 轮；标准 = 每人 3 轮；深入 = 每人 4 轮。一局约 15–30 分钟，费用约 ¥0.1–0.3。")
+
+                with st.expander("＋ 进阶设定：自定义剧情 · 时间 · 地点 · 嫌疑人名字", expanded=False):
+                    st.caption("自定义剧情背景优先级最高：填了它，主题与风格只作为气质参考。")
+                    background_story = st.text_area(
+                        "自定义剧情背景",
+                        placeholder="例如：1935 年上海滩，顾家老爷在寿宴上离奇身亡，三个姨太与管家各怀鬼胎……",
+                        help="可选。写下具体背景剧情，AI 会理解后融入创作；留空则由 AI 根据主题和风格自由发挥。",
+                        max_chars=MAX_BG_STORY_LEN,
+                        height=120,
+                    )
+                    time_col, loc_col = st.columns(2)
+                    story_time = time_col.text_input(
+                        "故事发生时间",
+                        placeholder="例如：1935 年深秋 / 未来废土纪元",
+                        help="可选。作为时代氛围的素材种子，AI 会理解后融入，不会照抄。",
+                        max_chars=MAX_STORY_TIME_LEN,
+                    )
+                    story_location = loc_col.text_input(
+                        "故事发生地点",
+                        placeholder="例如：上海滩租界 / 湖南师大图书馆",
+                        help="可选。作为空间与人文环境的素材种子。",
+                        max_chars=MAX_STORY_LOCATION_LEN,
+                    )
+                    use_custom_names = st.toggle(
+                        "使用自定义嫌疑人名字",
+                        value=False,
+                        help="默认随机抽取 4–6 名；自定义需填写 3–6 个名字。",
+                    )
+                    custom_names = []
+                    if use_custom_names:
+                        custom_names_text = st.text_input(
+                            "嫌疑人名字（3–6 个，用逗号或空格分隔）",
+                            placeholder="例如：张三, 李四, 王五, 赵六",
+                            max_chars=80,
+                        )
+                        custom_names = _parse_names(custom_names_text)
+                        if custom_names and len(custom_names) < 3:
+                            st.caption("⚠️ 至少 3 个名字，否则会自动退回随机生成。")
+                        elif len(custom_names) > 6:
+                            st.caption("⚠️ 最多 6 个名字，超出部分会被忽略。")
+
+                generate_clicked = st.button(
+                    "立 案 侦 查",
+                    type="primary",
+                    use_container_width=True,
+                    icon=":material/search:",
+                )
+                st.markdown(
+                    '<div class="start-cta-note">剧本生成约 30–60 秒 · 请勿刷新页面</div>',
+                    unsafe_allow_html=True,
+                )
+
+            # 生成进度：只展示阶段，不渲染任何 LLM token（防止选中角色前看到凶手/真相）。
+            if generate_clicked:
+                st.session_state.started = True
+                play_audio_cue(
+                    "case_open",
+                    token=f"{st.session_state.thread_id}:generate:{time.time_ns()}",
+                )
+                # F2：输入长度限制，防超长输入烧 token + 降低注入攻击面
+                theme_val = (theme.strip() or "自由发挥")[:MAX_THEME_LEN]
+                story_val = background_story.strip()[:MAX_BG_STORY_LEN]
+                time_val = story_time.strip()[:MAX_STORY_TIME_LEN]
+                location_val = story_location.strip()[:MAX_STORY_LOCATION_LEN]
+
+                # F2：自定义名字白名单校验（只允许中英数字和间隔号，2-10 字，防名字里塞 prompt）
+                custom_names = sanitize_custom_names(custom_names)
+
+                # 真流式生成：保留“边生成边推进度”的体感，但 token 内容绝不进入 DOM。
+                # generate_script_stream 是生成器，逐 token yield；从 StopIteration.value 拿最终 script。
+                # R8：传跨局已用名字集合（生成器内部原地 update，抽用自动写回）。
+                gen = generate_script_stream(
+                    theme_val, background, story_val, custom_names,
+                    time_val, location_val, used=st.session_state.used_names,
+                )
+                started_at = time.time()
+                stage_idx = 0
+                retry_count = 0
+                last_render = 0.0
+                _render_generation_progress(progress, stage_idx, 0)
+                script = None
+                try:
+                    while True:
+                        item = next(gen)
+                        now = time.time()
+                        elapsed = now - started_at
+                        if isinstance(item, tuple) and item[0] == "retry":
+                            retry_count += 1
+                            stage_idx = len(_GEN_STAGES) - 1
+                            _render_generation_progress(progress, stage_idx, elapsed, retry_count)
+                            last_render = now
+                            continue
+                        # 只按耗时推进阶段，token 内容不读取、不渲染。
+                        if elapsed >= 28:
+                            new_stage = 3
+                        elif elapsed >= 16:
+                            new_stage = 2
+                        elif elapsed >= 7:
+                            new_stage = 1
+                        else:
+                            new_stage = 0
+                        if new_stage > stage_idx or now - last_render >= 1.0:
+                            stage_idx = max(stage_idx, new_stage)
+                            _render_generation_progress(progress, stage_idx, elapsed, retry_count)
+                            last_render = now
+                except StopIteration as e:
+                    script = e.value   # 生成器 return 的最终 script
+                except ScriptGenerationError as e:
+                    # H1：剧本致命问题（凶手无效/无线索）重试耗尽，提示重开而非带病启动
+                    progress.empty()
+                    st.error(f"剧本生成质量不达标：{e}")
+                    st.info("请调整主题或背景后重新立案侦查。")
+                    st.session_state.started = False
+                    st.stop()
+                except Exception as e:
+                    # LLM 网络异常 / 限流 / 超时会在这里抛出，不能让页面直接崩溃
+                    progress.empty()
+                    st.error(f"剧本生成失败：{type(e).__name__}：{e}")
+                    st.info("可能是网络波动或 DeepSeek 临时限流，请稍后点击「立案侦查」重试。")
+                    st.session_state.started = False   # 回到输入页，允许重试
+                    st.stop()
+
+                _render_generation_progress(
+                    progress, len(_GEN_STAGES) - 1, time.time() - started_at,
+                    retry_count, complete=True,
+                )
+
+                # 把预生成好的 script 传给图（generate_script_node 检测到已有 script 会跳过）
+                # R8：used_names 一并写入状态，GameState.used_names 不再是死字段
+                try:
+                    st.session_state.result = graph.invoke(
+                        {
+                            "script": script,
+                            "theme": theme_val,
+                            "background_style": background,
+                            "background_story": story_val,
+                            "story_time": time_val,
+                            "story_location": location_val,
+                            "custom_names": custom_names,
+                            "rounds_per_player": rounds_per_player,
+                            "used_names": sorted(st.session_state.used_names),
+                            "messages": [],
+                            "thoughts": [],
+                        },
+                        config,
+                    )
+                except Exception as e:
+                    progress.empty()
+                    st.error(f"进入游戏失败：{type(e).__name__}：{e}")
+                    st.info("请稍后重试；若持续失败，请检查网络或重新立案侦查。")
+                    st.session_state.started = False
+                    st.stop()
+                st.rerun()
+
+        with col_side:
+            render_audio_panel()
+            render_start_side()
+            render_recent_history(st.session_state.get("game_history", []))
 
 # ---- 已开始：显示游戏 ----
 else:
+    st.title("🕯 剧本杀 · 推理之夜")
+    st.caption("卷宗已开启——你扮演其中一个嫌疑人，找出真凶。")
     result = st.session_state.result
     # 8-20 防御：started=True 但 result 仍为 None（剧本生成中刷新页面/生成被中断残留）。
     # 刷新会终止正在执行的生成循环，result 永远不会被赋值——直接回滚到输入页
@@ -828,26 +545,74 @@ else:
         st.session_state.interrupt_notice = "剧本生成被中断（可能是页面刷新导致），请重新立案侦查。"
         st.rerun()
 
+    interrupt_type = get_interrupt_type(result)
+
     # ---- 阶段 1：开局选角色（图停在 choose_role interrupt，此时 user_role 还没定）----
-    if get_interrupt_type(result) == "choose_role":
+    if interrupt_type == "choose_role":
+        set_audio_scene("menu")
+        # 点击角色后先切到“进入案件”页，再跑图；否则生成 DM 开场/AI 自我介绍时，
+        # 选角卡片仍留在页面上，主持人台词会出现在角色卡下面（用户反馈图一）。
+        if st.session_state.get("role_loading"):
+            st.markdown("### 🎭 正在进入案件……")
+            st.caption("主持人正在整理卷宗和开场白，请稍候。")
+            selected_role = st.session_state.pop("pending_role", "")
+            if not selected_role:
+                st.session_state.role_loading = False
+                st.rerun()
+            try:
+                with st.spinner("正在进入案件，生成开场与自我介绍……"):
+                    st.session_state.result = _run_stream(
+                        graph, Command(resume=selected_role), config
+                    )
+            finally:
+                st.session_state.role_loading = False
+            st.rerun()
         info = get_interrupt(result)
         # C-1：开场动画只播一次（session_state 标记），播完显示选角引导
         if not st.session_state.intro_played:
             _render_intro_animation(result)
+            play_audio_cue(
+                "intro",
+                token=f"{st.session_state.thread_id}:intro",
+                params={"titleLen": len(_resolve_case_title(result))},
+            )
             st.session_state.intro_played = True
         st.markdown("### 🎭 选择你想扮演的角色")
         st.markdown("剧本已生成，请选一个嫌疑人扮演：")
+        # 选角前先展示公开身份信息（职业/与死者关系），避免“看名字盲选”。
+        # 注意：只给公开字段，secret / personal_script 不进入选角 payload。
+        profiles = {
+            p.get("name"): p for p in info.get("profiles", [])
+            if isinstance(p, dict) and p.get("name")
+        }
         # L4：6 列按钮在窄屏挤压，每行最多 3 个
         n_sus = len(info["suspects"])
-        cols = st.columns(min(n_sus, 3))
+        cols = st.columns(min(n_sus, 3), gap="medium")
         for i, name in enumerate(info["suspects"]):
-            if cols[i % 3].button(name, key=f"role_{i}", use_container_width=True):
-                st.session_state.result = _run_stream(graph, Command(resume=name), config)
-                st.rerun()
+            p = profiles.get(name, {})
+            profession = str(p.get("profession", "")).strip()
+            relation = str(p.get("relation_to_victim", "")).strip()
+            with cols[i % 3]:
+                with st.container(key=f"role_card_{i}"):
+                    st.markdown(
+                        character_card_html(name, profession, relation),
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(
+                        "选 择 此 人",
+                        key=f"role_{i}",
+                        use_container_width=True,
+                        help=relation or None,
+                    ):
+                        # 先记录角色并 rerun 到“进入案件”页；真正的图执行在下一轮做，
+                        # 避免选角卡片与 DM 开场台词同屏。
+                        st.session_state.pending_role = name
+                        st.session_state.role_loading = True
+                        st.rerun()
         with st.sidebar:
+            render_audio_panel()
             st.header("🪪 你的角色卡")
             st.caption("请先在主界面选择你的角色")
-            _render_ambient_audio()
         st.stop()   # 选角色阶段不渲染下面的角色卡 / 对话 / 结算
 
     # ---- 阶段 2：游戏中（user_role 已确定）----
@@ -866,7 +631,30 @@ else:
     user_alibi = user_suspect.get("alibi", "")
     user_task = user_suspect.get("task", "")
 
-    # C-4：阶段过渡幕布 + 事件音效（key 随 thread_id + phase，跨局重玩不串动画）
+    # 音频：按阶段切换 BGM，并在进入关键节点时播放提示音。
+    # 音效 token = 本局 thread_id + 节点，重复 rerun 不会重复响；跨局换 thread_id 自动重播。
+    _tid = st.session_state.thread_id
+    _phase = result.get("current_phase", "")
+    _player_won = (
+        (result.get("user_is_murderer") and result.get("game_result") == "凶手胜利")
+        or (not result.get("user_is_murderer") and result.get("game_result") == "平民胜利")
+    )
+    if _phase == "discuss":
+        set_audio_scene("discuss")
+        play_audio_cue("role_reveal", token=f"{_tid}:role_reveal")
+        play_audio_cue("discuss_start", token=f"{_tid}:discuss:start")
+    elif _phase == "vote":
+        set_audio_scene("vote")
+        play_audio_cue("role_reveal", token=f"{_tid}:role_reveal")
+        play_audio_cue("vote_start", token=f"{_tid}:vote:{result.get('vote_round', 1)}")
+    elif _phase == "reveal":
+        set_audio_scene("ending_win" if _player_won else "ending_lose")
+        play_audio_cue("reveal", token=f"{_tid}:reveal")
+        play_audio_cue("win" if _player_won else "lose", token=f"{_tid}:ending", delay_ms=1800)
+    else:
+        set_audio_scene("menu")
+
+    # C-4：阶段过渡幕布（纯视觉；音效由 ui_audio 统一播放，key 随 thread_id + phase）
     _render_phase_banner(result)
     # 轮次进度（普通 markdown，每次 rerun 更新；无动画，不干扰幕布）
     round_num = result.get("phase_round", 0)
@@ -877,32 +665,25 @@ else:
 
     # 角色卡（侧边栏）
     with st.sidebar:
+        # C-2：声音控制面板（音乐/音效独立开关 + 音量；状态由页面顶层音频引擎持有）
+        render_audio_panel()
         st.header("🪪 你的角色卡")
-        st.subheader(user_role)
+        st.markdown(
+            role_header_html(user_role, user_profession, user_relation),
+            unsafe_allow_html=True,
+        )
         # 嫌疑人总览：提到角色卡顶部最显眼位置（飞哥 8-20 反馈"选完角色后原本 4 人
         # 只剩 2 个"的根因——这条原本在 sidebar 最底部，被长角色卡挤出可见区域 +
         # st.write 在长 sidebar 里循环渲染不稳定）。改用 expander 折叠（默认展开）+
-        # markdown 列表强制渲染所有嫌疑人，确保全员任何时候都可见。
+        # 小头像列表，确保全员任何时候都可见。
         if suspects:
             with st.expander(f"👥 嫌疑人总览（共 {len(suspects)} 人）", expanded=True):
-                for s in suspects:
-                    sname = s.get("name", "?")
-                    sprof = s.get("profession", "")
-                    mark = " ←（你）" if sname == user_role else ""
-                    # markdown 渲染（比 st.write 在 sidebar 长内容里更稳定，不丢字符）
-                    # L5 收口：剧本字段全部来自 LLM，按字面量渲染，防被当成排版指令
-                    st.markdown(f"· **{_sanitize_md(sname)}**{mark}  _{_sanitize_md(sprof) or '（未提供职业）'}_")
+                st.markdown(suspect_roster_html(suspects, user_role), unsafe_allow_html=True)
         st.divider()
         # 玩家是凶手时给特殊提示（否则会陷入"知道自己是凶手却无事可做"的断裂）
         if result.get("user_is_murderer"):
             st.warning("🩸 你是真凶！你的目标：误导其他人、隐藏证据、别被投出去。")
-        # 结构化角色信息：让玩家一眼锚定"我是谁、我和死者什么关系、我要干嘛"
-        if user_profession:
-            st.caption("💼 职业")
-            st.markdown(_sanitize_md(user_profession))
-        if user_relation:
-            st.caption("🔗 与死者的关系")
-            st.markdown(_sanitize_md(user_relation))
+        # 结构化角色信息：职业/与死者关系已在角色卡头展示，这里补充行动向信息。
         if user_alibi:
             st.caption("🕐 你的不在场证明")
             st.markdown(_sanitize_md(user_alibi))
@@ -913,40 +694,103 @@ else:
         st.caption("你的秘密（别主动暴露）")
         st.info(_sanitize_md(user_secret))
         st.divider()
-        st.caption("🔍 你掌握的私密线索（只有你知道）")
-        if user_clues:
-            for c in user_clues:
-                st.markdown(f"· {_sanitize_md(c)}")
-        else:
-            st.markdown("· （你没有任何私密线索，只能靠盘问别人）")
+        # 线索板：把「自己的私密线索 / 已公开线索 / 调查所得」分开展示，
+        # 避免玩家在聊天记录里来回翻找，解决“线索记不住”的体验问题（P2）。
+        investigated = result.get("investigated_clues", [])
+        own_private = [c for c in user_clues if c not in investigated]
+        public_clues = result.get("revealed_clues", {})
+        with st.expander("🗂 线索板（私密 / 已公开 / 已调查）", expanded=False):
+            st.caption("🔒 只有你知道的线索")
+            if own_private:
+                for c in own_private:
+                    st.markdown(f"· {_sanitize_md(c)}")
+            else:
+                st.markdown("· （没有私密线索，靠盘问别人）")
+            st.caption("📣 已公开线索")
+            if public_clues:
+                for clue, holder in public_clues.items():
+                    st.markdown(f"· {_sanitize_md(str(holder))} 公开：{_sanitize_md(str(clue))}")
+            else:
+                st.markdown("· （还没有人公开线索）")
+            st.caption("🔍 你调查到的隐藏线索")
+            if investigated:
+                for c in investigated:
+                    st.markdown(f"· {_sanitize_md(c)}")
+            else:
+                st.markdown("· （还没有调查到隐藏线索）")
+            st.caption(
+                f"调查次数：{result.get('investigations_used', 0)} / {INVESTIGATE_LIMIT}"
+            )
+        # 侦探笔记：参考 AI Murder Mystery 的 EnhancedNotesPanel，
+        # 让玩家不用在聊天记录里反复找线索；纯会话状态，不进入图状态。
+        with st.expander("📝 我的推理笔记", expanded=False):
+            st.text_area(
+                "记录你的怀疑、时间线和线索（仅自己可见）",
+                key=f"detective_notes_{st.session_state.thread_id}",
+                height=110,
+                placeholder="例如：李四说 21:00 在图书馆，但监控显示 21:10 才出现……",
+            )
+        # 嫌疑度面板：参考 LieGraph 的 suspicion matrix，只给玩家自己看，
+        # 不把分数传给 AI，避免 AI 迎合玩家或反向剧透。
+        with st.expander("🎯 嫌疑度面板", expanded=False):
+            st.caption("给你自己打分的推理辅助，不会传给 AI。")
+            for s in suspects:
+                sname = s.get("name", "")
+                # 自己的角色不需要“嫌疑度”，面板只给其他嫌疑人打分。
+                if sname and sname != user_role:
+                    st.slider(
+                        sname,
+                        min_value=0,
+                        max_value=100,
+                        value=50,
+                        key=f"suspicion_{st.session_state.thread_id}_{sname}",
+                    )
+        # AI 侦探助手：只喂公开信息 + 玩家笔记，绝不喂 truth/私密线索（参考 Scottish AI 搭档）。
+        with st.expander("🧠 AI 侦探助手", expanded=False):
+            st.caption("只基于公开线索和你自己的笔记分析，不会读取私密线索或真相。")
+            if st.button("分析当前线索", key="assistant_btn", use_container_width=True):
+                public_clue_list = list(dict.fromkeys(
+                    list(script.get("public_clues", []))
+                    + list(result.get("revealed_clues", {}).keys())
+                ))
+                relation_lines = [
+                    f"{r.get('from', '?')} → {r.get('to', '?')}：{r.get('rel', '')}"
+                    for r in script.get("relations", [])
+                    if r.get("public")
+                ]
+                notes = st.session_state.get(f"detective_notes_{st.session_state.thread_id}", "")
+                with st.spinner("侦探助手正在整理线索..."):
+                    advice = _cached_assistant_analysis(
+                        tuple(s.get("name", "") for s in suspects if s.get("name")),
+                        tuple(public_clue_list),
+                        tuple(relation_lines),
+                        notes,
+                        int(result.get("phase_round", 0)),
+                    )
+                st.session_state[f"assistant_advice_{st.session_state.thread_id}"] = advice
+            advice = st.session_state.get(f"assistant_advice_{st.session_state.thread_id}", "")
+            if advice:
+                st.markdown(_sanitize_md(advice))
         # 注：原"嫌疑人名单"区域已移除（已合并到顶部 expander，避免重复 + 被裁）
         st.divider()
-        # 人物关系图（仅公开关系，私密关系属信息差不显示）：侧边栏放按钮，点击后屏幕中央弹大图
-        st.caption("🕸️ 人物关系图")
-        relations_html = _cached_relations_html(
-            tuple(json.dumps(r, ensure_ascii=False, sort_keys=True) for r in script.get("relations", [])),
-            tuple(s.get("name", "?") for s in suspects),
-        )
-        if relations_html:
-            if st.button("🔍 展开关系网", use_container_width=True):
-                _relations_dialog(relations_html)
-        else:
-            st.caption("（剧本未生成公开关系）")
         st.divider()
         # R5：中途弃局的清理入口——此前只有结算页能 delete_thread，直接关页/弃玩
         # 会让 checkpoint 永久残留在 @st.cache_resource 的图单例里（内存累积）。
         if st.button("🚪 弃局重开（清理本局存档）", use_container_width=True):
             _reset_game_state()
             st.rerun()
-        st.divider()
-        # C-2：氛围音乐控制条（常驻，固定 key）
-        _render_ambient_audio()
 
     # 个人剧本册子（开局必读）：玩家自己的完整背景故事 + 自己与他人的关系。
     # 信息差铁律：只展示「玩家自己」的剧本；其他角色的 secret / personal_script 绝不在此公开，
     # 否则凶手开局就暴露。关系清单也只提取「涉及玩家自己」的边（自己知情，无论是否公开）。
     if user_script:
-        with st.expander("📖 你的个人剧本（开局先读，发言和推理都靠它）", expanded=True):
+        # 首屏默认展开，方便玩家开局读；读过一次后折叠，避免长剧本在每次 rerun 时
+        # 把聊天记录继续往下顶（手机/小屏尤其明显）。玩家仍可随时手动展开。
+        with st.expander(
+            "📖 你的个人剧本（开局先读，发言和推理都靠它）",
+            expanded=not st.session_state.get("personal_script_seen", False),
+        ):
+            st.session_state.personal_script_seen = True
             st.markdown(_sanitize_md(user_script))
             my_relations = [
                 r for r in script.get("relations", [])
@@ -976,8 +820,8 @@ else:
     for m in result.get("messages", []):
         is_user = m["speaker"] == user_role
         role = "user" if is_user else "assistant"
-        with st.chat_message(role):
-            st.markdown(f"**{_sanitize_md(m['speaker'])}**：{_sanitize_md(m['content'])}")
+        with st.chat_message(role, avatar=avatar_data_uri(str(m["speaker"]))):
+            st.markdown(_format_chat_message(m["speaker"], m["content"]))
 
     # H14：DEV_MODE 下显示 AI 内心戏和调试状态（默认关闭，防剧透）
     if DEV_MODE:
@@ -996,11 +840,19 @@ else:
                 "investigations_used": result.get("investigations_used"),
                 "revealed_clues": list(result.get("revealed_clues", {}).keys()),
             })
+        # 原始剧本只在 DEV_MODE 下可见：默认玩家视角绝不能在选角前看到 murderer / truth。
+        with st.expander("📄 原始剧本 JSON（DEV_MODE · 含剧透）", expanded=False):
+            st.code(json.dumps(result.get("script", {}), ensure_ascii=False, indent=2), language="json")
 
     # 处理 interrupt（human_turn / human_vote）
     info = get_interrupt(result)
     if info:
         if info["type"] == "human_turn":
+            # 轮到玩家发言：提示音按「消息数 + 发言人」去重，每次真正轮到你只响一次
+            play_audio_cue(
+                "turn",
+                token=f"{_tid}:turn:{len(result.get('messages', []))}:{info.get('speaker', '')}",
+            )
             # 玩家回合现在支持「发言」+「公开线索 / 指控 / 调查」三种行动。
             # 行动按钮在 expander 里，默认玩家直接用 chat_input 发言（str），
             # 点行动按钮则 resume 传 dict（human_turn_node 里区分处理）。
@@ -1032,11 +884,44 @@ else:
                         st.caption("（没有可指控的对象）")
                 if can_investigate:
                     remaining = info.get("investigations_remaining", INVESTIGATE_LIMIT)
-                    if st.button(f"🌙 暗中调查现场（剩余 {remaining} 次）", key="investigate_btn"):
-                        st.session_state.result = _run_stream(
-                            graph, Command(resume={"action": "investigate"}), config
+                    location_rows = info.get("locations") or []
+                    if not isinstance(location_rows, list):
+                        location_rows = []
+                    available_locations = [
+                        row["name"] for row in location_rows
+                        if isinstance(row, dict) and row.get("remaining", 0) > 0
+                    ]
+                    if available_locations:
+                        selected_location = st.selectbox(
+                            "选择搜证地点",
+                            available_locations,
+                            key="investigate_location",
                         )
-                        st.rerun()
+                        selected_row = next(
+                            row for row in location_rows
+                            if isinstance(row, dict) and row.get("name") == selected_location
+                        )
+                        st.caption(
+                            f"该地点还有 {selected_row.get('remaining', 0)} 条线索 · "
+                            f"本局调查次数剩余 {remaining} 次"
+                        )
+                        if st.button(f"🔍 搜索{selected_location}", key="investigate_btn"):
+                            st.session_state.result = _run_stream(
+                                graph,
+                                Command(resume={"action": "investigate", "location": selected_location}),
+                                config,
+                            )
+                            st.rerun()
+                    elif not location_rows:
+                        # 兼容旧 checkpoint / 外部直接构造的 interrupt payload：
+                        # 没有 locations 字段时退回原来的随机调查，不能让玩家丢动作。
+                        if st.button(f"🌙 暗中调查现场（剩余 {remaining} 次）", key="investigate_btn"):
+                            st.session_state.result = _run_stream(
+                                graph, Command(resume={"action": "investigate"}), config
+                            )
+                            st.rerun()
+                    else:
+                        st.caption("（现场已经搜遍，没有新发现了）")
                 else:
                     st.caption("（现场已经搜遍，没有新发现了）")
                 # M9：发言不是强制的——保持沉默也是剧本杀的合法策略
@@ -1052,6 +937,20 @@ else:
             if user_input:
                 resume = "沉默" if is_silence(user_input) else user_input[:MAX_CHAT_LEN]
                 st.session_state.result = _run_stream(graph, Command(resume=resume), config)
+                st.rerun()
+        elif info["type"] == "human_tiebreak":
+            # 平票加时：AI 候选人已做完最后辩护，轮到玩家自辩（F-05）。
+            play_audio_cue("tiebreak", token=f"{_tid}:tiebreak")
+            st.markdown("### ⚖️ 平票加时 · 你的最后陈述")
+            st.caption(f"你与 {'、'.join(info.get('suspects', []))} 进入平票加时，请做最后陈述后进入重投。")
+            if st.button("🤐 保持沉默（直接进入重投）", key="tiebreak_silence"):
+                st.session_state.result = _run_stream(graph, Command(resume="沉默"), config)
+                st.rerun()
+            user_input = st.chat_input("说出你的最后陈述（也可输入「沉默」）...", key="tiebreak_input")
+            if user_input:
+                st.session_state.result = _run_stream(
+                    graph, Command(resume=user_input[:MAX_CHAT_LEN]), config
+                )
                 st.rerun()
         elif info["type"] == "human_vote":
             # M9：投票不是强制的——弃权通道显式暴露（规则层一直有 None 通道）
@@ -1074,6 +973,65 @@ else:
     # 游戏结束：显示结算
     else:
         st.success("🎉 真相大白！")
+        # 结算动画只播一次：胜利/失败/平局三种视觉反馈。
+        effect_key = f"result_effect_{st.session_state.get('thread_id', 'default')}"
+        if not st.session_state.get(effect_key):
+            render_result_effect(result)
+            st.session_state[effect_key] = True
+        # 本局复盘卡：参考 AI Murder Mystery 的“真凶/动机揭晓”和 Wolfcha 的
+        # post-game review，给玩家一个可截图的结局摘要，而不是只看票数。
+        end_script = result.get("script", {})
+        true_murderer = end_script.get("murderer", "（未知）")
+        your_vote = result.get("votes", {}).get(user_role)
+        vote_text = your_vote or "（弃权）"
+        verdict = "✅ 指认正确" if your_vote == true_murderer else "❌ 指认错误"
+        # 本会话战绩：同一 thread_id 只记一次（rerun / 导出 / 点按钮都不重复追加）。
+        history_key = f"history_recorded_{st.session_state.thread_id}"
+        if not st.session_state.get(history_key):
+            st.session_state.game_history.append({
+                "case": _resolve_case_title(result),
+                "role": user_role,
+                "vote": vote_text,
+                "correct": your_vote == true_murderer,
+                "result": result.get("game_result", ""),
+                "time": time.strftime("%m-%d"),
+            })
+            st.session_state.game_history = st.session_state.game_history[-10:]
+            st.session_state[history_key] = True
+        st.markdown("### 🧾 本局复盘")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("真凶", true_murderer)
+        m2.metric("你的指认", vote_text)
+        m3.metric("本局结果", result.get("game_result", "—"))
+        st.caption(f"{verdict} · 对话 {len(result.get('messages', []))} 条 · 公开线索 {len(result.get('revealed_clues', {}))} 条 · 调查 {result.get('investigations_used', 0)} 次")
+        truth_text = end_script.get("truth", "")
+        if truth_text:
+            st.info(f"案件真相：{_sanitize_md(truth_text)}")
+        # 复盘导出：方便答辩演示后回看，也方便玩家保留本局记录。
+        review_cache_key = f"review_json_{st.session_state.get('thread_id', 'default')}"
+        review_json = st.session_state.get(review_cache_key)
+        if not review_json:
+            review_payload = {
+                "case": _resolve_case_title(result),
+                "user_role": user_role,
+                "murderer": true_murderer,
+                "truth": truth_text,
+                "game_result": result.get("game_result", ""),
+                "vote_outcome": result.get("vote_outcome", ""),
+                "votes": result.get("votes", {}),
+                "vote_counts": result.get("vote_counts", {}),
+                "revealed_clues": result.get("revealed_clues", {}),
+                "investigated_clues": result.get("investigated_clues", []),
+                "messages": result.get("messages", []),
+            }
+            review_json = json.dumps(review_payload, ensure_ascii=False, indent=2)
+            st.session_state[review_cache_key] = review_json
+        st.download_button(
+            "⬇️ 导出本局复盘 JSON",
+            data=review_json,
+            file_name=f"剧本杀复盘-{st.session_state.get('thread_id', '本局')}.json",
+            mime="application/json",
+        )
         with st.expander("📊 投票结果", expanded=True):
             # M9 配套：弃权票（None）显示为「（弃权）」而非 Python 的 None
             for voter, target in result.get("votes", {}).items():
@@ -1099,3 +1057,8 @@ else:
             # 旧代码调 delete(config) 必抛 AttributeError 被 except 吞掉。
             _reset_game_state()
             st.rerun()
+
+    # 关键：投票结束/长内容生成后的 st.rerun 会把页面滚回顶部。
+    # 在游戏页末尾恢复玩家刚才的 scrollTop（按 thread_id 隔离），
+    # 不改变 start / role 阶段的滚动行为。
+    _preserve_scroll_position()

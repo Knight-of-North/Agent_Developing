@@ -17,7 +17,7 @@ LangGraph 图定义 —— 把节点和边组装成完整的剧本杀状态机�
     → human_vote（interrupt 等用户投票）
     → tally（统计票数+全局胜负）
     → route_after_tally（H15：平票且未加时 → tie_break 重投一轮）
-        → tie_break（平票候选人辩护）→ ai_vote → human_vote → tally
+        → tie_break（AI 候选人辩护）→ human_tiebreak（玩家若在平票名单则自辩）→ ai_vote → human_vote → tally
         → final_statement（被投最高者最终陈词）
     → dm_reveal（DM 揭晓真相+线索复盘）
     → END
@@ -38,9 +38,11 @@ from nodes import (
     dm_reveal_node,
     final_statement_node,
     generate_script_node,
+    human_tiebreak_node,
     human_turn_node,
     human_vote_node,
     route_after_tally,
+    route_after_tie_break,
     route_speaker,
     self_intro_node,
     tally_node,
@@ -86,6 +88,7 @@ def build_graph():
     g.add_node("human_vote", human_vote_node)
     g.add_node("tally", tally_node)
     g.add_node("tie_break", tie_break_node)
+    g.add_node("human_tiebreak", human_tiebreak_node)
     g.add_node("final_statement", final_statement_node)
     g.add_node("dm_reveal", dm_reveal_node)
 
@@ -94,9 +97,16 @@ def build_graph():
     g.add_edge("distribute_clues", "choose_role")
     g.add_edge("choose_role", "dm_intro")
     g.add_edge("dm_intro", "self_intro")
-    g.add_edge("self_intro", "ai_player_turn")
 
-    # 讨论循环：条件边路由
+    # 讨论循环：self_intro 之后也必须经过 route_speaker。
+    # 之前写死 self_intro -> ai_player_turn，若最后一位自我介绍的角色后面正好轮到
+    # 玩家（例如玩家是 suspects[0]），ai_player_turn 会拿玩家角色自动生成发言——
+    # 玩家还没输入就“被发言”了。
+    g.add_conditional_edges(
+        "self_intro",
+        route_speaker,
+        {"human": "human_turn", "ai": "ai_player_turn", "midpoint": "dm_midpoint", "vote": "ai_vote"},
+    )
     g.add_conditional_edges(
         "ai_player_turn",
         route_speaker,
@@ -122,7 +132,13 @@ def build_graph():
         route_after_tally,
         {"tie_break": "tie_break", "final_statement": "final_statement"},
     )
-    g.add_edge("tie_break", "ai_vote")
+    # 平票辩护后：玩家在平票名单里先让玩家做最后陈述，否则直接 AI 重投
+    g.add_conditional_edges(
+        "tie_break",
+        route_after_tie_break,
+        {"human_tiebreak": "human_tiebreak", "ai_vote": "ai_vote"},
+    )
+    g.add_edge("human_tiebreak", "ai_vote")
     g.add_edge("final_statement", "dm_reveal")
     g.add_edge("dm_reveal", END)
 

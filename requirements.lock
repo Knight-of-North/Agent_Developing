@@ -18,5 +18,4 @@ langchain-deepseek==1.1.0
 python-dotenv==1.2.2
 streamlit==1.61.1
 httpx==0.28.1
-pyvis==0.3.2
 pytest==9.1.1
