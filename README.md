@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.61-FF4B4B?logo=streamlit&logoColor=white)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.2-1F6FEB)
-![Tests](https://img.shields.io/badge/pytest-167%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/pytest-172%20passed-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 一个**能自己开剧本杀的 AI 主持人**：你输入主题和风格，它自动创作案件、设计嫌疑人、分配线索；然后你扮演其中一个嫌疑人，和一群 AI 同台辩论、推理、投票、抓出真凶。
@@ -39,7 +39,7 @@ LLM 只负责“说什么”，Python 规则层负责“算不算、合不合规
 - **信息差**：公开线索 / 私密线索 / 隐藏线索三层结构，AI 不能读取别人的剧本和秘密。
 - **可解释推理**：AI 先产生 think 内心推理，再输出 speak 公开发言；内心戏不展示给玩家。
 - **确定性规则层**：计票、校验、防剧透、名单过滤全部是 Python 纯函数，不依赖 LLM。
-- **可测试**：167 个测试全部不调用真实 API；另有 fake-LLM 图级端到端冒烟测试。
+- **可测试**：172 个测试全部不调用真实 API；另有 fake-LLM 图级端到端冒烟测试。
 - **完整 UI**：启动封面、开始页、角色卡、搜证、聊天、投票、胜负动画、复盘导出。
 - **可玩性增强**：AI 侦探助手、场景搜证、嫌疑度面板、推理笔记、最近战绩。
 
@@ -244,11 +244,13 @@ Agent_Developing/
 ├── names.py               # 名字池与抽样
 ├── logging_config.py      # 日志轮转 + 对局 ID
 ├── config.py              # 环境变量与 LLM 配置
-├── tests/                 # pytest（167 passed）
+├── tests/                 # pytest（172 passed）
 ├── docs/
 │   ├── screenshots/       # README 截图
 │   ├── launch-screen-design.md
 │   ├── optimization-proposal-2026-11.md
+│   ├── dsh-audit-prompt-2026-11.md
+│   ├── dsh-audit-report-2026-11.md
 │   └── deep-review-2026-08/
 ├── requirements.txt       # 兼容区间
 ├── requirements.lock      # 精确版本
@@ -263,7 +265,7 @@ Agent_Developing/
 ## 🧪 测试与质量
 
 ~~~bash
-pytest -q -W error   # → 167 passed
+pytest -q -W error   # → 172 passed
 ruff check .         # → All checks passed
 ~~~
 

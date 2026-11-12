@@ -79,6 +79,7 @@ from ui_start import (
     render_start_side,
 )
 from ui_theme import _THEME_CSS
+from validators import _sanitize_outsider_names, _sanitize_text_for_script
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -141,7 +142,7 @@ def _format_chat_message(speaker: str, content: str) -> str:
     return f"**{speaker_text}**：{_sanitize_md(body)}"
 
 
-@st.cache_data(show_spinner=False, ttl=300)
+@st.cache_data(show_spinner=False, ttl=300, max_entries=64)
 def _cached_assistant_analysis(
     suspects: tuple[str, ...],
     public_clues: tuple[str, ...],
@@ -182,6 +183,9 @@ def _reset_game_state() -> None:
     for key in list(st.session_state):
         if key.startswith("review_json_") or key.startswith("assistant_advice_"):
             st.session_state.pop(key, None)
+    # widget key（笔记/嫌疑度/结算特效标记）留到下一次 rerun 顶部再删，
+    # 避免“widget 已实例化后修改 session_state”的 Streamlit 异常。
+    st.session_state["_pending_session_cleanup"] = True
 
 
 def _run_stream(graph, cmd, config):
@@ -247,9 +251,11 @@ def _run_stream(graph, cmd, config):
                 thinking = False
                 for _node, update in d.items():
                     if isinstance(update, dict):
-                        for m in update.get("messages", []):
+                        for m in (update.get("messages") or []):
+                            if not isinstance(m, dict):
+                                continue
                             # DM 台词渲染 Markdown；其他角色仍按字面量渲染。
-                            segments.append(_format_chat_message(m["speaker"], m["content"]))
+                            segments.append(_format_chat_message(str(m.get("speaker", "?")), m.get("content", "")))
                 current_parts = []   # 节点结束，清空当前 token 累积
                 pending = 0
                 render()
@@ -308,6 +314,18 @@ if "launched" not in st.session_state:
 if "game_history" not in st.session_state:
     # 本会话最近战绩（最多保留 10 局）：不落库，刷新即清空。
     st.session_state.game_history = []
+
+# 弃局时只做“登记”，真正的清理放到下一次 rerun 的最顶部——
+# 那时旧页面 widget 还没创建，删除 detective_notes_* / suspicion_* 等
+# widget key 不会被 Streamlit 拒绝，同时避免旧 thread 的 per-key 状态跨局累积。
+if st.session_state.pop("_pending_session_cleanup", False):
+    cleanup_prefixes = (
+        "review_json_", "assistant_advice_", "detective_notes_", "suspicion_",
+        "result_effect_", "history_recorded_", "checkpoint_sanitized_",
+    )
+    for key in list(st.session_state):
+        if key.startswith(cleanup_prefixes):
+            st.session_state.pop(key, None)
 
 # M1：thread_id → config 全项目唯一构造点（与 GameSession/终端版同一语义）
 config = build_config(st.session_state.thread_id)
@@ -545,6 +563,21 @@ else:
         st.session_state.interrupt_notice = "剧本生成被中断（可能是页面刷新导致），请重新立案侦查。"
         st.rerun()
 
+    # 兼容旧 checkpoint：清掉历史剧本/消息里已经出现的名单外人物名
+    # （例如旧版本 LLM 编出的「张浩」），新生成内容也会在 validators 中清洗。
+    sanitize_key = f"checkpoint_sanitized_{st.session_state.get('thread_id', '')}"
+    if (isinstance(result, dict) and isinstance(result.get("script"), dict)
+            and not st.session_state.get(sanitize_key)):
+        old_script = result["script"]
+        if old_script.get("suspects"):
+            result["script"] = _sanitize_outsider_names(old_script)
+            for old_msg in (result.get("messages") or []):
+                if isinstance(old_msg, dict):
+                    old_msg["content"] = _sanitize_text_for_script(
+                        old_msg.get("content", ""), result["script"]
+                    )
+            st.session_state[sanitize_key] = True
+
     interrupt_type = get_interrupt_type(result)
 
     # ---- 阶段 1：开局选角色（图停在 choose_role interrupt，此时 user_role 还没定）----
@@ -616,12 +649,12 @@ else:
         st.stop()   # 选角色阶段不渲染下面的角色卡 / 对话 / 结算
 
     # ---- 阶段 2：游戏中（user_role 已确定）----
-    script = result.get("script", {})
+    script = result.get("script") or {}
     user_role = result.get("user_role", "你")
-    suspects = script.get("suspects", [])
-    user_secret = next((s.get("secret", "") for s in suspects if s.get("name") == user_role), "")
+    suspects = script.get("suspects") or []
+    user_secret = next((s.get("secret") or "" for s in suspects if s.get("name") == user_role), "")
     # 信息差：只显示你自己持有的私密线索
-    user_clues = result.get("distributed_clues", {}).get(user_role, [])
+    user_clues = (result.get("distributed_clues") or {}).get(user_role, [])
     # 个人剧本：玩家自己的完整背景故事（开局必读，发言和推理的根基）
     user_script = next((s.get("personal_script", "") for s in suspects if s.get("name") == user_role), "")
     # 结构化角色信息（职业/与死者关系/不在场证明/任务），角色卡要展示、让玩家快速锚定"我是谁我要干嘛"
@@ -696,9 +729,9 @@ else:
         st.divider()
         # 线索板：把「自己的私密线索 / 已公开线索 / 调查所得」分开展示，
         # 避免玩家在聊天记录里来回翻找，解决“线索记不住”的体验问题（P2）。
-        investigated = result.get("investigated_clues", [])
+        investigated = result.get("investigated_clues") or []
         own_private = [c for c in user_clues if c not in investigated]
-        public_clues = result.get("revealed_clues", {})
+        public_clues = result.get("revealed_clues") or {}
         with st.expander("🗂 线索板（私密 / 已公开 / 已调查）", expanded=False):
             st.caption("🔒 只有你知道的线索")
             if own_private:
@@ -750,8 +783,8 @@ else:
             st.caption("只基于公开线索和你自己的笔记分析，不会读取私密线索或真相。")
             if st.button("分析当前线索", key="assistant_btn", use_container_width=True):
                 public_clue_list = list(dict.fromkeys(
-                    list(script.get("public_clues", []))
-                    + list(result.get("revealed_clues", {}).keys())
+                    list(script.get("public_clues") or [])
+                    + list((result.get("revealed_clues") or {}).keys())
                 ))
                 relation_lines = [
                     f"{r.get('from', '?')} → {r.get('to', '?')}：{r.get('rel', '')}"
@@ -772,7 +805,6 @@ else:
             if advice:
                 st.markdown(_sanitize_md(advice))
         # 注：原"嫌疑人名单"区域已移除（已合并到顶部 expander，避免重复 + 被裁）
-        st.divider()
         st.divider()
         # R5：中途弃局的清理入口——此前只有结算页能 delete_thread，直接关页/弃玩
         # 会让 checkpoint 永久残留在 @st.cache_resource 的图单例里（内存累积）。
@@ -817,11 +849,16 @@ else:
     # 对话历史（主区域）：直接渲染。
     # 真流式已经在"等待时"实时显示过了，这里无需再打字机回放。
     # L5：speaker/content 均按字面量渲染，防用户输入/AI 输出注入 markdown 排版。
-    for m in result.get("messages", []):
-        is_user = m["speaker"] == user_role
+    for m in (result.get("messages") or []):
+        if not isinstance(m, dict):
+            continue  # 防御旧 checkpoint / 手工构造 state 里的脏消息
+        speaker = str(m.get("speaker") or "主持人")
+        content = m.get("content")
+        content = content if isinstance(content, str) else str(content or "")
+        is_user = speaker == user_role
         role = "user" if is_user else "assistant"
-        with st.chat_message(role, avatar=avatar_data_uri(str(m["speaker"]))):
-            st.markdown(_format_chat_message(m["speaker"], m["content"]))
+        with st.chat_message(role, avatar=avatar_data_uri(speaker)):
+            st.markdown(_format_chat_message(speaker, content))
 
     # H14：DEV_MODE 下显示 AI 内心戏和调试状态（默认关闭，防剧透）
     if DEV_MODE:
@@ -838,11 +875,11 @@ else:
                 "consecutive_followups": result.get("consecutive_followups"),
                 "midpoint_done": result.get("midpoint_done"),
                 "investigations_used": result.get("investigations_used"),
-                "revealed_clues": list(result.get("revealed_clues", {}).keys()),
+                "revealed_clues": list((result.get("revealed_clues") or {}).keys()),
             })
         # 原始剧本只在 DEV_MODE 下可见：默认玩家视角绝不能在选角前看到 murderer / truth。
         with st.expander("📄 原始剧本 JSON（DEV_MODE · 含剧透）", expanded=False):
-            st.code(json.dumps(result.get("script", {}), ensure_ascii=False, indent=2), language="json")
+            st.code(json.dumps((result.get("script") or {}), ensure_ascii=False, indent=2), language="json")
 
     # 处理 interrupt（human_turn / human_vote）
     info = get_interrupt(result)
@@ -980,9 +1017,9 @@ else:
             st.session_state[effect_key] = True
         # 本局复盘卡：参考 AI Murder Mystery 的“真凶/动机揭晓”和 Wolfcha 的
         # post-game review，给玩家一个可截图的结局摘要，而不是只看票数。
-        end_script = result.get("script", {})
+        end_script = (result.get("script") or {})
         true_murderer = end_script.get("murderer", "（未知）")
-        your_vote = result.get("votes", {}).get(user_role)
+        your_vote = (result.get("votes") or {}).get(user_role)
         vote_text = your_vote or "（弃权）"
         verdict = "✅ 指认正确" if your_vote == true_murderer else "❌ 指认错误"
         # 本会话战绩：同一 thread_id 只记一次（rerun / 导出 / 点按钮都不重复追加）。
@@ -1003,7 +1040,7 @@ else:
         m1.metric("真凶", true_murderer)
         m2.metric("你的指认", vote_text)
         m3.metric("本局结果", result.get("game_result", "—"))
-        st.caption(f"{verdict} · 对话 {len(result.get('messages', []))} 条 · 公开线索 {len(result.get('revealed_clues', {}))} 条 · 调查 {result.get('investigations_used', 0)} 次")
+        st.caption(f"{verdict} · 对话 {len(result.get('messages') or [])} 条 · 公开线索 {len(result.get('revealed_clues') or {})} 条 · 调查 {result.get('investigations_used', 0)} 次")
         truth_text = end_script.get("truth", "")
         if truth_text:
             st.info(f"案件真相：{_sanitize_md(truth_text)}")
@@ -1018,11 +1055,11 @@ else:
                 "truth": truth_text,
                 "game_result": result.get("game_result", ""),
                 "vote_outcome": result.get("vote_outcome", ""),
-                "votes": result.get("votes", {}),
+                "votes": (result.get("votes") or {}),
                 "vote_counts": result.get("vote_counts", {}),
-                "revealed_clues": result.get("revealed_clues", {}),
-                "investigated_clues": result.get("investigated_clues", []),
-                "messages": result.get("messages", []),
+                "revealed_clues": (result.get("revealed_clues") or {}),
+                "investigated_clues": (result.get("investigated_clues") or []),
+                "messages": (result.get("messages") or []),
             }
             review_json = json.dumps(review_payload, ensure_ascii=False, indent=2)
             st.session_state[review_cache_key] = review_json
@@ -1034,7 +1071,7 @@ else:
         )
         with st.expander("📊 投票结果", expanded=True):
             # M9 配套：弃权票（None）显示为「（弃权）」而非 Python 的 None
-            for voter, target in result.get("votes", {}).items():
+            for voter, target in (result.get("votes") or {}).items():
                 st.write(f"· {voter} → {target or '（弃权）'}")
             # 2026-11：vote_winner 只存真实人名，平票/无人投票由 vote_outcome 表达
             outcome = result.get("vote_outcome", "")

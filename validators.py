@@ -21,6 +21,33 @@ _FORBIDDEN_STOPWORDS = frozenset({
 # 每个角色最多保留的违禁词数量（prompt 里要求 2~4 个，超出的截断）
 MAX_FORBIDDEN_WORDS = 4
 
+# 名单外人物名检测：中文常见姓氏 + 1~3 个汉字（2~4 字姓名）。
+# 只用于「自由文本里出现的人名」预警/清理，不用于替换剧本名。
+_OUTSIDER_NAME_RE = re.compile(
+    r"(?:^|[，。！？、；：\s“”「」『』（）()]|被|和|与|跟|向|对|让|叫|是|把|由|给|从|到|在|说|问|找|见|看|听|有|没|发现|看到|看见|遇见|认识|喜欢|讨厌|恨|爱|怕|怀疑|指控|告诉|质疑|提到)"
+    r"([赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳史唐费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄和穆萧尹姚邵汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊胡凌霍虞万支柯管卢莫房裘解应宗丁宣邓郁单杭洪包诸左石崔吉龚程邢裴陆荣翁荀羊惠甄曲封芮羿储靳段富车侯全班秋仲伊宫宁仇栾甘厉戎祖武符刘景詹束龙叶黎薄印宿白怀蒲从鄂索咸赖卓蔺屠蒙池乔闻党翟谭贡劳姬申扶冉郏浦尚农温别庄晏柴瞿阎慕连茹习艾鱼容向古易慎戈廖庾居衡步都耿满弘匡国文寇广禄东欧沃利蔚越隆师巩聂晁勾融冷辛简饶曾沙鞠丰巢关查后荆红游竺权盖益]"
+    r"[一-龥]{1,3}?"
+    r"(?=$|[，。！？、；：\s“”「」『』（）()]|的|是|在|说|问|答|道|喊|叫|笑|哭|看|见|听|想|要|会|能|把|被|给|让|对|向|从|到|跟|和|与|及|而|也|还|又|就|正|曾|已|将|未|没|不|很|最|更|昨|今|明|当|那|这|他|她|它|我|你|们|杀|死|害|骗|瞒|藏|偷|打|骂|威胁|承认|发现|告诉|质问|指认|离开|回到|走进|站在|拿着|看到|听到|来|去|走|坐|站|回|出|进|因为|所以|但是|然后|之后|之前|时|后|前|中))"
+)
+
+# 角色/职业后缀："刘老师""张医生""周管理员"不是独立角色名，保留原称谓。
+_ROLE_SUFFIXES = (
+    "老师", "医生", "警察", "保安", "管理员", "辅导员", "院长", "主任", "老板",
+    "同学", "朋友", "父亲", "母亲", "哥哥", "姐姐", "弟弟", "妹妹", "叔叔", "阿姨",
+    "先生", "小姐", "女士",
+)
+
+# 高频非人名词/称谓，避免姓名启发式把普通词当成人名。
+_NON_PERSON_WORDS = frozenset({
+    "自己", "大家", "众人", "有人", "某人", "主持人", "嫌疑人", "凶手", "死者",
+    "警方", "警察", "老师", "医生", "学生", "监控", "录像", "手机", "钥匙", "纸条",
+    "证据", "线索", "时间", "现场", "房间", "食堂", "图书馆", "实验室", "办公室",
+    "校门口", "保安", "管理员", "辅导员", "院长", "主任", "老板", "同学", "朋友",
+    "家人", "父亲", "母亲", "哥哥", "姐姐", "弟弟", "妹妹", "叔叔", "阿姨", "先生",
+    "小姐", "女士", "男人", "女人", "晚上", "白天", "凌晨", "傍晚", "今天", "昨天",
+    "明天", "早上", "中午", "下午", "周末", "春节", "中秋", "国庆",
+})
+
 
 def _coerce_text(value) -> str:
     """把 LLM 输出的"本该是字符串"的字段安全转成 str。
@@ -126,6 +153,115 @@ def _enforce_names(script: dict, names: list[str]) -> dict:
     return script
 
 
+def _extract_outsider_names(text: str, roster: set[str]) -> list[str]:
+    """从一段文本里提取名单外人物名（按出现顺序去重）。"""
+    found: list[str] = []
+    if not isinstance(text, str) or not text:
+        return found
+    for m in _OUTSIDER_NAME_RE.finditer(text):
+        name = m.group(1)
+        if name in roster or name in found:
+            continue
+        # “周一早上/周五晚上”是时间，不是人物名
+        if name.startswith(("周一", "周二", "周三", "周四", "周五", "周六", "周日", "周天")):
+            continue
+        # “张家界/李家庄”这类地名不是人物名；单字后缀只拦 3 字以上，
+        # 避免误伤“张路”这种两字人名。
+        if len(name) >= 3 and name.endswith(("界", "省", "市", "县", "区", "镇", "村", "街", "路", "楼")):
+            continue
+        if name.endswith(("公园", "广场", "学校", "大学", "公司", "车站", "机场", "酒店",
+                          "餐厅", "食堂", "图书馆", "实验室", "办公室", "宿舍", "门口")):
+            continue
+        # 名单内名字的子串（如「舒飞」出现在「舒飞扬」里）不算 outsider
+        if any(name in r or r in name for r in roster if r):
+            continue
+        if name in _NON_PERSON_WORDS:
+            continue
+        if any(name.endswith(suffix) for suffix in _ROLE_SUFFIXES):
+            continue
+        found.append(name)
+    return found
+
+
+def _find_outsider_names(script: dict) -> list[str]:
+    """找出剧本自由文本里出现的「名单外人物名」。
+
+    背景：_enforce_names 只把 suspects[i].name 强制改成抽到的名字，但 LLM 在
+    truth / personal_script / 线索内容这些自由文本里仍可能写入自己编的人名
+    （例如玩家只设定了 4 个角色，DM 揭晓里却出现「张浩」）。这些名字不在
+    suspects 名单里，前端无法索引、玩家也无法盘问，属于必须修掉的数据污染。
+    """
+    suspects = script.get("suspects") or []
+    roster = {s.get("name", "") for s in suspects if isinstance(s, dict) and s.get("name")}
+    roster.add("死者")
+
+    texts = [script.get("background", ""), script.get("truth", "")]
+    for s in suspects:
+        if isinstance(s, dict):
+            texts.extend([s.get("secret", ""), s.get("personal_script", ""), s.get("alibi", ""), s.get("relation_to_victim", "")])
+    for c in script.get("public_clues") or []:
+        texts.append(c if isinstance(c, str) else "")
+    for c in script.get("hidden_clues") or []:
+        texts.append(c if isinstance(c, str) else "")
+    for c in script.get("private_clues") or []:
+        if isinstance(c, dict):
+            texts.append(c.get("content", ""))
+
+    found: list[str] = []
+    for text in texts:
+        for name in _extract_outsider_names(text, roster):
+            if name not in found:
+                found.append(name)
+    return found
+
+
+def _replace_outsider_names(text: str, roster: set[str]) -> str:
+    """把一段文本里的名单外人物名替换为「某人」，并返回替换后的文本。"""
+    if not isinstance(text, str) or not text:
+        return text
+    for name in _extract_outsider_names(text, roster):
+        text = text.replace(name, "某人")
+    return text
+
+
+def _sanitize_outsider_names(script: dict) -> dict:
+    """把剧本自由文本中的名单外人物名统一替换为「某人」。
+
+    这是展示层前的最后一道防线；配合 prompt 的名单铁律和自洽校验，
+    避免 LLM 编出来的「张浩」之类角色出现在 DM 揭晓/个人剧本里。
+    """
+    suspects = script.get("suspects") or []
+    roster = {s.get("name", "") for s in suspects if isinstance(s, dict) and s.get("name")}
+    roster.add("死者")
+
+    for key in ("background", "truth"):
+        script[key] = _replace_outsider_names(script.get(key, ""), roster)
+    for s in suspects:
+        if not isinstance(s, dict):
+            continue
+        for key in ("secret", "personal_script", "alibi", "relation_to_victim", "profession", "task"):
+            if key in s:
+                s[key] = _replace_outsider_names(s.get(key, ""), roster)
+    for key in ("public_clues", "hidden_clues"):
+        script[key] = [_replace_outsider_names(c, roster) if isinstance(c, str) else c
+                       for c in (script.get(key) or [])]
+    for c in script.get("private_clues") or []:
+        if isinstance(c, dict):
+            c["content"] = _replace_outsider_names(c.get("content", ""), roster)
+    for r in script.get("relations") or []:
+        if isinstance(r, dict) and "rel" in r:
+            r["rel"] = _replace_outsider_names(r.get("rel", ""), roster)
+    return script
+
+
+def _sanitize_text_for_script(text: str, script: dict) -> str:
+    """清洗单段 LLM 输出里出现的名单外人物名（DM 台词 / AI 公开发言用）。"""
+    suspects = script.get("suspects") or []
+    roster = {s.get("name", "") for s in suspects if isinstance(s, dict) and s.get("name")}
+    roster.add("死者")
+    return _replace_outsider_names(text, roster)
+
+
 def _normalize_secret_first_person(secret: str) -> str:
     """兜底：把 secret 开头的第三人称代词替换为第一人称。
 
@@ -165,6 +301,10 @@ def _fallback_clues(script: dict) -> dict:
     suspects = script.get("suspects") or []
     names = [s.get("name") for s in suspects if s.get("name")]
     old_clues = script.get("clues") or []
+    if isinstance(old_clues, str):
+        old_clues = [old_clues]
+    if not isinstance(old_clues, list):
+        old_clues = []
     if not old_clues:
         return script   # 连旧线索都没有，放弃兜底
 

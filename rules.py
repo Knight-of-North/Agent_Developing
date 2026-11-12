@@ -43,9 +43,9 @@ def clue_mentioned(clue: str, speak: str, threshold: float = 0.5) -> bool:
 def update_revealed_clues(speak: str, distributed_clues: dict, revealed_clues: dict) -> dict:
     """发言后更新线索公开状态。用 clue_mentioned 容忍转述、防止单词误报。"""
     newly = {}
-    for holder, clues in distributed_clues.items():
-        for clue in clues:
-            if clue in revealed_clues:
+    for holder, clues in (distributed_clues or {}).items():
+        for clue in clues or []:
+            if clue in (revealed_clues or {}):
                 continue
             if clue_mentioned(clue, speak):
                 newly[clue] = holder
@@ -126,12 +126,12 @@ def judge_ending(state: dict) -> tuple[str, str]:
     """
     user_role = state.get("user_role", "你")
     user_is_murderer = state.get("user_is_murderer", False)
-    votes = state.get("votes", {})
+    votes = (state.get("votes") or {})
     user_vote = votes.get(user_role, "未投")
     vote_winner = str(state.get("vote_winner", ""))
     vote_outcome = state.get("vote_outcome", "winner")
-    script = state.get("script", {})
-    murderer = get_murderer(script, [s.get("name", "") for s in script.get("suspects", [])])
+    script = (state.get("script") or {})
+    murderer = get_murderer(script, [s.get("name", "") for s in (script.get("suspects") or [])])
 
     # 平票/无人有效票时 game_result 是「平局」，不能在这里把凶手写成「完美犯罪」——
     # 两段文案会同时进入 dm_reveal prompt，DM 会一边说平局、一边说真凶脱罪。
@@ -151,7 +151,10 @@ def judge_ending(state: dict) -> tuple[str, str]:
         return "置身事外", f"（真人玩家 {user_role} 弃权未投票，全程冷眼旁观，请演绎他置身事外的疏离感）"
 
     if murderer and user_vote == murderer:
-        speak_count = sum(1 for m in state.get("messages", []) if m.get("speaker") == user_role)
+        speak_count = sum(
+            1 for m in (state.get("messages") or [])
+            if isinstance(m, dict) and m.get("speaker") == user_role
+        )
         investigated = bool(state.get("investigated_clues"))
         if speak_count >= 3 or investigated:
             return "侦探", f"（真人玩家 {user_role} 投对了真凶且积极主导了推理，请夸赞他/她的洞察力）"
@@ -169,14 +172,15 @@ def get_murderer(script: dict, suspect_names: list[str]) -> str:
     位置靠后"，注释与行为不符。现按 truth 中的实际位置取最靠后者；
     子串重叠名（"江叙" ⊂ "江叙白"）位置相同时长名优先。
     """
+    script = script or {}
     murderer = script.get("murderer", "")
-    if murderer and murderer in suspect_names:
+    if murderer and murderer in (suspect_names or []):
         return murderer
-    truth = script.get("truth", "")
+    truth = script.get("truth") or ""
     found = ""
     best_pos = -1
     # 长名优先：位置相同（子串重叠）时不让短名抢走匹配
-    for n in sorted((n for n in suspect_names if n), key=len, reverse=True):
+    for n in sorted((n for n in (suspect_names or []) if n), key=len, reverse=True):
         pos = truth.find(n)
         if pos != -1 and pos > best_pos:
             best_pos = pos
