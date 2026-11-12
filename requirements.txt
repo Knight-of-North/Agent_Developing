@@ -14,7 +14,6 @@ langchain-deepseek>=1.1,<2
 python-dotenv>=1.0
 streamlit>=1.61,<2
 httpx>=0.27,<1
-pyvis>=0.3,<1
 
 # 测试（纯函数、不调 LLM，CI 可直接跑）
 pytest>=8

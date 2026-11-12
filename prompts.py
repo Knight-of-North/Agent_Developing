@@ -4,7 +4,7 @@ Prompt 构建（从 nodes.py 拆出 + 接收 nodes.py 内联 prompt 的提取）
 把所有"拼 prompt 字符串"的逻辑集中在这里，节点函数只负责调用。
 把 prompt 文本和"用 prompt 干什么"的节点逻辑分开，改措辞时只动这一个文件。
 """
-
+import html
 
 # 凶手的"狡辩策略池"（H12：例子改为占位符，避免特定剧本的人名/地点串戏）。
 # 5 套策略循环使用：每次被指控轮换一套，严禁 LLM 重复同一种话术。
@@ -85,8 +85,12 @@ _USER_INPUT_BLOCK = """<user_provided_setting untrusted="true">
 
 
 def _untrusted(text: str) -> str:
-    """把一段用户输入包进反注入分隔块（H5：theme/time/location/background 统一走这里）。"""
-    return _USER_INPUT_BLOCK.format(content=text.strip())
+    """把一段用户输入包进反注入分隔块（H5：theme/time/location/background 统一走这里）。
+
+    用户输入中的 HTML 尖括号必须转义：否则玩家输入
+    `</user_provided_setting>` 就能提前闭合分隔块，把后续内容伪装成系统指令。
+    """
+    return _USER_INPUT_BLOCK.format(content=html.escape(text.strip(), quote=False))
 
 
 def _build_script_prompt(theme: str, background: str, names: list[str], background_story: str = "", story_time: str = "", story_location: str = "", previous_problems: list[str] | None = None) -> str:
@@ -115,11 +119,11 @@ def _build_script_prompt(theme: str, background: str, names: list[str], backgrou
 - 即使玩家已经给了剧情/机制信息，**public_clues / private_clues / hidden_clues 也必须按下方铁律独立生成**（信息差的基础，缺失会让某些角色"零线索"——"白板角色"劝退的核心问题）。
 - 把玩家给的设定自然融入背景叙述、补完人物关系和动机冲突。
 
-背景风格参考：{background}"""
+背景风格参考：{_untrusted(background)}"""
     else:
         # 自由发挥分支。H5：theme 也是用户输入，同样包反注入分隔块。
         context = _STRUCTURED_FIELD_WARNING + f"""创作主题：{_untrusted(theme)}
-背景风格：{background}
+背景风格：{_untrusted(background)}
 
 要求：
 - **结构化字段每个嫌疑人必须独立写一遍**（profession/relation_to_victim/alibi/task/personality/speech_style/secret/forbidden/personal_script 都不能省略，缺失会触发"待补充"默认值让 AI prompt 注入崩溃，角色卡全部空白）。
@@ -204,7 +208,7 @@ def _build_script_prompt(theme: str, background: str, names: list[str], backgrou
 
 【人物关系铁律（relations 是玩家盘问的抓手）】：
 - 任意两个嫌疑人之间至少要有一条关系或冲突；死者必须与每个嫌疑人都有直接纠葛。
-- **嫌疑人之间也要有公开边**：关系图里不能只有「嫌疑人→死者」的放射线，嫌疑人之间也要有横向边。4 人及以上局，嫌疑人之间的公开边至少要有 ⌈嫌疑人数/2⌉ 条。
+- **嫌疑人之间也要有公开边**：公开关系不能只有「嫌疑人→死者」的放射线，嫌疑人之间也要有横向关系。4 人及以上局，嫌疑人之间的公开边至少要有 ⌈嫌疑人数/2⌉ 条。
 - relations 数组要覆盖主要人物关系。**公开边（public=true）里至少要有 2 条直接涉及「死者」**。
 - **from 是关系主语（说「我」的那个人），to 是关系宾语（被指向的人）**：rel 里的「我」= from 角色，关系对象 = to 角色。方向必须和 rel 语义一致。
 - **涉及「死者」的边，from 必须是嫌疑人、to 必须是「死者」**。
