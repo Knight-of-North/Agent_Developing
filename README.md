@@ -133,7 +133,7 @@ flowchart TD
 | 类别 | 选型 | 用途 |
 |---|---|---|
 | 智能体编排 | LangGraph ≥1.0 | StateGraph、条件边、interrupt、checkpointer |
-| 大模型 | DeepSeek deepseek-v4-flash | 中文生成稳、成本低，每局约 ¥0.1–0.3 |
+| 大模型 | DeepSeek deepseek-flash | 中文生成稳、成本低，每局约 ¥0.1–0.3 |
 | Web UI | Streamlit ≥1.61 | 单文件页面编排 + 暗色主题 + 会话状态 |
 | 声音 | Web Audio API | 纯代码生成 BGM / 事件音效，无外部音频素材 |
 | 关系数据 | Python dict / TypedDict | 人物关系参与 prompt 与个人剧本，不做前端关系图 |
@@ -183,7 +183,7 @@ cp .env.example .env
 
 ~~~dotenv
 DEEPSEEK_API_KEY=你的key
-DEEPSEEK_MODEL=deepseek-v4-flash
+DEEPSEEK_MODEL=deepseek-flash
 ~~~
 
 到 [platform.deepseek.com](https://platform.deepseek.com) 注册并创建 key；每局成本约 ¥0.1–0.3。
@@ -251,6 +251,9 @@ Agent_Developing/
 │   ├── optimization-proposal-2026-11.md
 │   ├── dsh-audit-prompt-2026-11.md
 │   ├── dsh-audit-report-2026-11.md
+│   ├── desktop-packaging-analysis-2026-11.md
+│   ├── desktop-option-a-proposal-2026-11.md
+│   ├── desktop-option-c-proposal-2026-11.md
 │   └── deep-review-2026-08/
 ├── requirements.txt       # 兼容区间
 ├── requirements.lock      # 精确版本
@@ -291,7 +294,7 @@ CI 在 GitHub Actions 上跑 Python 3.10 + 3.12 两个版本，全程不请求�
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | DEEPSEEK_API_KEY | 无（必填） | DeepSeek API Key |
-| DEEPSEEK_MODEL | deepseek-v4-flash | 模型名 |
+| DEEPSEEK_MODEL | deepseek-flash | 模型名 |
 | ROUNDS_PER_PLAYER | 3 | 每人发言轮数（UI 可按局覆盖 2/3/4） |
 | INVESTIGATE_LIMIT | 2 | 每局调查次数上限 |
 | MAX_CONSECUTIVE_FOLLOWUPS | 1 | 玩家连续追问上限 |

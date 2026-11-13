@@ -38,7 +38,7 @@
 - 人在回路通过 interrupt / Command(resume)；
 - 使用 GameState、agent_memory、MemorySaver / 可选 SqliteSaver；
 - 当前测试基线约 172 passed，ruff 全绿；
-- 当前使用 DeepSeek deepseek-v4-flash，每局约 ¥0.1–0.3；
+- 当前使用 DeepSeek deepseek-flash，每局约 ¥0.1–0.3；
 - 现有 UI 模块：app.py、ui_theme.py、ui_assets.py、ui_audio.py、ui_launch.py、ui_characters.py、ui_start.py、ui_components.py；
 - 当前已移除人物关系图前端功能，不要重新引入 visualization.py 或 pyvis；
 - 当前已有人物名清洗、AI 侦探助手、场景搜证、嫌疑度面板、推理笔记、复盘导出。

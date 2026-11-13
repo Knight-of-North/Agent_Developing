@@ -124,7 +124,7 @@ def get_llm(purpose: str = "player", json_mode: bool = False):
             if key not in _llm_cache:   # 双重检查，避免并发重复构造
                 cfg = LLM_CONFIG.get(purpose, LLM_CONFIG["player"])
                 _llm_cache[key] = ChatDeepSeek(
-                    model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+                    model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
                     api_key=os.getenv("DEEPSEEK_API_KEY"),
                     base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
                     temperature=cfg["temperature"],

@@ -19,7 +19,7 @@ from langchain_deepseek import ChatDeepSeek  # noqa: E402  必须先 load_dotenv
 
 def main():
     llm = ChatDeepSeek(
-        model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+        model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
         api_key=os.getenv("DEEPSEEK_API_KEY"),
         base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         # 8-20 审查修复：参数必须与 nodes.py 的 get_llm() 保持一致——
