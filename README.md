@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10-3776AB?logo=python&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.61-FF4B4B?logo=streamlit&logoColor=white)
 ![LangGraph](https://img.shields.io/badge/LangGraph-1.2-1F6FEB)
-![Tests](https://img.shields.io/badge/pytest-172%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/pytest-180%20passed-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 一个**能自己开剧本杀的 AI 主持人**：你输入主题和风格，它自动创作案件、设计嫌疑人、分配线索；然后你扮演其中一个嫌疑人，和一群 AI 同台辩论、推理、投票、抓出真凶。
@@ -39,7 +39,7 @@ LLM 只负责“说什么”，Python 规则层负责“算不算、合不合规
 - **信息差**：公开线索 / 私密线索 / 隐藏线索三层结构，AI 不能读取别人的剧本和秘密。
 - **可解释推理**：AI 先产生 think 内心推理，再输出 speak 公开发言；内心戏不展示给玩家。
 - **确定性规则层**：计票、校验、防剧透、名单过滤全部是 Python 纯函数，不依赖 LLM。
-- **可测试**：172 个测试全部不调用真实 API；另有 fake-LLM 图级端到端冒烟测试。
+- **可测试**：180 个测试全部不调用真实 API；另有 fake-LLM 图级端到端冒烟测试。
 - **完整 UI**：启动封面、开始页、角色卡、搜证、聊天、投票、胜负动画、复盘导出。
 - **可玩性增强**：AI 侦探助手、场景搜证、嫌疑度面板、推理笔记、最近战绩。
 
@@ -132,7 +132,7 @@ flowchart TD
 
 | 类别 | 选型 | 用途 |
 |---|---|---|
-| 智能体编排 | LangGraph ≥1.0 | StateGraph、条件边、interrupt、checkpointer |
+| 智能体编排 | LangGraph ≥1.2 | StateGraph、条件边、interrupt、checkpointer |
 | 大模型 | DeepSeek deepseek-flash | 中文生成稳、成本低，每局约 ¥0.1–0.3 |
 | Web UI | Streamlit ≥1.61 | 单文件页面编排 + 暗色主题 + 会话状态 |
 | 声音 | Web Audio API | 纯代码生成 BGM / 事件音效，无外部音频素材 |
@@ -199,7 +199,7 @@ streamlit run app.py
 python main.py
 ~~~
 
-**VS Code 快速启动**：用 VS Code 打开 Agent_Developing 仓库根目录（不是上一级课程目录），新建集成终端会自动激活 Conda py10，直接执行 streamlit run app.py。修改 .vscode/settings.json 后需要关闭旧终端或重启 VS Code。
+**VS Code 快速启动**：用 VS Code 打开 Agent_Develop 仓库根目录（不是上一级课程目录），新建集成终端会自动激活 Conda py10，直接执行 streamlit run app.py。修改 .vscode/settings.json 后需要关闭旧终端或重启 VS Code。
 
 ---
 
@@ -221,7 +221,7 @@ python main.py
 ## 🗂️ 项目结构
 
 ~~~text
-Agent_Developing/
+Agent_Develop/
 ├── app.py                 # Streamlit Web UI（页面编排）
 ├── ui_theme.py            # 全局暗色主题 CSS
 ├── ui_assets.py           # 开场动画 / 阶段幕布 HTML
@@ -244,7 +244,7 @@ Agent_Developing/
 ├── names.py               # 名字池与抽样
 ├── logging_config.py      # 日志轮转 + 对局 ID
 ├── config.py              # 环境变量与 LLM 配置
-├── tests/                 # pytest（172 passed）
+├── tests/                 # pytest（180 passed）
 ├── docs/
 │   ├── screenshots/       # README 截图
 │   ├── launch-screen-design.md
@@ -268,7 +268,7 @@ Agent_Developing/
 ## 🧪 测试与质量
 
 ~~~bash
-pytest -q -W error   # → 172 passed
+pytest -q -W error   # → 180 passed
 ruff check .         # → All checks passed
 ~~~
 

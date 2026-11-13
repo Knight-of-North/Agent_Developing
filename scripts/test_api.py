@@ -1,6 +1,6 @@
 """DeepSeek API 连通性测试（手动诊断脚本，非 pytest 用例）
 
-用法：cd Agent_Developing && python scripts/test_api.py
+用法：cd Agent_Develop && python scripts/test_api.py
 读取 .env 中的 DEEPSEEK_API_KEY / DEEPSEEK_MODEL / DEEPSEEK_BASE_URL
 
 H2：此脚本原来在项目根目录且顶层直接执行 llm.invoke —— pytest 按默认规则
@@ -22,10 +22,10 @@ def main():
         model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
         api_key=os.getenv("DEEPSEEK_API_KEY"),
         base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        # 8-20 审查修复：参数必须与 nodes.py 的 get_llm() 保持一致——
+        # 8-20 审查修复：参数必须与 nodes.py 的 get_llm(purpose="player") 保持一致——
         # 之前 reasoning_effort="high" + max_tokens=16384 测的是"思考模式"行为，
-        # 和游戏实际跑的 reasoning_effort="none"(关 thinking)不一致，排查会误导。
-        max_tokens=4096,
+        # 和游戏实际跑的参数不一致，排查会误导。
+        max_tokens=int(os.getenv("LLM_MAXTOK_PLAYER", "1024")),
         reasoning_effort="none",
     )
 

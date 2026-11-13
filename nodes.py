@@ -91,6 +91,7 @@ from validators import (
     _extract_speak,
     _fallback_clues,
     _filter_relations,
+    _normalize_private_clues,
     _normalize_secrets,
     _parse_json,
     _sanitize_outsider_names,
@@ -281,8 +282,13 @@ def _postprocess_script(raw_text: str, names: list[str]) -> tuple[dict, list[Scr
     """
     try:
         script = _parse_json(raw_text)
+        # background / truth 也做字符串归一：LLM 可能返回数字/对象，后续
+        # prompt 拼接与 sanitize 都假定它们是字符串。
+        for text_key in ("background", "truth"):
+            script[text_key] = _coerce_text(script.get(text_key, ""))
         script = _fallback_clues(script)
         script = _enforce_names(script, names)
+        script = _normalize_private_clues(script)
         script = _sanitize_outsider_names(script)
         script = _normalize_secrets(script)
         script = _filter_relations(script)
@@ -326,6 +332,12 @@ def _check_script_consistency(script: dict) -> list[ScriptProblem]:
         problems.append(ScriptProblem(
             f"murderer 字段缺失或不在嫌疑人名单内（当前：{murderer!r}），必须精确等于某个嫌疑人 name",
             fatal=True,
+        ))
+    elif truth and murderer not in truth:
+        # 非致命：truth 可能用“真凶/他”等代称；但点明姓名能避免 dm_reveal
+        # 与 tally/judge_ending 使用的 murderer 字段互相矛盾。重试一次通常能修正。
+        problems.append(ScriptProblem(
+            f"truth 没有点明真凶「{murderer}」的名字，请确保揭晓文本与 murderer 字段一致"
         ))
 
     for s in suspects:
@@ -805,7 +817,8 @@ def ai_player_turn_node(state: GameState) -> dict:
     # 发言里若出现名单外人物名，统一替换为「某人」，防止 AI 编出「张浩」之类角色。
     speak = _sanitize_text_for_script(speak, script)
 
-    revealed = _update_revealed_clues(speak, (state.get("distributed_clues") or {}), (state.get("revealed_clues") or {}))
+    revealed = _update_revealed_clues(speak, (state.get("distributed_clues") or {}),
+                                      (state.get("revealed_clues") or {}), speaker=name)
     new_memory = ((state.get("agent_memory") or {}).get(name, []) + [speak])[-3:]
 
     logger.info("node=ai_player_turn speaker=%s round=%d followup=%s cost=%.2fs",
@@ -886,7 +899,8 @@ def human_turn_node(state: GameState) -> dict:
             addressed, follow_up, consecutive = _apply_followup_guard(
                 text, targets, state.get("follow_up", 0), state.get("consecutive_followups", 0)
             )
-            revealed = _update_revealed_clues(text, (state.get("distributed_clues") or {}), (state.get("revealed_clues") or {}))
+            revealed = _update_revealed_clues(text, (state.get("distributed_clues") or {}),
+                                              (state.get("revealed_clues") or {}), speaker=user_role)
         elif kind == "investigate":
             location = str(action.get("location") or "").strip()
             # 如果 UI 指定了地点，只在该地点未发现的线索里选；旧协议不带 location 则回退全局随机。
@@ -914,8 +928,10 @@ def human_turn_node(state: GameState) -> dict:
         else:
             # dict 协议的裸发言：与 str 协议走同一个守卫函数（M3）——
             # 此前 dict 分支没有 F5 守卫（连续点名可无限续期霸麦），接入即引爆。
-            text = str(action.get("text", ""))[:MAX_CHAT_LEN]
-            revealed = _update_revealed_clues(text, (state.get("distributed_clues") or {}), (state.get("revealed_clues") or {}))
+            raw_text = action.get("text")
+            text = ("" if raw_text is None else str(raw_text)).strip()[:MAX_CHAT_LEN]
+            revealed = _update_revealed_clues(text, (state.get("distributed_clues") or {}),
+                                              (state.get("revealed_clues") or {}), speaker=user_role)
             addressed, follow_up, consecutive = _apply_followup_guard(
                 text, targets, state.get("follow_up", 0), state.get("consecutive_followups", 0))
     else:
@@ -924,7 +940,8 @@ def human_turn_node(state: GameState) -> dict:
         # 当成台词广播给所有人，这里归一为空输入再降级成沉默占位。
         raw_text = "" if action is None else str(action)
         text = raw_text.strip()[:MAX_CHAT_LEN] or "（环视众人，沉默不语）"
-        revealed = _update_revealed_clues(text, (state.get("distributed_clues") or {}), (state.get("revealed_clues") or {}))
+        revealed = _update_revealed_clues(text, (state.get("distributed_clues") or {}),
+                                          (state.get("revealed_clues") or {}), speaker=user_role)
         addressed, follow_up, consecutive = _apply_followup_guard(
             text, targets, state.get("follow_up", 0), state.get("consecutive_followups", 0))
 
@@ -1070,12 +1087,13 @@ def human_vote_node(state: GameState) -> dict:
 
     user_vote = interrupt({"type": "human_vote", "suspects": candidates})
 
-    # M9：弃权保留字规范化（strip + 大小写不敏感）
+    # M9：弃权保留字规范化（strip + 大小写不敏感）；候选人校验也使用归一后的值，
+    # 否则 " 李四 " 会被误判为弃权。
     raw = user_vote.strip() if isinstance(user_vote, str) else user_vote
     if isinstance(raw, str) and raw.lower() in _ABSTAIN_WORDS:
         return {"votes": {user_role: None}}
-    if user_vote in candidates:
-        return {"votes": {user_role: user_vote}}
+    if raw in candidates:
+        return {"votes": {user_role: raw}}
     # 非法值/弃权：显式写 None，避免合并 reducer 残留上一轮旧票
     return {"votes": {user_role: None}}
 
@@ -1190,11 +1208,12 @@ def final_statement_node(state: GameState) -> dict:
     winner = next((s for s in suspects if s.get("name") == vote_winner), None)
     secret = winner.get("secret", "无") if winner else "无"
 
-    truth = script.get("truth", "")
     suspects_names = [s.get("name", "") for s in suspects]
     murderer = _get_murderer(script, suspects_names)
     if vote_winner == murderer:
-        truth_hint = f"案件真相（你此刻扮演这个角色，请根据自己是否真凶来决定喊冤还是认罪）：{truth}"
+        # 安全：这是玩家可见的最终陈词，绝不能把完整 truth 注入 prompt——
+        # _run_stream 会逐 token 展示 final_statement，否则会在 dm_reveal 前剧透全部手法。
+        truth_hint = "你是真凶，现在被指认。请选择继续狡辩、嫁祸他人或当场认罪，但绝不能说出完整案件真相或作案细节。"
     else:
         truth_hint = "事实：你不是真凶，你被冤枉了——喊冤时语气要符合被冤枉的处境，但绝不要说破真凶是谁（悬念留给揭晓环节）"
 

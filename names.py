@@ -53,8 +53,11 @@ def sanitize_custom_names(names: list[str] | None) -> list[str]:
 
     此前这条正则分别硬编码在两个入口里——改一处忘另一处就会出现
     "Web 端挡住了、终端版还能注进 prompt"的不一致。
+    同时拒绝「主持人 / DM / 死者」等系统保留名，避免自定义名字和系统角色/
+    DM 消息渲染路径冲突。
     """
-    return [n for n in (names or []) if _NAME_RE.fullmatch(n or "")]
+    reserved = {"主持人", "DM", "dm", "死者"}
+    return [n for n in (names or []) if _NAME_RE.fullmatch(n or "") and n not in reserved]
 
 # 本会话已用过的名字集合：避免重玩撞脸。
 # 名字池每风格 20 个、混合池约 100 个，同一风格连续玩多局后重复概率仍会上升，

@@ -64,7 +64,6 @@ from ui_components import (
     _GEN_STAGES,
     _preserve_scroll_position,
     _render_generation_progress,
-    _render_intro_animation,
     _render_phase_banner,
     _resolve_case_title,
     render_result_effect,
@@ -175,7 +174,7 @@ def _reset_game_state() -> None:
         except Exception as e:
             logger.warning("checkpoint 清理失败 thread=%s: %s", tid, e)
     for key in [
-        "started", "result", "thread_id", "intro_played", "personal_script_seen", "last_error",
+        "started", "result", "thread_id", "personal_script_seen", "last_error",
         "role_loading", "pending_role",
     ]:
         st.session_state.pop(key, None)
@@ -304,8 +303,6 @@ if "started" not in st.session_state:
     st.session_state.started = False
 if "result" not in st.session_state:
     st.session_state.result = None
-if "intro_played" not in st.session_state:
-    st.session_state.intro_played = False   # 开场动画只播一次
 if "personal_script_seen" not in st.session_state:
     st.session_state.personal_script_seen = False   # 个人剧本只在开局默认展开一次
 if "launched" not in st.session_state:
@@ -601,15 +598,9 @@ else:
                 st.session_state.role_loading = False
             st.rerun()
         info = get_interrupt(result)
-        # C-1：开场动画只播一次（session_state 标记），播完显示选角引导
-        if not st.session_state.intro_played:
-            _render_intro_animation(result)
-            play_audio_cue(
-                "intro",
-                token=f"{st.session_state.thread_id}:intro",
-                params={"titleLen": len(_resolve_case_title(result))},
-            )
-            st.session_state.intro_played = True
+        # 选角页只展示角色卡。此前这里会渲染一次性开场动画（st.iframe），
+        # 它带出 script.background 的“案件背景”长文本且不会从页面消失，
+        # 用户反馈到了选角界面仍看到上一段背景信息——移除该面板，保持选角页干净。
         st.markdown("### 🎭 选择你想扮演的角色")
         st.markdown("剧本已生成，请选一个嫌疑人扮演：")
         # 选角前先展示公开身份信息（职业/与死者关系），避免“看名字盲选”。
@@ -618,10 +609,18 @@ else:
             p.get("name"): p for p in info.get("profiles", [])
             if isinstance(p, dict) and p.get("name")
         }
-        # L4：6 列按钮在窄屏挤压，每行最多 3 个
-        n_sus = len(info["suspects"])
+        # L4：6 列按钮在窄屏挤压，每行最多 3 个。
+        # 防御旧 checkpoint / 异常剧本：suspects 为空时 st.columns(0) 会直接抛异常。
+        suspects_list = info.get("suspects") or []
+        if not suspects_list:
+            st.error("剧本数据异常：没有可选的嫌疑人，请重新立案侦查。")
+            if st.button("返回开始页", key="choose_role_empty_back"):
+                _reset_game_state()
+                st.rerun()
+            st.stop()
+        n_sus = len(suspects_list)
         cols = st.columns(min(n_sus, 3), gap="medium")
-        for i, name in enumerate(info["suspects"]):
+        for i, name in enumerate(suspects_list):
             p = profiles.get(name, {})
             profession = str(p.get("profession", "")).strip()
             relation = str(p.get("relation_to_victim", "")).strip()

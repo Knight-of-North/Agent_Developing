@@ -48,6 +48,7 @@ _INTRO_HTML = """
 """
 
 _PHASE_BANNER_HTML = """
+<style>html, body { margin: 0; padding: 0; background: transparent; }</style>
 <div data-tid="__TID__" style="text-align:center; padding:10px 0; font-family:'KaiTi','楷体',serif;">
   <div id="phase-banner" style="display:inline-block; background:#1d1916; border:1px solid #C9A227; border-radius:10px; padding:10px 30px; color:#C9A227; font-size:18px; letter-spacing:6px; opacity:0;">
     __BANNER__

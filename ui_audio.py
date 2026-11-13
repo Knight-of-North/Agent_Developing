@@ -802,6 +802,8 @@ def render_audio_panel() -> None:
 def _run_js(body: str) -> None:
     """执行一段音频调用脚本；nonce 保证每次 rerun 都会重新执行。"""
     nonce = time.time_ns()
+    # json.dumps 不会转义 </script>；若 token/参数里出现该片段会提前闭合脚本标签。
+    body = body.replace("</", "<\\/")
     st.html(
         f"<script>// audio-call {nonce}\n(function(){{ if (window.__agentAudio) {{ {body} }} }})();</script>",
         unsafe_allow_javascript=True,

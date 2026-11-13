@@ -278,4 +278,5 @@ def _render_phase_banner(result: dict):
             .replace("__BANNER__", banner)
             .replace("__SFX__", sfx)
             .replace("__TID__", st.session_state.get("thread_id", "default")))
-    st.iframe(html, height=58)
+    # 58px 会裁掉 padding + 18px 字号（实测内容约 63px），留到 72px 并压掉 body margin。
+    st.iframe(html, height=72)

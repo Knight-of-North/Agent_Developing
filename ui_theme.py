@@ -340,6 +340,7 @@ footer,
   border-color: var(--murder-gold) !important;
   color: var(--murder-gold) !important;
 }
+[data-testid="stButtonGroup"] button[data-variant][data-selected="true"],
 [data-testid="stButtonGroup"] button[data-variant][aria-checked="true"] {
   background: #262016 !important;
   border-color: var(--murder-gold) !important;

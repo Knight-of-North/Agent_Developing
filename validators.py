@@ -34,7 +34,10 @@ _OUTSIDER_NAME_RE = re.compile(
 _ROLE_SUFFIXES = (
     "老师", "医生", "警察", "保安", "管理员", "辅导员", "院长", "主任", "老板",
     "同学", "朋友", "父亲", "母亲", "哥哥", "姐姐", "弟弟", "妹妹", "叔叔", "阿姨",
-    "先生", "小姐", "女士",
+    "先生", "小姐", "女士", "管家", "老爷", "夫人", "太太", "少爷", "少奶奶",
+    "老太爷", "老太太", "掌柜", "伙计", "师傅", "师父", "师兄", "师姐", "师妹",
+    "公子", "姑娘", "丫鬟", "仆人", "家丁", "小厮", "公公", "嬷嬷", "伯父", "伯母",
+    "舅舅", "舅妈", "姑姑", "姑父", "表哥", "表妹", "堂哥", "堂妹",
 )
 
 # 高频非人名词/称谓，避免姓名启发式把普通词当成人名。
@@ -46,6 +49,12 @@ _NON_PERSON_WORDS = frozenset({
     "家人", "父亲", "母亲", "哥哥", "姐姐", "弟弟", "妹妹", "叔叔", "阿姨", "先生",
     "小姐", "女士", "男人", "女人", "晚上", "白天", "凌晨", "傍晚", "今天", "昨天",
     "明天", "早上", "中午", "下午", "周末", "春节", "中秋", "国庆",
+    # 常用时间 / 方位 / 场景复合词：姓名启发式不能把它们当人名
+    "明天早上", "周末下午", "上午", "深夜", "半夜", "春天", "夏天", "秋天", "冬天",
+    "那年", "那年夏天", "当时", "那时", "这时", "那天", "这天", "当天", "第二天",
+    "路上", "马上", "马上开始", "江南", "古镇", "老宅", "宅子", "院子", "大厅",
+    "书房", "卧室", "厨房", "花园", "走廊", "门口", "窗外", "屋内", "屋外",
+    "家里", "家中", "家族", "小时候", "长大后", "后来", "从前", "以前", "之后",
 })
 
 
@@ -101,8 +110,12 @@ def _parse_json(text: str) -> dict:
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
 
+    # 只接受 JSON 对象（dict）。LLM 偶尔输出合法但非对象的 JSON（[] / null / "ok"），
+    # 若直接返回 list/None，下游 out.get(...) 会抛 AttributeError 绕过节点兜底。
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
 
@@ -110,7 +123,9 @@ def _parse_json(text: str) -> dict:
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
     if m:
         try:
-            return json.loads(m.group(1))
+            parsed = json.loads(m.group(1))
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
@@ -119,7 +134,9 @@ def _parse_json(text: str) -> dict:
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
         try:
-            return json.loads(text[start:end + 1])
+            parsed = json.loads(text[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
@@ -147,6 +164,12 @@ def _enforce_names(script: dict, names: list[str]) -> dict:
         else:
             # LLM 少给了嫌疑人，补一个空壳
             s = {"name": name, "secret": "待补充", "forbidden": []}
+        # LLM 可能把结构化字段写成数字/对象；先归一成字符串，避免 UI 的
+        # role_header_html / character_card_html 对 int 调 .strip() 直接崩溃。
+        for fld in ("gender", "profession", "relation_to_victim", "alibi", "task",
+                    "personality", "speech_style", "secret", "personal_script"):
+            if fld in s:
+                s[fld] = _coerce_text(s.get(fld))
         s["forbidden"] = _sanitize_forbidden(s.get("forbidden"), name, names)
         fixed.append(s)
     script["suspects"] = fixed
@@ -177,7 +200,16 @@ def _extract_outsider_names(text: str, roster: set[str]) -> list[str]:
             continue
         if name in _NON_PERSON_WORDS:
             continue
+        if name.startswith(("明天", "今天", "昨天", "后天", "上午", "下午", "中午",
+                            "晚上", "早上", "凌晨", "傍晚", "深夜", "周末", "春天",
+                            "夏天", "秋天", "冬天", "那年", "当时", "这时", "那时",
+                            "路上", "马上", "江南", "古镇")):
+            continue
+        if name.endswith("家") and len(name) <= 3:
+            continue  # 「顾家 / 张家」是家族称谓，不是人名
         if any(name.endswith(suffix) for suffix in _ROLE_SUFFIXES):
+            continue
+        if any(name.endswith(suffix) for suffix in ("宅", "府", "院", "堂", "馆", "店", "庄", "城", "国", "州")):
             continue
         found.append(name)
     return found
@@ -207,12 +239,13 @@ def _find_outsider_names(script: dict) -> list[str]:
         if isinstance(c, dict):
             texts.append(c.get("content", ""))
 
-    found: list[str] = []
+    # 同一“人名”至少出现两次才视为真实污染：单次出现的普通短语更可能是
+    # “明天早上 / 周末下午 / 秋天 / 路上”这类时间/地点词，宁可不替换。
+    counts: dict[str, int] = {}
     for text in texts:
         for name in _extract_outsider_names(text, roster):
-            if name not in found:
-                found.append(name)
-    return found
+            counts[name] = counts.get(name, 0) + 1
+    return [name for name, count in counts.items() if count >= 2]
 
 
 def _replace_outsider_names(text: str, roster: set[str]) -> str:
@@ -229,28 +262,38 @@ def _sanitize_outsider_names(script: dict) -> dict:
 
     这是展示层前的最后一道防线；配合 prompt 的名单铁律和自洽校验，
     避免 LLM 编出来的「张浩」之类角色出现在 DM 揭晓/个人剧本里。
+
+    只替换 `_find_outsider_names` 跨字段确认过的名字（至少出现两次），
+    避免旧实现逐字段扫描时把「明天早上」「周末下午」「顾家」等普通词误伤。
     """
-    suspects = script.get("suspects") or []
-    roster = {s.get("name", "") for s in suspects if isinstance(s, dict) and s.get("name")}
-    roster.add("死者")
+    outsiders = _find_outsider_names(script)
+    if not outsiders:
+        return script
+
+    def clean(value):
+        if not isinstance(value, str) or not value:
+            return value
+        for name in outsiders:
+            value = value.replace(name, "某人")
+        return value
 
     for key in ("background", "truth"):
-        script[key] = _replace_outsider_names(script.get(key, ""), roster)
-    for s in suspects:
+        script[key] = clean(script.get(key, ""))
+    for s in script.get("suspects") or []:
         if not isinstance(s, dict):
             continue
         for key in ("secret", "personal_script", "alibi", "relation_to_victim", "profession", "task"):
             if key in s:
-                s[key] = _replace_outsider_names(s.get(key, ""), roster)
+                s[key] = clean(s.get(key, ""))
     for key in ("public_clues", "hidden_clues"):
-        script[key] = [_replace_outsider_names(c, roster) if isinstance(c, str) else c
+        script[key] = [clean(c) if isinstance(c, str) else c
                        for c in (script.get(key) or [])]
     for c in script.get("private_clues") or []:
         if isinstance(c, dict):
-            c["content"] = _replace_outsider_names(c.get("content", ""), roster)
+            c["content"] = clean(c.get("content", ""))
     for r in script.get("relations") or []:
         if isinstance(r, dict) and "rel" in r:
-            r["rel"] = _replace_outsider_names(r.get("rel", ""), roster)
+            r["rel"] = clean(r.get("rel", ""))
     return script
 
 
@@ -272,6 +315,10 @@ def _normalize_secret_first_person(secret: str) -> str:
     """
     secret = _coerce_text(secret)
     if not secret:
+        return secret
+    # 「他是我哥哥」这类开头是在介绍别人，不是“用第三人称写自己”，强行替换会变成
+    # “我是我哥哥”。只对“他/她 + 行为动词”的常见偷懒写法做第一人称归一。
+    if secret.startswith(("他是", "她是", "他叫", "她叫", "他有", "她有")):
         return secret
     # 按长度从长到短匹配，避免「她的」被先匹配成「她」+「的」
     for old, new in [("她的", "我的"), ("他的", "我的"), ("她", "我"), ("他", "我")]:
@@ -322,6 +369,33 @@ def _fallback_clues(script: dict) -> dict:
     return script
 
 
+def _normalize_private_clues(script: dict) -> dict:
+    """把 private_clues 归一成 [{holder, content}]。
+
+    LLM 偶尔返回字符串列表（旧式 clues 思维）或 holder 不在名单里的记录；
+    若原样保留，distribute_clues_node 会把所有角色分到空线索，信息差直接消失。
+    非法项丢弃，交给 _ensure_clues 从 secret 生成兜底私密线索。
+    """
+    suspects = script.get("suspects") or []
+    names = {s.get("name", "") for s in suspects if isinstance(s, dict) and s.get("name")}
+    raw = script.get("private_clues")
+    if not isinstance(raw, list):
+        raw = []
+    valid = []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        holder = _coerce_text(c.get("holder", "")).strip()
+        content = _coerce_text(c.get("content", "")).strip()
+        if holder in names and content:
+            item = dict(c)
+            item["holder"] = holder
+            item["content"] = content
+            valid.append(item)
+    script["private_clues"] = valid
+    return script
+
+
 def _filter_relations(script: dict) -> dict:
     """兜底：清洗 relations 里引用名单外角色的关系边。
 
@@ -343,7 +417,9 @@ def _filter_relations(script: dict) -> dict:
         if isinstance(r, dict)
         and r.get("from") in valid and r.get("to") in valid
     ]
-    if len(kept) != len(rels):
+    # relations=None / 非列表也要归一为空列表：否则 app.py 后续
+    # `for r in script.get("relations", [])` 会对 None 迭代抛 TypeError。
+    if "relations" in script or kept:
         script["relations"] = kept
     return script
 
@@ -360,8 +436,8 @@ def _ensure_clues(script: dict) -> dict:
 
     这层是"最后防线"：正常剧本（LLM 有线索）完全不受影响。
     """
-    if script.get("private_clues") or script.get("public_clues"):
-        return script   # 已有线索，不动
+    if script.get("private_clues"):
+        return script   # 已有私密线索，不动（public_clues 存在但无私密线索时仍需补信息差）
 
     suspects = script.get("suspects") or []
     private = []

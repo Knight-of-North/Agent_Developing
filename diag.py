@@ -38,5 +38,10 @@ def test(name, trust_env):
             cause = cause.__cause__
 
 
-test("测试1：trust_env=False（不走代理，直连）", trust_env=False)
-test("测试2：trust_env=True（默认，会读代理）", trust_env=True)
+def main():
+    test("测试1：trust_env=False（不走代理，直连）", trust_env=False)
+    test("测试2：trust_env=True（默认，会读代理）", trust_env=True)
+
+
+if __name__ == "__main__":
+    main()

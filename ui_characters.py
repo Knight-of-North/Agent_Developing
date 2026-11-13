@@ -78,8 +78,10 @@ def avatar_data_uri(name: str) -> str:
 
 def character_card_html(name: str, profession: str, relation: str) -> str:
     """选角页的嫌疑人卡：头像 + 姓名 + 职业 + 与死者关系。"""
-    prof = html.escape((profession or "").strip()) or "身份未明"
-    rel = html.escape((relation or "").strip()) or "关系未明"
+    # LLM 字段可能是 int/dict（旧 checkpoint 或异常输出），统一先转字符串，
+    # 避免 `123.strip()` 这类 AttributeError 把整个选角页打崩。
+    prof = html.escape(str(profession or "").strip()) or "身份未明"
+    rel = html.escape(str(relation or "").strip()) or "关系未明"
     return (
         '<div class="suspect-card">'
         '<div class="suspect-card-tag">PERSON OF INTEREST</div>'
@@ -96,9 +98,11 @@ def character_card_html(name: str, profession: str, relation: str) -> str:
 
 def role_header_html(name: str, profession: str, relation: str) -> str:
     """侧栏顶部「你的角色」卡头。"""
-    meta_parts = [html.escape((profession or "").strip()) or "身份未明"]
-    if relation:
-        meta_parts.append(f"与死者：{html.escape(relation.strip())}")
+    prof_text = str(profession or "").strip()
+    rel_text = str(relation or "").strip()
+    meta_parts = [html.escape(prof_text) or "身份未明"]
+    if rel_text:
+        meta_parts.append(f"与死者：{html.escape(rel_text)}")
     return (
         '<div class="role-hero">'
         f"{avatar_html(name, 58)}"

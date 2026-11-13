@@ -40,10 +40,18 @@ def clue_mentioned(clue: str, speak: str, threshold: float = 0.5) -> bool:
     return hit / len(clue_grams) >= threshold
 
 
-def update_revealed_clues(speak: str, distributed_clues: dict, revealed_clues: dict) -> dict:
-    """发言后更新线索公开状态。用 clue_mentioned 容忍转述、防止单词误报。"""
+def update_revealed_clues(speak: str, distributed_clues: dict, revealed_clues: dict,
+                          speaker: str = "") -> dict:
+    """发言后更新线索公开状态。用 clue_mentioned 容忍转述、防止单词误报。
+
+    speaker 非空时只检查该发言人自己持有的线索：普通发言提到相似词句不应把
+    其他角色的私密线索错误标记为“已公开”（否则会把别人藏着的底牌泄露给全体 AI）。
+    保留 speaker="" 的旧调用语义（全量检查）用于兼容已有测试/外部脚本。
+    """
     newly = {}
     for holder, clues in (distributed_clues or {}).items():
+        if speaker and holder != speaker:
+            continue
         for clue in clues or []:
             if clue in (revealed_clues or {}):
                 continue
@@ -69,9 +77,13 @@ def clue_topic_map(script: dict) -> dict:
     """建 {线索内容: 方向标签} 映射，供 DM 中场引导用（H13）。"""
     topic_map = {}
     for c in script.get("private_clues", []) or []:
-        if isinstance(c, dict) and c.get("content"):
-            topic = (c.get("topic") or "").strip()
-            topic_map[c["content"]] = topic
+        if not isinstance(c, dict):
+            continue
+        content = c.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        topic = c.get("topic")
+        topic_map[content] = str(topic).strip() if topic is not None else ""
     return topic_map
 
 
@@ -159,6 +171,10 @@ def judge_ending(state: dict) -> tuple[str, str]:
         if speak_count >= 3 or investigated:
             return "侦探", f"（真人玩家 {user_role} 投对了真凶且积极主导了推理，请夸赞他/她的洞察力）"
         return "幸运旁观者", f"（真人玩家 {user_role} 投对了但全程低调，像是个运气不错的旁观者）"
+    if murderer and vote_winner == murderer:
+        # 玩家自己投错，但其他嫌疑人投出了真凶：整体是平民胜利，
+        # 不能再说“真凶逍遥法外”，否则 dm_reveal 的剧情自相矛盾。
+        return "被蒙蔽", f"（真人玩家 {user_role} 投错了，但其他嫌疑人成功投出真凶 {murderer}；请演绎他/她看走眼的懊恼，不要再说真凶逃脱）"
     return "被蒙蔽", f"（真人玩家 {user_role} 投错了、被真凶误导，请演绎'真凶逍遥法外'的遗憾尾声，让玩家恍然大悟又懊恼）"
 
 
