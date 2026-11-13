@@ -47,9 +47,12 @@ from validators import (
     _extract_speak,
     _fallback_clues,
     _filter_relations,
+    _find_outsider_names,
     _normalize_secret_first_person,
     _normalize_secrets,
     _parse_json,
+    _sanitize_outsider_names,
+    _sanitize_text_for_script,
 )
 
 # ============ interrupt_handler ============
@@ -394,6 +397,47 @@ def test_filter_relations_empty_or_missing():
     assert fixed["relations"] == []
     # 无 suspects 也不崩
     assert _filter_relations({"relations": [{"from": "a", "to": "b", "public": True}]})["relations"] == []
+
+
+# ============ 名单外人物名清洗（张浩类幻觉回归） ============
+
+def test_sanitize_outsider_names_replaces_hallucinated_person():
+    script = {
+        "suspects": [
+            {"name": "舒飞", "personal_script": "张浩威胁过我", "alibi": "在图书馆", "relation_to_victim": "同学"},
+            {"name": "李四", "personal_script": "我在宿舍", "alibi": "在宿舍", "relation_to_victim": "同学"},
+        ],
+        "truth": "张浩杀了舒飞，并在现场留下烟头。",
+        "background": "张浩是舒飞的朋友。",
+        "public_clues": ["现场有张浩的烟头"],
+        "hidden_clues": [],
+        "private_clues": [{"holder": "舒飞", "content": "张浩昨晚来过"}],
+        "relations": [{"from": "舒飞", "to": "李四", "rel": "我讨厌张浩", "public": True}],
+    }
+    assert "张浩" in _find_outsider_names(script)
+    fixed = _sanitize_outsider_names(script)
+    joined = str(fixed)
+    assert "张浩" not in joined
+    assert "某人" in fixed["truth"]
+    assert fixed["suspects"][0]["name"] == "舒飞"
+
+
+def test_sanitize_text_for_script_protects_dm_reveal():
+    script = {"suspects": [{"name": "舒飞"}, {"name": "李四"}]}
+    out = _sanitize_text_for_script("张浩承认自己杀了人，舒飞是无辜的。", script)
+    assert "张浩" not in out
+    assert "舒飞" in out
+    assert "某人" in out
+
+
+def test_outsider_name_detector_ignores_time_roles_and_places():
+    """姓名启发式不能把“周一早上”“刘老师”“张家界”误判成名单外角色。"""
+    script = {
+        "suspects": [{"name": "舒飞", "personal_script": "我是舒飞。"}],
+        "background": "周一早上，刘老师在图书馆门口遇见舒飞，说起了张家界。",
+        "truth": "舒飞在图书馆看书。",
+    }
+    assert _find_outsider_names(script) == []
 
 
 # ============ _ensure_clues（线索全空最后防线） ============
@@ -1233,6 +1277,26 @@ def test_human_turn_silence_reserved_word(monkeypatch):
     assert out["phase_round"] == 3   # 沉默也占一轮，防"永远沉默"卡死循环
 
 
+def test_human_turn_accuse_respects_followup_guard(monkeypatch):
+    """F5 回归：accuse 分支不能绕过守卫，连续指控不续期追问权。"""
+    monkeypatch.setattr("nodes.interrupt",
+                        lambda payload: {"action": "accuse", "target": "李四"})
+    base = {
+        "user_role": "张三",
+        "phase_round": 2,
+        "script": {"suspects": [{"name": "张三"}, {"name": "李四"}]},
+        "distributed_clues": {}, "revealed_clues": {}, "messages": [],
+    }
+    # 第一次指控：prev_follow=0，给一次追问权
+    out = human_turn_node({**base, "follow_up": 0, "consecutive_followups": 0})
+    assert out["follow_up"] == 1
+    assert out["consecutive_followups"] == 1
+    # 上一轮追问权未用就再次指控：不续期，consecutive 归零
+    out = human_turn_node({**base, "follow_up": 1, "consecutive_followups": 1})
+    assert out["follow_up"] == 0
+    assert out["consecutive_followups"] == 0
+
+
 # ---------- M11：插队不计费 + 总量保险丝 ----------
 
 def _ai_turn_state(**overrides):
@@ -1364,6 +1428,24 @@ def test_dm_reveal_history_keeps_recent_messages_only(monkeypatch):
     assert "RECENT_MARKER" in captured["prompt"]
     assert "OLD_MARKER_0" not in captured["prompt"]
     assert "OLD_MARKER_10" not in captured["prompt"]
+
+
+def test_dm_reveal_handles_malformed_messages(monkeypatch):
+    """旧 checkpoint / 手工 state 里的坏消息不能把 DM 揭晓整段打崩。"""
+    from nodes import dm_reveal_node
+    captured = {}
+
+    monkeypatch.setattr("nodes._safe_llm_text", lambda prompt, *a, **k: captured.setdefault("prompt", prompt) or "揭晓台词")
+    state = {
+        "script": {"truth": "李四杀人", "murderer": "李四",
+                   "suspects": [{"name": "张三"}, {"name": "李四"}]},
+        "votes": {"张三": "李四"}, "vote_counts": {"李四": 1},
+        "vote_winner": "李四", "user_role": "张三",
+        "distributed_clues": {}, "messages": ["坏消息", {"content": "缺少 speaker"}, None],
+    }
+    out = dm_reveal_node(state)
+    assert out["current_phase"] == "reveal"
+    assert "RECENT" not in captured["prompt"]
 
 
 # ---------- R2：json_mode 必须走流式（反馈占位依赖 token 事件） ----------

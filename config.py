@@ -62,10 +62,10 @@ LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "none")
 TRUST_ENV = _get_bool("TRUST_ENV", False)
 
 # ---- 游戏节奏 ----
-ROUNDS_PER_PLAYER = _get_int("ROUNDS_PER_PLAYER", 3)
+ROUNDS_PER_PLAYER = max(1, _get_int("ROUNDS_PER_PLAYER", 3))
 
 # 每局「调查」次数上限（H4：之前无限制，玩家可搜完所有隐藏线索）
-INVESTIGATE_LIMIT = _get_int("INVESTIGATE_LIMIT", 2)
+INVESTIGATE_LIMIT = max(0, _get_int("INVESTIGATE_LIMIT", 2))
 
 # 连续追问上限（F5：防止玩家点名霸麦饿死 AI）
 MAX_CONSECUTIVE_FOLLOWUPS = _get_int("MAX_CONSECUTIVE_FOLLOWUPS", 1)
@@ -81,17 +81,17 @@ MAX_CHAT_LEN = _get_int("MAX_CHAT_LEN", 500)
 # AI 投票/自我介绍是否用线程池并发（H6）。httpx.Client 文档声明线程安全，
 # 但若你的环境出现并发问题，设 VOTE_CONCURRENT=0 回退串行。
 VOTE_CONCURRENT = _get_bool("VOTE_CONCURRENT", True)
-VOTE_MAX_WORKERS = _get_int("VOTE_MAX_WORKERS", 5)
+VOTE_MAX_WORKERS = max(1, _get_int("VOTE_MAX_WORKERS", 5))
 
 # ---- 调试 ----
 # DEV_MODE=1 时在 Web 端显示 AI 内心戏、节点耗时等调试信息（H14）
 DEV_MODE = _get_bool("DEV_MODE", False)
 
 # ---- 剧本生成 ----
-SCRIPT_MAX_ATTEMPTS = _get_int("SCRIPT_MAX_ATTEMPTS", 2)
+SCRIPT_MAX_ATTEMPTS = max(1, _get_int("SCRIPT_MAX_ATTEMPTS", 2))
 
 # 单次 AI 发言的总时间预算（秒）。重试层数会相乘
 # （节点 3 次尝试 × json_mode 的"JSON 失败→普通模式"回退 × SDK max_retries），
 # 极端情况下一个回合可以发出十几次请求、把页面挂住十几分钟。
 # 超过预算就停止重试、直接走确定性兜底文案——宁可一句过场，也不冻结 UI。
-TURN_BUDGET_SECONDS = _get_int("TURN_BUDGET_SECONDS", 180)
+TURN_BUDGET_SECONDS = max(1, _get_int("TURN_BUDGET_SECONDS", 180))

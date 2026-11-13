@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+from functools import lru_cache
 
 import streamlit as st
 
@@ -39,8 +40,13 @@ def _palette_for(name: str) -> tuple[str, str, str]:
     return _AVATAR_PALETTE[int(digest[:8], 16) % len(_AVATAR_PALETTE)]
 
 
+@lru_cache(maxsize=256)
 def avatar_html(name: str, size: int = 64, extra_class: str = "") -> str:
-    """返回首字头像的 HTML（用于卡片 / 侧栏）。"""
+    """返回首字头像的 HTML（用于卡片 / 侧栏）。
+
+    lru_cache：每局会话页 rerun 会重复渲染同一批角色头像，缓存后避免重复
+    MD5 取色 + 字符串拼接；函数纯、参数可哈希，缓存安全。
+    """
     start, end, ink = _palette_for(name)
     cls = f"char-avatar {extra_class}".strip()
     return (
@@ -50,8 +56,12 @@ def avatar_html(name: str, size: int = 64, extra_class: str = "") -> str:
     )
 
 
+@lru_cache(maxsize=256)
 def avatar_data_uri(name: str) -> str:
-    """生成 SVG data URI，供 st.chat_message(avatar=...) 使用。"""
+    """生成 SVG data URI，供 st.chat_message(avatar=...) 使用。
+
+    每条聊天消息每次 rerun 都会取头像；缓存后避免重复 base64 编码 SVG。
+    """
     start, end, ink = _palette_for(name)
     initial = html.escape(_initial(name))
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">

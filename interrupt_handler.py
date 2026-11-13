@@ -42,7 +42,7 @@ def get_interrupt_type(result: dict) -> str:
 
 def validate_vote(vote: str, suspects: list[str]) -> str | None:
     """校验投票：合法嫌疑人名字才返回，否则返回 None（弃权）。"""
-    return vote if vote in suspects else None
+    return vote if vote in (suspects or []) else None
 
 
 # M9：与 nodes.py 的 _ABSTAIN_WORDS 保持一致。抽到这里是因为 app.py / main.py

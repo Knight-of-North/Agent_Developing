@@ -25,14 +25,14 @@ logger = logging.getLogger(__name__)
 
 def print_role_card(result):
     """打印角色卡：你的角色 + 秘密 + 私密线索（选完角色之后才能打印）"""
-    script = result.get("script", {})
+    script = (result.get("script") or {})
     user_role = result.get("user_role", "你")
     suspects = script.get("suspects", [])
     user_secret = next((s.get("secret", "") for s in suspects if s.get("name") == user_role), "")
     user_script = next((s.get("personal_script", "") for s in suspects if s.get("name") == user_role), "")
     user_suspect = next((s for s in suspects if s.get("name") == user_role), {})
     # 信息差：只显示你自己持有的私密线索，别人的线索你看不到
-    user_clues = result.get("distributed_clues", {}).get(user_role, [])
+    user_clues = (result.get("distributed_clues") or {}).get(user_role, [])
     print("=" * 46)
     print(f"【你的角色卡】你扮演：{user_role}")
     if result.get("user_is_murderer"):
@@ -114,8 +114,11 @@ if __name__ == "__main__":
 
     def show_new(messages, start):
         """打印从 start 开始的新消息，返回最新长度"""
+        messages = messages or []
         for m in messages[start:]:
-            print(f"\n{m['speaker']}: {m['content']}")
+            if not isinstance(m, dict):
+                continue
+            print(f"\n{m.get('speaker', '?')}: {m.get('content', '')}")
         return len(messages)
 
     # ---- 循环处理 interrupt：图暂停时，读提示 -> 用户输入 -> 恢复 ----
@@ -156,7 +159,7 @@ if __name__ == "__main__":
 
             # 选完角色后，user_role 才确定，此时打印角色卡 + 已发生的消息（DM 开场 / AI 发言）
             print_role_card(result)
-            printed = show_new(result.get("messages", []), printed)
+            printed = show_new((result.get("messages") or []), printed)
 
         elif info["type"] == "human_turn":
             # 玩家回合：支持发言 + 公开线索/指控/调查三种行动（终端版用菜单选择）
@@ -218,14 +221,14 @@ if __name__ == "__main__":
                     break
 
             result = safe_resume(resume)
-            printed = show_new(result.get("messages", []), printed)
+            printed = show_new((result.get("messages") or []), printed)
 
         elif info["type"] == "human_tiebreak":
             # 平票加时：AI 候选人已辩护，玩家若在平票名单中也要有最后陈述机会
             print(f"\n【平票加时】你与 {'、'.join(info.get('suspects', []))} 进入平票。")
             user_input = input("你的最后陈述（输入「沉默」跳过）：").strip()[:MAX_CHAT_LEN]
             result = safe_resume(user_input)
-            printed = show_new(result.get("messages", []), printed)
+            printed = show_new((result.get("messages") or []), printed)
 
         elif info["type"] == "human_vote":
             # 轮到你投票（校验输入必须是合法嫌疑人名字；M9：也可输入「弃权」放弃投票）
@@ -238,12 +241,12 @@ if __name__ == "__main__":
                 user_input = input("你投谁（输入名字）：").strip()
             result = safe_resume(user_input)
             # 投票后图会跑 tally -> dm_reveal，打印 DM 揭晓台词
-            printed = show_new(result.get("messages", []), printed)
+            printed = show_new((result.get("messages") or []), printed)
 
     # ---- 打印最终结算 ----
     print("\n" + "=" * 46)
     print("【投票结果】")
-    for voter, target in result.get("votes", {}).items():
+    for voter, target in (result.get("votes") or {}).items():
         print(f"  · {voter} → {target or '（弃权）'}")
     outcome = result.get("vote_outcome", "")
     if outcome == "tie":

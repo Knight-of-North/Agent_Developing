@@ -94,6 +94,7 @@ def _preserve_scroll_position() -> None:
   let tries = 0;
   const finish = () => { window.__agentScrollRestoring = false; };
   const restore = () => {
+    if (!window.__agentScrollRestoring) return;
     if (window.__agentScrollUserInteracted) { finish(); return; }
     const el = getScroller();
     if (!el) {
@@ -143,7 +144,7 @@ def _render_intro_animation(result: dict):
     safe_title = json.dumps(case_title, ensure_ascii=False)
     html = (_INTRO_HTML
             .replace("__TITLE__", safe_title)
-            .replace("__TID__", st.session_state.thread_id))
+            .replace("__TID__", st.session_state.get("thread_id", "default")))
     st.iframe(html, height=310)
 
 def _result_outcome(result: dict) -> str:
@@ -276,5 +277,5 @@ def _render_phase_banner(result: dict):
     html = (_PHASE_BANNER_HTML
             .replace("__BANNER__", banner)
             .replace("__SFX__", sfx)
-            .replace("__TID__", st.session_state.thread_id))
+            .replace("__TID__", st.session_state.get("thread_id", "default")))
     st.iframe(html, height=58)

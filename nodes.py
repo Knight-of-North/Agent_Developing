@@ -93,6 +93,8 @@ from validators import (
     _filter_relations,
     _normalize_secrets,
     _parse_json,
+    _sanitize_outsider_names,
+    _sanitize_text_for_script,
 )
 
 # `.env` 由 config.py 在 import 时加载（必须先于任何 os.getenv）；
@@ -122,7 +124,7 @@ def get_llm(purpose: str = "player", json_mode: bool = False):
             if key not in _llm_cache:   # 双重检查，避免并发重复构造
                 cfg = LLM_CONFIG.get(purpose, LLM_CONFIG["player"])
                 _llm_cache[key] = ChatDeepSeek(
-                    model=os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+                    model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
                     api_key=os.getenv("DEEPSEEK_API_KEY"),
                     base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
                     temperature=cfg["temperature"],
@@ -281,6 +283,7 @@ def _postprocess_script(raw_text: str, names: list[str]) -> tuple[dict, list[Scr
         script = _parse_json(raw_text)
         script = _fallback_clues(script)
         script = _enforce_names(script, names)
+        script = _sanitize_outsider_names(script)
         script = _normalize_secrets(script)
         script = _filter_relations(script)
         script = _ensure_clues(script)
@@ -504,8 +507,11 @@ def generate_script_stream(theme: str, background: str, background_story: str = 
 
 def distribute_clues_node(state: GameState) -> dict:
     """节点 1.5：线索分发（信息差的核心，确定性节点，不调 LLM）。"""
-    script = state.get("script", {})
-    suspect_names = [s.get("name", "") for s in (script.get("suspects") or []) if s.get("name")]
+    script = (state.get("script") or {})
+    suspect_names = [
+        s.get("name", "") for s in (script.get("suspects") or [])
+        if isinstance(s, dict) and s.get("name")
+    ]
 
     private = script.get("private_clues") or []
 
@@ -540,7 +546,7 @@ def distribute_clues_node(state: GameState) -> dict:
 
 def choose_role_node(state: GameState) -> dict:
     """节点 1.6：用户选择扮演的角色（interrupt 暂停，等用户选）。"""
-    script = state.get("script", {})
+    script = (state.get("script") or {})
     suspects = script.get("suspects") or []
     names = [s.get("name", "?") for s in suspects]
     # 选角页只展示公开身份信息（职业/与死者关系），不泄露 secret/personal_script。
@@ -572,12 +578,12 @@ def choose_role_node(state: GameState) -> dict:
 
 def dm_intro_node(state: GameState) -> dict:
     """节点 2：DM 开场介绍（只公布公共线索和公开关系）。"""
-    script = state.get("script", {})
+    script = (state.get("script") or {})
     background = script.get("background", "")   # L1：删死 fallback script.get("raw","")——流水线恒产出 background
-    suspects = script.get("suspects", [])
+    suspects = script.get("suspects") or []
     names = [s.get("name", "?") for s in suspects]
-    public_clues = script.get("public_clues", [])
-    relations = script.get("relations", [])
+    public_clues = script.get("public_clues") or []
+    relations = script.get("relations") or []
     public_relations = [
         f"{r.get('from', '?')} 与 {r.get('to', '?')}：{r.get('rel', '')}"
         for r in relations if isinstance(r, dict) and r.get("public", False)
@@ -588,6 +594,7 @@ def dm_intro_node(state: GameState) -> dict:
     prompt = build_dm_intro_prompt(background, names, relations_text, public_clues, user_role)
     resp = _safe_llm_text(prompt, purpose="dm", allow_partial=False,
                           fallback="主持人翻开卷宗，将案件背景一一道来，众人各怀心事。")
+    resp = _sanitize_text_for_script(resp, script)
     return {
         "messages": [{"speaker": "主持人", "content": resp}],
         "current_phase": "discuss",
@@ -602,8 +609,8 @@ def self_intro_node(state: GameState) -> dict:
     H1：多角色并发调用（复用 ai_vote_node 的线程池模式，map 保序），
         开局 N-1 次串行干等 12~32 秒 → 并发后≈单次调用耗时。
     """
-    script = state.get("script", {})
-    suspects = script.get("suspects", [])
+    script = (state.get("script") or {})
+    suspects = script.get("suspects") or []
     user_role = state.get("user_role", "")
     bg_style = state.get("background_style", "") or ""
 
@@ -626,6 +633,7 @@ def self_intro_node(state: GameState) -> dict:
         )
         resp = _safe_llm_text(prompt, purpose="player", allow_partial=False,
                               fallback=_fallback(name))
+        resp = _sanitize_text_for_script(resp, script)
         return {"speaker": name, "content": f"（自我介绍）{resp}"}
 
     targets = [s for s in suspects if s.get("name", "") != user_role]
@@ -636,11 +644,11 @@ def self_intro_node(state: GameState) -> dict:
 
 def dm_midpoint_node(state: GameState) -> dict:
     """节点 3.5：DM 中场引导（H13：只给线索方向标签，不给原文）。"""
-    revealed = state.get("revealed_clues", {})
-    distributed = state.get("distributed_clues", {})
-    script = state.get("script", {})
+    revealed = (state.get("revealed_clues") or {})
+    distributed = (state.get("distributed_clues") or {})
+    script = (state.get("script") or {})
 
-    all_clues = [c for clues in distributed.values() for c in clues]
+    all_clues = [c for clues in distributed.values() for c in (clues or [])]
     hidden = [c for c in all_clues if c not in revealed]
     topic_map = _clue_topic_map(script)
     # M5：有 topic 标签的用标签；缺失 topic 的不能截取原文前 6 字（会直接泄露线索内容），
@@ -659,6 +667,7 @@ def dm_midpoint_node(state: GameState) -> dict:
     prompt = build_midpoint_prompt(revealed, hidden_topics)
     resp = _safe_llm_text(prompt, purpose="dm", allow_partial=False,
                           fallback="主持人目光扫过众人：有些线索似乎还被藏着，不妨再往深处问问。")
+    resp = _sanitize_text_for_script(resp, script)
     return {
         "messages": [{"speaker": "主持人", "content": resp}],
         "midpoint_done": True,
@@ -668,8 +677,8 @@ def dm_midpoint_node(state: GameState) -> dict:
 def ai_player_turn_node(state: GameState) -> dict:
     """节点 3：AI 玩家发言（think/speak 双通道 + 防泄露重试 + 确定性脱敏兜底）。"""
     t0 = time.time()
-    script = state.get("script", {})
-    suspects = script.get("suspects", [])
+    script = (state.get("script") or {})
+    suspects = script.get("suspects") or []
     if not suspects:
         return {"phase_round": state.get("phase_round", 0) + 1}
 
@@ -712,7 +721,7 @@ def ai_player_turn_node(state: GameState) -> dict:
     murderer = _get_murderer(script, suspect_names)
     if name == murderer:
         # M4：用启发式统计所有发言者对本角色的指控次数（不只认"指控"二字）
-        messages_all = state.get("messages", [])
+        messages_all = (state.get("messages") or [])
         accusation_count = _count_accusations_against(messages_all, name)
         goal_text = """【你的目标】你是真凶，首要目标是不被投出去：
 - 不要主动提及任何能指向你的线索，尽量把嫌疑引向有动机的其他人
@@ -724,12 +733,12 @@ def ai_player_turn_node(state: GameState) -> dict:
 - 关注其他人发言中的矛盾，指出不合理之处
 - 被怀疑时为自己辩护，但不要慌乱"""
 
-    own_clues = state.get("distributed_clues", {}).get(name, [])
+    own_clues = (state.get("distributed_clues") or {}).get(name, [])
     clues_text = "\n".join(f"- {c}" for c in own_clues) if own_clues else "（你没有额外的私密线索）"
 
     # H3/P2：全局已公开线索账本——AI 不知道别人摊过牌会重复公开同一线索；
     # 注入账本后 AI 还能围绕已公开线索做增量推理。滑动窗口外的摊牌也不丢。
-    revealed_all = state.get("revealed_clues", {})
+    revealed_all = (state.get("revealed_clues") or {})
     revealed_text = ("\n".join(f"- {holder}公开过：{clue}" for clue, holder in revealed_all.items())
                      if revealed_all else "（目前还没有人公开过私密线索）")
 
@@ -740,10 +749,10 @@ def ai_player_turn_node(state: GameState) -> dict:
     )
 
     history = "\n".join(
-        f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])[-max(6, len(suspects) * 2):]
+        f"{m.get('speaker', '?')}: {m.get('content', '')}" for m in (state.get("messages") or [])[-max(6, len(suspects) * 2):] if isinstance(m, dict)
     )
 
-    memory = state.get("agent_memory", {}).get(name, [])
+    memory = (state.get("agent_memory") or {}).get(name, [])
     memory_text = "\n".join(f"- 你之前说过：{m}" for m in memory[-3:]) if memory else "（这是你第一次发言）"
 
     prompt = build_ai_turn_prompt(
@@ -793,9 +802,11 @@ def ai_player_turn_node(state: GameState) -> dict:
     # 放在循环外而不是 for-else：超预算 break 时也要兜底，不能漏掉最后一句。
     if any(isinstance(w, str) and w and w in speak for w in forbidden):
         speak = "此事我不想多谈，你们与其盯着我，不如去问问别人。"
+    # 发言里若出现名单外人物名，统一替换为「某人」，防止 AI 编出「张浩」之类角色。
+    speak = _sanitize_text_for_script(speak, script)
 
-    revealed = _update_revealed_clues(speak, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
-    new_memory = (state.get("agent_memory", {}).get(name, []) + [speak])[-3:]
+    revealed = _update_revealed_clues(speak, (state.get("distributed_clues") or {}), (state.get("revealed_clues") or {}))
+    new_memory = ((state.get("agent_memory") or {}).get(name, []) + [speak])[-3:]
 
     logger.info("node=ai_player_turn speaker=%s round=%d followup=%s cost=%.2fs",
                 name, round_num, is_followup_reply, time.time() - t0)
@@ -816,10 +827,10 @@ def human_turn_node(state: GameState) -> dict:
     """节点 4：轮到用户行动（interrupt 暂停，等用户发言或选动作）。"""
     user_role = state.get("user_role", "你")
     round_num = state.get("phase_round", 0)
-    script = state.get("script", {})
+    script = (state.get("script") or {})
     suspect_names = [s.get("name", "") for s in (script.get("suspects") or [])]
     targets = [n for n in suspect_names if n != user_role]
-    own_clues = state.get("distributed_clues", {}).get(user_role, [])
+    own_clues = (state.get("distributed_clues") or {}).get(user_role, [])
     hidden = script.get("hidden_clues") or []
     investigated = state.get("investigated_clues") or []
     available_hidden = [c for c in hidden if c not in investigated]
@@ -870,10 +881,12 @@ def human_turn_node(state: GameState) -> dict:
         elif kind == "accuse":
             target = action.get("target", "")
             text = f"我正式指控 {target} 是凶手！"
-            addressed = target if target in targets else ""
-            follow_up = 1 if addressed else 0
-            consecutive = state.get("consecutive_followups", 0) + 1 if addressed else 0
-            revealed = _update_revealed_clues(text, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
+            # F5 守卫必须覆盖 accuse 分支：此前这里直接 follow_up=1，
+            # 连续指控可无限续期追问权、烧穿讨论轮次预算（与 str/dict 发言分支不一致）。
+            addressed, follow_up, consecutive = _apply_followup_guard(
+                text, targets, state.get("follow_up", 0), state.get("consecutive_followups", 0)
+            )
+            revealed = _update_revealed_clues(text, (state.get("distributed_clues") or {}), (state.get("revealed_clues") or {}))
         elif kind == "investigate":
             location = str(action.get("location") or "").strip()
             # 如果 UI 指定了地点，只在该地点未发现的线索里选；旧协议不带 location 则回退全局随机。
@@ -902,7 +915,7 @@ def human_turn_node(state: GameState) -> dict:
             # dict 协议的裸发言：与 str 协议走同一个守卫函数（M3）——
             # 此前 dict 分支没有 F5 守卫（连续点名可无限续期霸麦），接入即引爆。
             text = str(action.get("text", ""))[:MAX_CHAT_LEN]
-            revealed = _update_revealed_clues(text, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
+            revealed = _update_revealed_clues(text, (state.get("distributed_clues") or {}), (state.get("revealed_clues") or {}))
             addressed, follow_up, consecutive = _apply_followup_guard(
                 text, targets, state.get("follow_up", 0), state.get("consecutive_followups", 0))
     else:
@@ -911,7 +924,7 @@ def human_turn_node(state: GameState) -> dict:
         # 当成台词广播给所有人，这里归一为空输入再降级成沉默占位。
         raw_text = "" if action is None else str(action)
         text = raw_text.strip()[:MAX_CHAT_LEN] or "（环视众人，沉默不语）"
-        revealed = _update_revealed_clues(text, state.get("distributed_clues", {}), state.get("revealed_clues", {}))
+        revealed = _update_revealed_clues(text, (state.get("distributed_clues") or {}), (state.get("revealed_clues") or {}))
         addressed, follow_up, consecutive = _apply_followup_guard(
             text, targets, state.get("follow_up", 0), state.get("consecutive_followups", 0))
 
@@ -930,7 +943,7 @@ def human_turn_node(state: GameState) -> dict:
         # （game_state._merge_dict），只需返回"这一个角色"的增量，不必整字典替换——
         # 整字典替换在并行 superstep 下会把别人同时写入的线索覆盖掉。
         result["distributed_clues"] = {
-            user_role: list(state.get("distributed_clues", {}).get(user_role, [])) + investigated_new
+            user_role: list((state.get("distributed_clues") or {}).get(user_role, [])) + investigated_new
         }
     return result
 
@@ -977,8 +990,8 @@ def ai_vote_node(state: GameState) -> dict:
     滑动窗口外的开场信息补回投票决策——推理闭环在最后一环不再断裂。
     C1：vote_round 在此递增，作为"只加时一次"的硬保险丝。
     """
-    script = state.get("script", {})
-    suspects = script.get("suspects", [])
+    script = (state.get("script") or {})
+    suspects = script.get("suspects") or []
     user_role = state.get("user_role", "")
     suspect_names = [s.get("name", "?") for s in suspects]
     ai_names = [n for n in suspect_names if n != user_role]
@@ -987,9 +1000,9 @@ def ai_vote_node(state: GameState) -> dict:
     # H2：加时轮只允许投平票候选人；首轮为全体嫌疑人
     candidates = state.get("tie_candidates") or None
 
-    distributed = state.get("distributed_clues", {})
+    distributed = (state.get("distributed_clues") or {})
     history = "\n".join(
-        f"{m['speaker']}: {m['content']}" for m in state.get("messages", [])[-max(10, len(suspects) * 2):]
+        f"{m.get('speaker', '?')}: {m.get('content', '')}" for m in (state.get("messages") or [])[-max(10, len(suspects) * 2):] if isinstance(m, dict)
     )
 
     # H3/P1：两个确定性事实层——花名册来自 script.suspects（开场自我介绍的声称），
@@ -998,7 +1011,7 @@ def ai_vote_node(state: GameState) -> dict:
         f"- {s.get('name', '?')}：{s.get('alibi', '未提供')}"
         for s in suspects if isinstance(s, dict)
     )
-    revealed_all = state.get("revealed_clues", {})
+    revealed_all = (state.get("revealed_clues") or {})
     revealed_text = ("\n".join(f"- {holder}公开过：{clue}" for clue, holder in revealed_all.items())
                      if revealed_all else "")
 
@@ -1048,8 +1061,8 @@ def human_vote_node(state: GameState) -> dict:
     同一套规则两副面孔（自投会让"平民胜利/凶手胜利"判定失真）。
     """
     user_role = state.get("user_role", "你")
-    script = state.get("script", {})
-    suspect_names = [s.get("name", "?") for s in script.get("suspects", [])]
+    script = (state.get("script") or {})
+    suspect_names = [s.get("name", "?") for s in script.get("suspects") or []]
     candidates = state.get("tie_candidates") or suspect_names
     # 剔除自己；极端情况（只剩 1 名嫌疑人）回退原名单，保证投票环节不会无选项可用
     others = [n for n in candidates if n != user_role]
@@ -1077,7 +1090,7 @@ def tally_node(state: GameState) -> dict:
     真实人名或空串。此前 4 处消费点靠 `startswith("平票")` / `== "无人投票"`
     嗅探语义，任何一处改文案就静默失配。
     """
-    votes = {k: v for k, v in state.get("votes", {}).items() if v}
+    votes = {k: v for k, v in (state.get("votes") or {}).items() if v}
     counter = Counter(votes.values())
     vote_counts = dict(counter)
     if not counter:
@@ -1088,8 +1101,8 @@ def tally_node(state: GameState) -> dict:
     max_n = top[0][1]
     winners = [k for k, v in top if v == max_n]
 
-    script = state.get("script", {})
-    murderer = _get_murderer(script, [s.get("name", "") for s in script.get("suspects", [])])
+    script = (state.get("script") or {})
+    murderer = _get_murderer(script, [s.get("name", "") for s in script.get("suspects") or []])
     if len(winners) > 1:
         return {"vote_counts": vote_counts, "vote_winner": "", "vote_outcome": "tie",
                 "tie_candidates": winners, "game_result": "平局"}
@@ -1113,8 +1126,8 @@ def tie_break_node(state: GameState) -> dict:
     # L4：结构化字段直读，字符串剥壳逻辑整体删除
     tied_names: list[str] = list(state.get("tie_candidates") or [])
     user_role = state.get("user_role", "")
-    script = state.get("script", {})
-    suspects = script.get("suspects", [])
+    script = (state.get("script") or {})
+    suspects = script.get("suspects") or []
     suspect_map = {s.get("name"): s for s in suspects if isinstance(s, dict)}
     murderer = _get_murderer(script, [s.get("name", "") for s in suspects])
 
@@ -1123,6 +1136,7 @@ def tie_break_node(state: GameState) -> dict:
         prompt = build_tiebreak_prompt(name, suspect.get("secret", "无"), name == murderer)
         resp = _safe_llm_text(prompt, purpose="player", allow_partial=False,
                               fallback=f"{name}沉默片刻，似乎有难言之隐。")
+        resp = _sanitize_text_for_script(resp, script)
         return {"speaker": name, "content": f"（平票辩护）{resp}"}
 
     # 真人玩家自己辩护不替它生成；并发执行、按 tied_names 顺序输出（map 保序）
@@ -1165,14 +1179,14 @@ def final_statement_node(state: GameState) -> dict:
     vote_winner = state.get("vote_winner", "")
     vote_outcome = state.get("vote_outcome", "winner")
     user_role = state.get("user_role", "")
-    script = state.get("script", {})
+    script = (state.get("script") or {})
 
     # L5：平票/无人投票/玩家自己被投时都不生成陈词。
     # 2026-11：判定改用 vote_outcome，不再对 vote_winner 做 startswith("平票") 嗅探。
     if vote_outcome != "winner" or not vote_winner or vote_winner == user_role:
         return {}
 
-    suspects = script.get("suspects", [])
+    suspects = script.get("suspects") or []
     winner = next((s for s in suspects if s.get("name") == vote_winner), None)
     secret = winner.get("secret", "无") if winner else "无"
 
@@ -1187,6 +1201,7 @@ def final_statement_node(state: GameState) -> dict:
     prompt = build_final_statement_prompt(vote_winner, secret, truth_hint)
     resp = _safe_llm_text(prompt, purpose="player", allow_partial=False,
                           fallback=f"{vote_winner}张了张嘴，最终什么也没说。")
+    resp = _sanitize_text_for_script(resp, script)
     return {
         "messages": [{"speaker": vote_winner, "content": f"（最终陈词）{resp}"}],
     }
@@ -1205,18 +1220,18 @@ def _render_vote(target) -> str:
 def _format_private_clues(distributed_clues: dict) -> str:
     """把 {角色名: [私密线索...]} 格式化成文本清单。"""
     lines = []
-    for holder, clues in distributed_clues.items():
-        for c in clues:
+    for holder, clues in (distributed_clues or {}).items():
+        for c in clues or []:
             lines.append(f"- {holder}：{c}")
     return "\n".join(lines) if lines else "（没有私密线索）"
 
 
 def dm_reveal_node(state: GameState) -> dict:
     """节点 8：DM 揭晓真相 + 对比投票结果 + 线索复盘（信息差闭环）。"""
-    script = state.get("script", {})
+    script = (state.get("script") or {})
     truth = script.get("truth", "")
-    votes = state.get("votes", {})
-    vote_counts = state.get("vote_counts", {})
+    votes = (state.get("votes") or {})
+    vote_counts = (state.get("vote_counts") or {})
     vote_outcome = state.get("vote_outcome", "")
     vote_winner = state.get("vote_winner", "")
 
@@ -1246,12 +1261,13 @@ def dm_reveal_node(state: GameState) -> dict:
         result_note = ""
 
     ending_label, ending_note = _judge_ending(state)
-    clues_text = _format_private_clues(state.get("distributed_clues", {}))
+    clues_text = _format_private_clues((state.get("distributed_clues") or {}))
     # DM 揭晓只需要最近一段讨论来复盘；完整历史在长局里会白白烧 token。
     # 保留最后 40 条（约 2–3 轮），truth / 线索 / 投票账本单独传给 prompt。
-    recent_messages = state.get("messages", [])[-40:]
+    recent_messages = (state.get("messages") or [])[-40:]
     history = "\n".join(
-        f"{m['speaker']}: {m['content']}" for m in recent_messages
+        f"{m.get('speaker', '?')}: {m.get('content', '')}"
+        for m in recent_messages if isinstance(m, dict)
     )
 
     prompt = build_reveal_prompt(
@@ -1262,6 +1278,7 @@ def dm_reveal_node(state: GameState) -> dict:
     )
     resp = _safe_llm_text(prompt, purpose="dm", allow_partial=False,
                           fallback="主持人公布了投票结果，揭开了案件真相。")
+    resp = _sanitize_text_for_script(resp, script)
     return {
         "messages": [{"speaker": "主持人", "content": resp}],
         "current_phase": "reveal",
@@ -1274,13 +1291,15 @@ def _current_speaker(state: GameState) -> dict:
     之前读 messages 末位 speaker，若末位是"主持人"（中场引导后）则回退到 suspects[0]，
     导致轮换重置、有人被跳过。现在从后向前找最近一位嫌疑人发言者。
     """
-    script = state.get("script", {})
-    suspects = script.get("suspects", [])
+    script = (state.get("script") or {})
+    suspects = script.get("suspects") or []
     if not suspects:
         return {}
     names = {s.get("name") for s in suspects if isinstance(s, dict)}
     # 从后向前找最近一位嫌疑人发言者，忽略主持人/DM/系统消息
-    for m in reversed(state.get("messages", [])):
+    for m in reversed(state.get("messages") or []):
+        if not isinstance(m, dict):
+            continue
         last = m.get("speaker", "")
         if last in names:
             for i, s in enumerate(suspects):
@@ -1293,8 +1312,8 @@ def _current_speaker(state: GameState) -> dict:
 def route_speaker(state: GameState) -> str:
     """条件边路由：返回 human / ai / midpoint / vote。"""
     round_num = state.get("phase_round", 0)
-    script = state.get("script", {})
-    suspects = script.get("suspects", [])
+    script = (state.get("script") or {})
+    suspects = script.get("suspects") or []
     if not suspects:
         return "vote"
 

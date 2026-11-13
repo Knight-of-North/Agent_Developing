@@ -15,7 +15,7 @@ def _merge_dict(a: dict, b: dict) -> dict:
     两个节点各自 `return {"votes": {...}}`，框架自动合并成一张完整投票表，
     节点里就不用再手动 `dict(state.get("votes", {}))` 拷贝了。
     """
-    return {**a, **b}
+    return {**(a or {}), **(b or {})}
 
 
 class GameState(TypedDict, total=False):

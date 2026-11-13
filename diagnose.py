@@ -1,5 +1,5 @@
 """
-诊断脚本：搞清楚 deepseek-v4-flash 到底返回了什么
+诊断脚本：搞清楚 deepseek-flash 到底返回了什么
 运行：python diagnose.py
 ⚠️ 本脚本会真实调用 API，消耗额度，仅在排查问题时使用。
 """
